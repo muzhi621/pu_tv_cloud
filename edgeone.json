@@ -1,6 +1,6 @@
 {
   "buildCommand": "echo no-build",
-  "installCommand": "echo no-install",
+  "installCommand": "npm install --omit=dev --no-audit --no-fund",
   "outputDirectory": "public",
   "nodeVersion": "22.11.0"
 }

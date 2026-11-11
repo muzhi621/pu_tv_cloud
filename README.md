@@ -8,7 +8,7 @@
 | **client（终端库）** | `G:/workbuddy/puretv/pure_live_tv_client` | 完整 Flutter 客户端源码 + `RemoteConfigService` 改造 |
 | 需求文档 | `G:/workbuddy/puretv/纯粹直播TV_云端配置下发_需求文档_v1.0.md` | 契约、FR、改动清单、验收、风险、分期 |
 
-> **部署目标（2026-11-11 起）**：默认改为**腾讯 EdgeOne Pages（Edge Functions + KV）**。
+> **部署目标（2026-11-11 起）**：默认改为**腾讯 EdgeOne Pages（Edge Functions + KV/Blob）**。
 > 原因是阿里云 FC 的函数调用、公网流量与 OSS/NAS 存储会持续产生按量费用，
 > 而 EdgeOne Pages 免费版的额度对本服务「开机拉一次几 KB JSON」的用量等于零成本。
 > **接口契约完全不变**，终端 APK 只需换配置地址。原 FC/Python 实现保留为备选，
@@ -29,21 +29,21 @@ cloud/                  Python/WSGI 实现（FC、自建服务器；零第三方
   app.py                WSGI 应用：API + 鉴权 + ETag/304/409 + 静态编辑器
   server.py             本地 / 自建服务器 / FC Web 函数启动入口
 ★ 仓库根目录即 EdgeOne Pages 项目根（Git 导入零配置）
-edge-functions/         ★ Edge Functions（ES2023+，零依赖）
+edge-functions/         ★ Edge Functions（ES2023+，唯一运行时依赖 @edgeone/pages-blob）
   index.js              GET / 内联编辑器单页
-  health.js             GET /health
+  health.js             GET /health（含存储后端与 degraded 状态）
   api/config/           GET/PUT config、catalog、revisions、rollback
-  _lib/                 contract.js（契约）/ storage.js（KV+乐观锁）/ http.js
+  _lib/                 contract.js（契约）/ storage.js（KV/Blob 双后端 + 乐观锁）/ http.js
                         + data.js、editor.js（由构建脚本生成，勿手改）
-edgeone.json            ★ 项目配置：无构建、输出目录 public、Node 22.11.0
+edgeone.json            ★ 项目配置：无构建、npm install 装 Blob SDK、输出目录 public
 public/robots.txt       让静态输出目录非空（不放 index.html，避免覆盖函数首页）
-package.json            仅声明 ESM 与本地测试脚本，零第三方依赖
+package.json            声明 ESM 与 @edgeone/pages-blob 依赖（Blob 兜底用）
 config/
   seed.json             内置兜底配置（四节全部 managed:false）—— 两个实现共用
   site_catalog.json     35 个站点 id（含中文名、退役标记）+ 7 个导航 id
 editor/                 在线配置编辑器源文件（零依赖静态页）
   index.html / app.js / style.css —— EdgeOne 版内联，FC 版同源托管
-tests/                  23 个 Python 单元测试 + test_edgeone.mjs（Node 14 项冒烟）
+tests/                  23 个 Python 单元测试 + test_edgeone.mjs（Node 20 项冒烟，含 Blob 回退）
 docs/
   API.md                接口说明（两种实现共用同一契约）
   DEPLOY_GITHUB.md      ★ GitHub 直连部署方案（控制台逐项、验证、维护、排错）
@@ -65,7 +65,7 @@ requirements.txt        仅 OSS 后端需要 oss2
 ```bash
 cd G:/workbuddy/puretv/pure_live_tv_cloud
 python3 -m unittest discover -s tests -v     # 23 个 Python 测试（FC/自建服务器实现）
-node --test tests/test_edgeone.mjs            # 15 项 EdgeOne 接口冒烟（内存 KV，无需部署）
+node --test tests/test_edgeone.mjs            # 20 项 EdgeOne 接口冒烟（内存 KV/Blob，无需部署）
 python scripts/build_edgeone_assets.py --check  # 校验内联资源与源文件一致
 sh scripts/run_local.sh                       # Python 版，默认 http://127.0.0.1:8080/
 ```
@@ -76,10 +76,15 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
 `edge-functions/`、`edgeone.json` 都在根上，平台会自动读取 `edgeone.json` 的
 「无构建 + 输出目录 `public`」，以后每次 push `main` 自动重新部署。
 
-1. 控制台 **存储 → KV**：开通账户、创建命名空间、绑定项目，**变量名填 `PURETV_KV`**。
+1. **存储二选一**：
+   - **KV（推荐，需申请）**：控制台 **存储 → KV → 立即申请**（可能要审核），创建命名空间、
+     绑定项目，**变量名填 `PURETV_KV`**。
+   - **Blob（免申请，即用即得）**：什么都不用做，首次请求时 `@edgeone/pages-blob` 会用
+     默认命名空间 `pu_tv_cloud` 自动创建。KV 未绑定时服务**自动走 Blob**，不用改代码。
 2. 创建项目页展开「**环境变量**」，填 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN`
    （**必须先填再点开始部署**，环境变量变更只对之后的部署生效）。
 3. 「从 Git 导入」选 `muzhi621/pu_tv_cloud`、生产分支 `main` → 开始部署。
+   安装命令由 `edgeone.json` 设为 `npm install`，用于装 Blob SDK（部署因此多花十几秒）。
 4. 用教程里的 5 条 curl 验证，浏览器打开项目域名根路径即在线编辑器。
 
 > ⚠️ **不要选「直接上传 zip」**：该方式要求压缩包根目录含 `index.html`（本项目首页由
@@ -90,12 +95,14 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
 完整步骤、验证 curl、终端接入与排错见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)，
 目录约定见 [docs/EDGEONE_LAYOUT.md](docs/EDGEONE_LAYOUT.md)。
 
-浏览器打开项目域名根路径即编辑器。首次访问自动在 KV 写入 `seed.json` 的副本
+浏览器打开项目域名根路径即编辑器。首次访问自动写入 `seed.json` 的副本
 （revision 0，四节全部 `managed:false`）。**生产环境务必配置两个 Token**；
 都为空时服务处于开发模式，接口不鉴权。
 
-KV 是最终一致性（其他边缘节点最长 60s 读到旧值），写入节点立即生效；
-本服务是单人编辑 + `If-Match` 乐观锁，个人规模足够。
+**存储后端自动选择**：检测到 KV 绑定就用 KV，否则用 Blob（强一致读）。可用
+`CONFIG_STORAGE=kv|blob` 强制指定，`/health` 会返回实际生效的 `backend`
+（`edgeone-kv` / `edgeone-blob`）以及 `degraded` 状态。两者都是最终一致模型，
+写入节点立即生效；本服务是单人编辑 + `If-Match` 乐观锁，个人规模足够。
 
 ## 备选：阿里云 FC / 本地自建服务器
 

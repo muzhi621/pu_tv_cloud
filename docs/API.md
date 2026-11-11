@@ -11,7 +11,7 @@ EdgeOne（JavaScript Edge Functions）与 FC（Python WSGI）两个实现的路�
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| GET | `/health` | 无 | 存活探测，返回当前 revision、后端类型、是否开发模式 |
+| GET | `/health` | 无 | 存活探测，返回当前 revision、**实际生效的存储后端**（`edgeone-kv` / `edgeone-blob` / `none`）、是否开发模式 |
 | GET | `/api/config` | read | 全量配置；`since=<rev>` 或 `If-None-Match` 命中返回 304 |
 | PUT | `/api/config` | write | 写入配置；需 `If-Match`，冲突返回 409 |
 | GET | `/api/config/catalog` | read | 站点/导航 id 目录（编辑器选项来源） |
@@ -93,6 +93,20 @@ curl -X POST "$BASE/api/config/rollback" \
 
 回滚把旧快照的 `sections` 写为**新的 revision**（不会回退版本号），返回
 `{"revision":44,"updatedAt":"...","rolledBackFrom":42}`。快照不存在返回 400。
+
+## /health 响应
+
+```json
+// 正常
+{"status":"ok","revision":3,"backend":"edgeone-blob","devMode":false}
+
+// 存储不可用：HTTP 仍是 200，便于监控区分「进程死了」和「配置没做完」
+{"status":"degraded","revision":null,"backend":"none","devMode":false,
+ "storageError":"..."}
+```
+
+`backend` 取值：`edgeone-kv`（已绑定 KV）、`edgeone-blob`（KV 未绑定时自动兜底）、
+`none`（都没有，此时 `/api/*` 返回 503 `storage_unavailable`）。
 
 ## 错误码
 

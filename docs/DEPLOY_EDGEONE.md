@@ -107,6 +107,29 @@ App 启动时读取一次，用于灰度控制功能开关，避免每次调整�
 > `config:rev:*` 快照合计约 **25 KB**。编辑器前端是内联在函数代码里的字符串常量，
 > **不占 KV**。若审核要求给"业务规模"，按「个人项目 + 数百台自有设备」描述即可。
 
+#### 1.2 KV 还在审批？直接用 Blob，不用等
+
+Blob 是 EdgeOne 的分布式对象存储，**免申请**：首次调用 `getStore("pu_tv_cloud")` 时
+平台自动为项目创建命名空间，免费版同样 1 GB。本服务的存储层做了自动降级：
+
+| 情况 | `/health` 的 `backend` | 行为 |
+|---|---|---|
+| KV 已绑定 | `edgeone-kv` | 走 KV |
+| KV 未绑定，依赖正常 | `edgeone-blob` | 自动走 Blob（强一致读） |
+| 都没有 | `none` + `status: degraded` | API 返回 503，并给出修复提示 |
+
+注意事项：
+
+1. **部署时必须让 `npm install` 跑起来**。`edgeone.json` 已把安装命令设为
+   `npm install --omit=dev --no-audit --no-fund`，用来装 `@edgeone/pages-blob`。
+   若你在控制台把它改回了 `echo no-install`，Blob 兜底会失效（返回 503）。
+2. **Blob 与 KV 的数据不互通**。KV 审批通过并绑定后服务会切回 KV，看到的是 revision 0
+   的种子配置 —— 需要在编辑器里重新保存一次（或先 `curl` 导出旧配置再 PUT 回去）。
+   想避免搬数据，就等 KV 下来再切，或全程只用 Blob。
+3. Blob 默认最终一致（其他节点最长 60s），本服务读取统一用强一致模式，写入后立即可读，
+   `If-Match` 乐观锁正常工作；代价是每次读多几十毫秒，对每次开机拉一次配置的终端无感。
+4. 想强制只用其中一种，设环境变量 `CONFIG_STORAGE=kv` 或 `CONFIG_STORAGE=blob`。
+
 ### 2. 创建项目（对应控制台「配置项目」页）
 
 | 配置项 | 填法 |
@@ -123,6 +146,8 @@ App 启动时读取一次，用于灰度控制功能开关，避免每次调整�
 | `CONFIG_READ_TOKEN` | 读 Token，APK 与编辑器读取配置用；**留空 = 不鉴权，仅限本地调试** |
 | `CONFIG_WRITE_TOKEN` | 写 Token，`PUT` / `rollback` 用；留空则回退到读 Token |
 | `CONFIG_KV_BINDING` | KV 绑定变量名，默认 `PURETV_KV`，与第 1 步控制台填的一致 |
+| `CONFIG_STORAGE` | 可选，`auto`（默认，有 KV 用 KV，否则 Blob）/ `kv` / `blob`。KV 审批期间建议显式写 `blob`，避免日志里反复出现探测失败 |
+| `CONFIG_BLOB_NAMESPACE` | 可选，Blob 命名空间名，默认 `pu_tv_cloud`；不存在时首次写入自动创建 |
 | `CONFIG_CORS_ORIGINS` | 可选；编辑器同源部署留空，跨域时填精确域名（逗号分隔），**不要用 `*`** |
 
 样例见 [edgeone.env.example](edgeone.env.example)。生成随机 Token：`openssl rand -hex 24`。
@@ -200,7 +225,7 @@ flutter build apk --release \
 | 项 | 阿里云 FC 3.0（备选） | EdgeOne Pages（当前默认） |
 |---|---|---|
 | 运行时 | Python 3.10 WSGI `index.handler` | JavaScript Edge Functions `onRequest*` |
-| 持久化 | OSS（需 `oss2`）或 NAS 挂载 | 内置 KV，零依赖、免费 1 GB |
+| 持久化 | OSS（需 `oss2`）或 NAS 挂载 | 内置 KV（需申请）或 Blob（免申请，自动兜底），各 1 GB |
 | 静态编辑器 | 3 个静态文件由 WSGI 提供 | 构建期内联成单页，由 `/` 函数返回 |
 | 压缩 | 应用内 gzip | 由平台 CDN 自动压缩，配置文档很小，无影响 |
 | 一致性 | OSS 强一致 + 进程内锁 | KV 最终一致（其他节点最长 60s） |
@@ -214,7 +239,9 @@ flutter build apk --release \
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 500 且日志含「KV 命名空间未绑定」 | KV 未开通/未绑定，或变量名不是 `PURETV_KV` | 按第 1 步绑定，或设置 `CONFIG_KV_BINDING` |
+| `/api/*` 返回 503 `storage_unavailable` | KV 未绑定，且 Blob SDK 没装上（安装命令被改回 `echo no-install`） | 安装命令改回 `npm install --omit=dev`，重新部署；或按第 1 步绑定 KV |
+| `/health` 返回 `status: degraded`、`backend: none` | 同上，存储层完全不可用 | 看 `storageError` 文案；绑定 KV 或修好依赖后重新部署 |
+| `/health` 返回 `backend: edgeone-blob` | KV 还没绑定，服务已在用 Blob，属正常 | 无需处理；KV 审批通过后绑定即自动切回 KV（数据不迁移） |
 | 所有 `/api/*` 返回 401 | Token 配错或请求头不是 `Bearer <token>`；或部署后才补的环境变量 | 核对环境变量与 [edgeone.env.example](edgeone.env.example)，补填后**重新部署**（环境变量不影响旧部署） |
 | `PUT` 返回 409 | `If-Match` 落后（编辑器/其他设备已改过） | 编辑器会带回当前文档，刷新后重试 |
 | 保存成功但 APK 没变化 | KV 边缘缓存最长 60s；或客户端命中 304 后未按新 revision 刷新 | 等 60s 或换节点重试；确认客户端读的是 `X-Revision` |

@@ -41,10 +41,12 @@ EdgeOne 的硬约定是：`edge-functions/` 与 `edgeone.json` 必须位于**项
    openssl rand -hex 24
    ```
 
-3. **开通 KV 账户**：`存储 → KV → 立即申请`（免费 1 GB）。命名空间可等部署后再建。
-   申请弹窗要填存储量 / 查询率 / 场景，照抄
-   [DEPLOY_EDGEONE.md 第 1.1 节](DEPLOY_EDGEONE.md#11-立即申请弹窗的申请理由怎么填)：
-   存储 `100MB`、查询率 `10 QPS`、场景用那段 200 字文案（真实用量仅约 25KB / < 1 QPS）。
+3. **存储：KV 或 Blob，二选一**
+   - **KV（要审核，可以先不管）**：`存储 → KV → 立即申请`（免费 1 GB）。弹窗要填存储量 /
+     查询率 / 场景，照抄 [DEPLOY_EDGEONE.md 第 1.1 节](DEPLOY_EDGEONE.md#11-立即申请弹窗的申请理由怎么填)。
+   - **Blob（免申请，推荐先用这个）**：不需要任何操作，部署后第一次请求时平台自动创建
+     命名空间 `pu_tv_cloud`。**KV 审批期间服务会自动走 Blob**，代码不用改。
+   - 两种后端数据不互通，切换后需在编辑器里重新保存一次配置。
 
 ## 3. 控制台逐项填写（对应「配置项目」页）
 
@@ -56,7 +58,7 @@ EdgeOne 的硬约定是：`edge-functions/` 与 `edgeone.json` 必须位于**项
 | 框架预设 | 其它 / 无（None） |
 | **根目录** | **`./`（必须是仓库根）** |
 | 构建命令 | `echo no-build` |
-| 安装命令 | `echo no-install` |
+| 安装命令 | `npm install --omit=dev --no-audit --no-fund`（由 `edgeone.json` 提供，用来装 Blob SDK） |
 | 输出目录 | `public` |
 | Node 版本 | `22.11.0` |
 

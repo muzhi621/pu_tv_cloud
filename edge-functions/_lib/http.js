@@ -6,7 +6,7 @@
  * - 请求体上限由平台约束（Edge Functions 1 MB），这里再校验一次。
  */
 import { ConfigError, etagFor, SCHEMA_VERSION } from './contract.js';
-import { Conflict } from './storage.js';
+import { Conflict, StorageUnavailable } from './storage.js';
 
 export class HttpError extends Error {
   constructor(status, code, message, extra = {}) {
@@ -119,6 +119,19 @@ export async function handle(context, fn) {
       return send({
         env, request, status: 400,
         body: { error: 'invalid_config', message: error.message },
+      });
+    }
+    if (error instanceof StorageUnavailable) {
+      // 存储缺失是「部署配置问题」而不是代码 bug：给出可执行提示，别让用户只看 500。
+      try { console.error('[pu_tv_cloud] storage unavailable:', error.message); } catch (_) { /* 忽略 */ }
+      return send({
+        env, request, status: 503,
+        body: {
+          error: 'storage_unavailable',
+          message: error.message,
+          hint: '在 EdgeOne 控制台把一个 KV 命名空间绑定到变量名 PURETV_KV；'
+            + '或确保项目安装了 @edgeone/pages-blob 依赖（重新部署即可自动创建 Blob 命名空间）',
+        },
       });
     }
     if (error instanceof HttpError) {

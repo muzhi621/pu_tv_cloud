@@ -1,6 +1,7 @@
 name: ci
 
-# 云端库零第三方依赖，CI 只做语法检查与单元测试。
+# 云端库只有一个运行时依赖（@edgeone/pages-blob，用于 KV 缺失时的 Blob 兜底），
+# CI 做语法检查、单元测试，并验证该依赖能正常解析。
 on:
   push:
     branches: [main]
@@ -30,6 +31,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: 安装 Blob SDK 依赖
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: Blob SDK 可解析
+        run: node -e "import('@edgeone/pages-blob').then(m => { if (typeof m.getStore !== 'function') process.exit(1); console.log('getStore OK'); })"
 
       - name: Python 语法检查
         run: python -m compileall -q cloud index.py

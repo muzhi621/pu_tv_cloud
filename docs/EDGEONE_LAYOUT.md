@@ -15,7 +15,7 @@
 | `edge-functions/_lib/` | 契约、KV 存储、HTTP 层 + 生成的内联资源 |
 | `edgeone.json` | 无构建、输出目录 `public`、Node 22.11.0 |
 | `public/robots.txt` | 让静态输出目录非空；**刻意不放 index.html**，避免覆盖函数首页 |
-| `package.json` | 仅声明 ESM 与本地测试脚本，零依赖 |
+| `package.json` | 声明 ESM 与唯一运行时依赖 `@edgeone/pages-blob`（KV 缺失时的 Blob 兜底） |
 | `edgeone.env.example`（本目录） | 需要在控制台填写的环境变量样例 |
 
 `cloud/`、`config/`、`editor/`、`tests/`、`scripts/`、`index.py` 等属于 Python/FC

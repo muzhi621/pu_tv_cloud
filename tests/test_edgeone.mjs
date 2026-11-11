@@ -216,3 +216,100 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.ok(kv.map.has('config_snapshot_00000001'));
   });
 });
+
+/** 模拟 @edgeone/pages-blob 的 Store：get(key,{type}) / set(key,value)。 */
+class MemoryBlob {
+  constructor() { this.map = new Map(); }
+  async get(key, options = {}) {
+    const value = this.map.get(key);
+    if (value === undefined) return null;
+    return options.type === 'json' ? JSON.parse(value) : value;
+  }
+  async set(key, value) { this.map.set(key, String(value)); }
+  async delete(key) { this.map.delete(key); }
+}
+
+test('KV 缺失时自动回退 Blob 后端', async (t) => {
+  const blob = new MemoryBlob();
+  const savedKv = globalThis.PURETV_KV;
+  delete globalThis.PURETV_KV;
+  globalThis.__PURETV_BLOB_STORE__ = blob;
+  t.after(() => {
+    globalThis.PURETV_KV = savedKv;
+    delete globalThis.__PURETV_BLOB_STORE__;
+  });
+
+  await t.test('health 报告 edgeone-blob 并写入 seed', async () => {
+    const res = await healthGet(ctx('GET', '/health'));
+    assert.equal(res.status, 200);
+    const data = await json(res);
+    assert.equal(data.status, 'ok');
+    assert.equal(data.backend, 'edgeone-blob');
+    assert.equal(data.revision, 0);
+    assert.ok(blob.map.has('config_current'), '首个请求应把 seed 落盘到 Blob');
+  });
+
+  await t.test('读写往返：ETag、304、If-Match 冲突、快照与回滚', async () => {
+    const first = await json(await configGet(ctx('GET', '/api/config')));
+    assert.equal(first.revision, 0);
+
+    const put = await configPut(ctx('PUT', '/api/config', {
+      headers: { 'If-Match': '0' },
+      body: { sections: { sites: { managed: true, policy: 'whitelist', enabledSiteIds: ['bilibili', 'huya'] } } },
+    }));
+    assert.equal(put.status, 200);
+    assert.equal(put.headers.get('X-Revision'), '1');
+
+    // 强一致读：Blob 后端必须立刻看到新 revision
+    const fresh = await configGet(ctx('GET', '/api/config'));
+    const doc = await json(fresh);
+    assert.equal(doc.revision, 1);
+    assert.deepEqual(doc.sections.sites.enabledSiteIds, ['bilibili', 'huya']);
+
+    const notModified = await configGet(ctx('GET', '/api/config?since=1'));
+    assert.equal(notModified.status, 304);
+
+    const conflict = await configPut(ctx('PUT', '/api/config', {
+      headers: { 'If-Match': '0' },
+      body: { sections: {} },
+    }));
+    assert.equal(conflict.status, 409);
+
+    assert.ok(blob.map.has('config_snapshot_00000001'), '应写入不可变快照');
+    assert.ok(blob.map.has('config_revisions'));
+
+    const list = await json(await revisionsGet(ctx('GET', '/api/config/revisions')));
+    assert.equal(list.revisions[0].revision, 1);
+
+    const rollback = await rollbackPost(ctx('POST', '/api/config/rollback', {
+      headers: { 'If-Match': '1' },
+      body: { revision: 1 },
+    }));
+    assert.equal(rollback.status, 200);
+    assert.equal((await json(rollback)).revision, 2);
+  });
+
+  await t.test('Blob 键名同样符合平台限制', () => {
+    for (const key of blob.map.keys()) {
+      assert.match(key, /^[A-Za-z0-9_]+$/);
+    }
+  });
+});
+
+test('无任何存储时给出 503 + 可执行提示', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  delete globalThis.PURETV_KV;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const res = await configGet(ctx('GET', '/api/config', { env: { CONFIG_STORAGE: 'kv' } }));
+  assert.equal(res.status, 503);
+  const data = await json(res);
+  assert.equal(data.error, 'storage_unavailable');
+  assert.match(data.hint, /PURETV_KV/);
+  assert.match(data.hint, /pages-blob/);
+
+  const health = await json(await healthGet(ctx('GET', '/health', { env: { CONFIG_STORAGE: 'kv' } })));
+  assert.equal(health.status, 'degraded');
+  assert.equal(health.backend, 'none');
+  assert.ok(health.storageError);
+});

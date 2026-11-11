@@ -83,6 +83,12 @@ function clearMessage() {
   $('message').innerHTML = '';
 }
 
+/** 服务端在 503 等场景会给可执行提示（hint），贴出来免得用户只看一句「内部错误」。 */
+function hintOf(error) {
+  const hint = error && error.data && error.data.hint;
+  return hint ? '\n\n' + hint : '';
+}
+
 function markDirty() {
   if (!state.doc || !state.original) return;
   state.dirty = JSON.stringify(state.doc.sections) !== JSON.stringify(state.original.sections);
@@ -344,7 +350,7 @@ async function load() {
     toast('配置加载成功');
   } catch (error) {
     statusText('连接失败');
-    message('加载失败：' + error.message, 'err');
+    message('加载失败：' + error.message + hintOf(error), 'err');
   }
 }
 
@@ -375,7 +381,7 @@ async function save() {
       $('message').innerHTML += '<div class="toolbar" style="margin-top:10px">' +
         '<button class="ghost" data-conflict="reload">载入云端最新版</button></div>';
     } else {
-      message('保存失败：' + error.message, 'err');
+      message('保存失败：' + error.message + hintOf(error), 'err');
     }
     render();
   }
