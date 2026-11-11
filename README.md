@@ -29,8 +29,10 @@ editor/                 在线配置编辑器（零依赖静态页，同源托�
 tests/                  23 个单元测试（unittest）
 docs/
   API.md                接口说明
-  DEPLOY_FC.md          阿里云 FC 3.0 + OSS 部署步骤
-scripts/run_local.sh    本地一键启动
+  DEPLOY_FC.md          阿里云 FC 3.0 完整部署教程（构建包 / 三种存储方案 / 排错表）
+scripts/
+  run_local.sh          本地一键启动
+  build_fc_package.py   生成阿里云 FC 代码包（输出到 dist/，已 gitignore）
 index.py                FC Python HTTP 函数入口（index.handler）
 .env.example            环境变量样例
 requirements.txt        仅 OSS 后端需要 oss2
@@ -43,6 +45,21 @@ cd G:/workbuddy/puretv/pure_live_tv_cloud
 python3 -m unittest discover -s tests -v     # 23 个测试
 sh scripts/run_local.sh                       # 默认 http://127.0.0.1:8080/
 ```
+
+## 打包部署到阿里云 FC
+
+```bash
+python scripts/build_fc_package.py
+# -> dist/pu_tv_cloud_fc_v1.0.0.zip（约 26 KB，零第三方依赖）
+```
+
+在 FC 控制台创建 Python 3.10 HTTP 函数、上传该 zip、请求处理程序填 `index.handler`，
+设置 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` 即可验证接口与在线编辑器。
+包内自带 `DEPLOY.md` 速查，完整步骤见 [docs/DEPLOY_FC.md](docs/DEPLOY_FC.md)。
+
+注意三种存储方案的区别：**file 裸跑仅供验证**（FC 无状态，重启回 seed）、
+**OSS + oss2 用于生产**（需在 FC WebIDE 执行 `pip3 install -r requirements.txt -t .`）、
+**NAS 挂载 + file 可零依赖持久化**。当前 `OSSStorage` 只支持 AK/SK，不支持函数 RAM 角色。
 
 浏览器打开 `http://127.0.0.1:8080/` 即编辑器。首次启动会自动在 `data/` 生成
 `seed.json` 的副本（revision 0，四节全部 `managed:false`），该目录不入库。
@@ -92,7 +109,8 @@ sh scripts/run_local.sh                       # 默认 http://127.0.0.1:8080/
 ## 终端侧前提
 
 终端库原本依赖 `F:/media_core/packages/...` 绝对路径（10 处），已改为指向公开仓库
-`liuchuancong/media_core` 固定提交的 git 依赖，GitHub Actions 可以还原依赖并打包 APK。
-但生成本改造的工作机没有 Flutter SDK，Dart 侧改动只做过静态核对（括号平衡、
-import 路径、方法一致性），**首次真实编译验证以 GitHub Actions 的 `ci.yml` /
-`dart.yml` 结果为准**，若出现编译错误需按 CI 日志迭代。
+`liuchuancong/media_core` 固定提交的 git 依赖。2026-11-11 已在 GitHub Actions 上完成
+**完整 release 编译验证并发布 v3.0.8 Release（6 个 APK）**：`flutter pub get`、
+`flutter analyze`、双 flavor × 3 ABI 的 R8 打包、Release 上传与 `releases.json` 回写全部通过。
+终端侧接入云端配置使用编译期 `--dart-define=PURE_LIVE_CONFIG_URL/TOKEN`，
+或运行时 Hive 键 `remoteConfigEndpoint` / `remoteConfigToken`（P0 暂无设置 UI）。
