@@ -47,6 +47,23 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(sections["navigation"]["railMenuIds"], list(VALID_MENU_IDS))
         self.assertTrue(any("回退内置全量" in item for item in warnings))
 
+    def test_camel_case_menu_ids_are_kept(self):
+        """回归：客户端用驼峰 id，服务端曾统一转小写比对导致这两项被丢弃。"""
+        sections, warnings = normalize_sections({"navigation": {
+            "managed": True,
+            "railMenuIds": ["favorite", "favoriteAreas", "moviePlayback", "search"],
+        }})
+        self.assertEqual(sections["navigation"]["railMenuIds"],
+                         ["favorite", "favoriteAreas", "moviePlayback", "search"])
+        self.assertEqual(warnings, [])
+
+    def test_menu_ids_match_case_insensitively_but_keep_canonical(self):
+        sections, _ = normalize_sections({"navigation": {
+            "railMenuIds": ["favoriteareas", "MOVIEPLAYBACK"],
+        }})
+        self.assertEqual(sections["navigation"]["railMenuIds"],
+                         ["favoriteAreas", "moviePlayback"])
+
     def test_enum_errors_are_strict(self):
         with self.assertRaises(ConfigError):
             normalize_sections({"update": {"prompt": "unknown"}})

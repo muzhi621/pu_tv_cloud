@@ -22,6 +22,21 @@ const URL_RE = /^https?:\/\/[^\s]+$/i;
 const VALID_SITE_IDS = CATALOG.sites.filter((item) => !item.retired).map((item) => item.id);
 const RETIRED_SITE_IDS = new Set(CATALOG.sites.filter((item) => item.retired).map((item) => item.id));
 const VALID_MENU_IDS = CATALOG.menus.map((item) => item.id);
+
+/**
+ * 大小写无关索引：小写 → catalog 中的原始 id。
+ * 客户端使用驼峰 id（favoriteAreas / moviePlayback），若直接转小写比对会全部
+ * 判为未知并被丢弃；这里只把「比对」降级为大小写无关，写回时仍用原始 id。
+ */
+function idIndex(ids) {
+  const map = new Map();
+  for (const id of ids) map.set(String(id).trim().toLowerCase(), id);
+  return map;
+}
+
+const VALID_SITE_BY_LOWER = idIndex(VALID_SITE_IDS);
+const RETIRED_SITE_BY_LOWER = idIndex([...RETIRED_SITE_IDS]);
+const VALID_MENU_BY_LOWER = idIndex(VALID_MENU_IDS);
 const VALID_PROMPTS = new Set(CATALOG.updatePrompts);
 const VALID_NOTICE_MODES = new Set(CATALOG.noticeModes);
 
@@ -108,24 +123,24 @@ function urls(value, field) {
   return items.filter((item) => URL_RE.test(item)).slice(0, 50);
 }
 
-function filterIds(raw, valid, seed, field, warnings) {
+function filterIds(raw, validIndex, seed, field, warnings) {
   if (raw === undefined) return [...seed];
-  const allowed = new Set(valid);
   const result = [];
   const seen = new Set();
   for (const item of raw) {
-    const normalized = item.trim().toLowerCase();
-    if (RETIRED_SITE_IDS.has(normalized)) {
-      warnings.push(`${field}: 忽略退役站点 ${normalized}`);
+    const key = item.trim().toLowerCase();
+    if (RETIRED_SITE_BY_LOWER.has(key)) {
+      warnings.push(`${field}: 忽略退役站点 ${key}`);
       continue;
     }
-    if (!allowed.has(normalized)) {
-      warnings.push(`${field}: 忽略未知 id ${normalized}`);
+    const canonical = validIndex.get(key);
+    if (canonical === undefined) {
+      warnings.push(`${field}: 忽略未知 id ${key}`);
       continue;
     }
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    result.push(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(canonical);
   }
   if (result.length === 0) {
     warnings.push(`${field}: 白名单为空，回退内置全量（防止客户端 .first 崩溃）`);
@@ -145,7 +160,7 @@ function normalizeSites(part, warnings) {
   base.policy = policy;
   base.enabledSiteIds = filterIds(
     strList(part.enabledSiteIds, 'sites.enabledSiteIds'),
-    VALID_SITE_IDS,
+    VALID_SITE_BY_LOWER,
     base.enabledSiteIds,
     'sites.enabledSiteIds',
     warnings,
@@ -158,7 +173,7 @@ function normalizeNavigation(part, warnings) {
   base.managed = bool(part.managed, false, 'navigation.managed');
   base.railMenuIds = filterIds(
     strList(part.railMenuIds, 'navigation.railMenuIds'),
-    VALID_MENU_IDS,
+    VALID_MENU_BY_LOWER,
     base.railMenuIds,
     'navigation.railMenuIds',
     warnings,

@@ -17,7 +17,7 @@
 > **仓库状态**：已按用户审核同意后提交到 GitHub，默认分支 `main`。
 > 云端库 → `https://github.com/muzhi621/pu_tv_cloud`，
 > 终端库 → `https://github.com/muzhi621/pu_tv_client`。
-> 本库 CI 在 push / PR 时运行 23 个 Python 单元测试、15 项 EdgeOne 接口冒烟、
+> 本库 CI 在 push / PR 时运行 25 个 Python 单元测试、22 项 EdgeOne 接口冒烟、
 > 内联资源一致性检查与语法检查（`.github/workflows/ci.yml`）。
 
 ## 目录
@@ -43,7 +43,7 @@ config/
   site_catalog.json     35 个站点 id（含中文名、退役标记）+ 7 个导航 id
 editor/                 在线配置编辑器源文件（零依赖静态页）
   index.html / app.js / style.css —— EdgeOne 版内联，FC 版同源托管
-tests/                  23 个 Python 单元测试 + test_edgeone.mjs（Node 20 项冒烟，含 Blob 回退）
+tests/                  25 个 Python 单元测试 + test_edgeone.mjs（Node 22 项冒烟，含 Blob 回退与驼峰 id 回归）
 docs/
   API.md                接口说明（两种实现共用同一契约）
   DEPLOY_GITHUB.md      ★ GitHub 直连部署方案（控制台逐项、验证、维护、排错）
@@ -64,8 +64,8 @@ requirements.txt        仅 OSS 后端需要 oss2
 
 ```bash
 cd G:/workbuddy/puretv/pure_live_tv_cloud
-python3 -m unittest discover -s tests -v     # 23 个 Python 测试（FC/自建服务器实现）
-node --test tests/test_edgeone.mjs            # 20 项 EdgeOne 接口冒烟（内存 KV/Blob，无需部署）
+python3 -m unittest discover -s tests -v     # 25 个 Python 测试（FC/自建服务器实现）
+node --test tests/test_edgeone.mjs            # 22 项 EdgeOne 接口冒烟（内存 KV/Blob，无需部署）
 python scripts/build_edgeone_assets.py --check  # 校验内联资源与源文件一致
 sh scripts/run_local.sh                       # Python 版，默认 http://127.0.0.1:8080/
 ```

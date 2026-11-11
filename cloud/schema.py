@@ -45,6 +45,20 @@ VALID_MENU_IDS: tuple[str, ...] = tuple(item["id"] for item in CATALOG["menus"])
 VALID_PROMPTS: frozenset[str] = frozenset(CATALOG["updatePrompts"])
 VALID_NOTICE_MODES: frozenset[str] = frozenset(CATALOG["noticeModes"])
 
+
+def _id_index(ids: tuple[str, ...] | frozenset[str]) -> dict[str, str]:
+    """小写 → catalog 中的原始 id。
+
+    客户端使用驼峰 id（favoriteAreas / moviePlayback），若直接转小写比对会全部
+    判为未知并被丢弃；这里只把「比对」降级为大小写无关，写回时仍用原始 id。
+    """
+    return {str(item).strip().lower(): item for item in ids}
+
+
+VALID_SITE_BY_LOWER = _id_index(VALID_SITE_IDS)
+RETIRED_SITE_BY_LOWER = _id_index(RETIRED_SITE_IDS)
+VALID_MENU_BY_LOWER = _id_index(VALID_MENU_IDS)
+
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
 _URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 
@@ -132,24 +146,25 @@ def _urls(value: Any, field: str) -> list[str]:
     return [item for item in items if _URL_RE.match(item)][:50]
 
 
-def _filter_ids(raw: list[str] | None, valid: tuple[str, ...], seed: list[str],
+def _filter_ids(raw: list[str] | None, valid: dict[str, str], seed: list[str],
                 field: str, warnings: list[str]) -> list[str]:
     if raw is None:
         return list(seed)
     result: list[str] = []
     seen: set[str] = set()
     for item in raw:
-        normalized = item.strip().lower()
-        if normalized in RETIRED_SITE_IDS:
-            warnings.append("%s: 忽略退役站点 %s" % (field, normalized))
+        key = item.strip().lower()
+        if key in RETIRED_SITE_BY_LOWER:
+            warnings.append("%s: 忽略退役站点 %s" % (field, key))
             continue
-        if normalized not in valid:
-            warnings.append("%s: 忽略未知 id %s" % (field, normalized))
+        canonical = valid.get(key)
+        if canonical is None:
+            warnings.append("%s: 忽略未知 id %s" % (field, key))
             continue
-        if normalized in seen:
+        if key in seen:
             continue
-        seen.add(normalized)
-        result.append(normalized)
+        seen.add(key)
+        result.append(canonical)
     if not result:
         warnings.append("%s: 白名单为空，回退内置全量（防止客户端 .first 崩溃）" % field)
         return list(seed)
@@ -166,7 +181,7 @@ def normalize_sites(part: dict, warnings: list[str]) -> dict:
     base["policy"] = policy
     base["enabledSiteIds"] = _filter_ids(
         _str_list(part.get("enabledSiteIds"), "sites.enabledSiteIds"),
-        VALID_SITE_IDS, base["enabledSiteIds"],
+        VALID_SITE_BY_LOWER, base["enabledSiteIds"],
         "sites.enabledSiteIds", warnings,
     )
     return base
@@ -177,7 +192,7 @@ def normalize_navigation(part: dict, warnings: list[str]) -> dict:
     base["managed"] = _bool(part.get("managed"), False, "navigation.managed")
     base["railMenuIds"] = _filter_ids(
         _str_list(part.get("railMenuIds"), "navigation.railMenuIds"),
-        VALID_MENU_IDS, base["railMenuIds"],
+        VALID_MENU_BY_LOWER, base["railMenuIds"],
         "navigation.railMenuIds", warnings,
     )
     base["sidebarExpanded"] = _bool(

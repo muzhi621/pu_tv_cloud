@@ -105,6 +105,27 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.deepEqual(doc.sections.navigation.railMenuIds, ['favorite', 'hot']);
   });
 
+  await t.test('驼峰菜单 id（favoriteAreas/moviePlayback）不被小写化误杀', async () => {
+    // 回归：客户端 AppMenuItem 用的是驼峰 id，服务端曾统一转小写比对，
+    // 导致这两项被判为未知 id 而丢弃，开启导航管控后电视上直接少两个菜单。
+    const [sections, warnings] = normalizeSections({
+      navigation: {
+        managed: true,
+        railMenuIds: ['favorite', 'favoriteAreas', 'moviePlayback', 'search'],
+      },
+    });
+    assert.deepEqual(sections.navigation.railMenuIds,
+      ['favorite', 'favoriteAreas', 'moviePlayback', 'search']);
+    assert.equal(warnings.length, 0);
+  });
+
+  await t.test('大小写不敏感匹配，但写回 catalog 里的原始 id', async () => {
+    const [sections] = normalizeSections({
+      navigation: { railMenuIds: ['favoriteareas', 'MOVIEPLAYBACK'] },
+    });
+    assert.deepEqual(sections.navigation.railMenuIds, ['favoriteAreas', 'moviePlayback']);
+  });
+
   await t.test('revision 冲突返回 409 并带回当前文档', async () => {
     const res = await configPut(ctx('PUT', '/api/config', {
       headers: { 'If-Match': '0' },

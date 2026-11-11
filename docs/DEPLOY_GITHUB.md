@@ -123,8 +123,8 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 发布前本地自检（CI 也会跑同一套）：
 
 ```bash
-python -m unittest discover -s tests        # 23 个 Python 单测
-node --test tests/test_edgeone.mjs          # 15 项 EdgeOne 冒烟
+python -m unittest discover -s tests        # 25 个 Python 单测
+node --test tests/test_edgeone.mjs          # 22 项 EdgeOne 冒烟
 python scripts/build_edgeone_assets.py --check
 ```
 
