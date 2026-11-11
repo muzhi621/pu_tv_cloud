@@ -29,7 +29,7 @@ jobs:
       - name: 设置Node环境
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Python 语法检查
         run: python -m compileall -q cloud index.py
@@ -40,5 +40,17 @@ jobs:
       - name: 配置 JSON 可解析性
         run: python -c "import json,pathlib; [json.loads(p.read_text(encoding='utf-8')) for p in pathlib.Path('config').glob('*.json')]"
 
-      - name: 单元测试
+      - name: 单元测试（Python / FC 实现）
         run: python -m unittest discover -s tests -v
+
+      - name: EdgeOne 内联资源一致性
+        run: python scripts/build_edgeone_assets.py --check
+
+      - name: EdgeOne 函数 JS 语法检查
+        run: |
+          for f in $(find edgeone/edge-functions -name '*.js' | sort); do
+            node --check "$f"
+          done
+
+      - name: EdgeOne 接口冒烟测试
+        run: node --test tests/test_edgeone.mjs

@@ -1,0 +1,6 @@
+{
+  "buildCommand": "echo no-build",
+  "installCommand": "echo no-install",
+  "outputDirectory": "public",
+  "nodeVersion": "22.11.0"
+}

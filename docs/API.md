@@ -1,6 +1,9 @@
 # 配置服务接口说明（v1）
 
-Base URL：部署后为 FC HTTP 触发器域名；本地为 `http://127.0.0.1:8080`。
+Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEONE.md](DEPLOY_EDGEONE.md)）；
+备选阿里云 FC 为 HTTP 触发器域名；本地 Python 版为 `http://127.0.0.1:8080`。
+EdgeOne（JavaScript Edge Functions）与 FC（Python WSGI）两个实现的路径、请求头、
+状态码与 JSON 结构**完全一致**，终端 APK 只需更换 Base URL。
 除 `/health` 与静态编辑器外，所有 `/api/*` 请求需要 `Authorization: Bearer <read-token>`。
 写入类接口（PUT、rollback）需要 `<write-token>`。
 
@@ -14,12 +17,13 @@ Base URL：部署后为 FC HTTP 触发器域名；本地为 `http://127.0.0.1:80
 | GET | `/api/config/catalog` | read | 站点/导航 id 目录（编辑器选项来源） |
 | GET | `/api/config/revisions?limit=20` | read | 历史快照列表（倒序） |
 | POST | `/api/config/rollback` | write | 回滚到指定快照，生成新 revision |
-| GET | `/`、`/app.js`、`/style.css` | 无 | 在线编辑器静态资源 |
+| GET | `/` | 无 | 在线编辑器；EdgeOne 版为内联单页，FC 版另提供 `/app.js`、`/style.css` |
 
 ## GET /api/config
 
 响应头：`ETag: "<revision>"`、`X-Revision`、`X-Schema-Version: 1`、
-`Cache-Control: no-store`；请求带 `Accept-Encoding: gzip` 时响应体 gzip 压缩。
+`Cache-Control: no-store`；FC 版在请求带 `Accept-Encoding: gzip` 时压缩响应体，
+EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异）。
 
 ```json
 {

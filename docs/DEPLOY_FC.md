@@ -1,5 +1,10 @@
 # 阿里云函数计算 FC 3.0 部署教程 · pu_tv_cloud 配置下发服务
 
+> **⚠️ 本方案自 2026-11-11 起改为备选**：默认部署目标已换成腾讯 EdgeOne Pages，
+> 因为阿里云 FC 的函数调用、公网流量与 OSS/NAS 存储会持续产生按量费用，
+> 而 EdgeOne 免费版足够承载本服务。请优先看 [DEPLOY_EDGEONE.md](DEPLOY_EDGEONE.md)。
+> 本文保留供已有 FC 环境、本地自建服务器或需要 Python 实现时参考。
+
 日期：2026-11-11 | 配套构建包：`pu_tv_cloud_fc_v1.0.0.zip`（25.6 KB / 14 个文件，零第三方依赖）
 适用仓库：`github.com/muzhi621/pu_tv_cloud`
 

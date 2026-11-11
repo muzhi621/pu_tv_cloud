@@ -4,37 +4,56 @@
 
 | 仓库 | 路径 | 内容 |
 |---|---|---|
-| **cloud（本库）** | `G:/workbuddy/puretv/pure_live_tv_cloud` | FC 配置服务、配置契约、在线编辑器、测试、部署脚本 |
+| **cloud（本库）** | `G:/workbuddy/puretv/pure_live_tv_cloud` | **EdgeOne 配置服务（默认）**、FC 备选、配置契约、在线编辑器、测试、部署脚本 |
 | **client（终端库）** | `G:/workbuddy/puretv/pure_live_tv_client` | 完整 Flutter 客户端源码 + `RemoteConfigService` 改造 |
 | 需求文档 | `G:/workbuddy/puretv/纯粹直播TV_云端配置下发_需求文档_v1.0.md` | 契约、FR、改动清单、验收、风险、分期 |
+
+> **部署目标（2026-11-11 起）**：默认改为**腾讯 EdgeOne Pages（Edge Functions + KV）**。
+> 原因是阿里云 FC 的函数调用、公网流量与 OSS/NAS 存储会持续产生按量费用，
+> 而 EdgeOne Pages 免费版的额度对本服务「开机拉一次几 KB JSON」的用量等于零成本。
+> **接口契约完全不变**，终端 APK 只需换配置地址。原 FC/Python 实现保留为备选，
+> 可用于本地自建服务器或已有 FC 环境。完整步骤见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)。
 
 > **仓库状态**：已按用户审核同意后提交到 GitHub，默认分支 `main`。
 > 云端库 → `https://github.com/muzhi621/pu_tv_cloud`，
 > 终端库 → `https://github.com/muzhi621/pu_tv_client`。
-> 本库 CI 在 push / PR 时运行 23 个单元测试与语法检查（`.github/workflows/ci.yml`）。
+> 本库 CI 在 push / PR 时运行 23 个 Python 单元测试、14 项 EdgeOne 接口冒烟、
+> 内联资源一致性检查与语法检查（`.github/workflows/ci.yml`）。
 
 ## 目录
 
 ```
-cloud/                  服务代码（零第三方依赖，OSS 后端除外）
+cloud/                  Python/WSGI 实现（FC、自建服务器；零第三方依赖，OSS 后端除外）
   schema.py             配置契约：校验、规范化、兜底（需求文档 4.2~4.4）
   storage.py            FileStorage / OSSStorage、revision 乐观锁、历史快照
   app.py                WSGI 应用：API + 鉴权 + ETag/304/409 + 静态编辑器
   server.py             本地 / 自建服务器 / FC Web 函数启动入口
+edgeone/                ★ EdgeOne Pages 部署包（默认）
+  edge-functions/
+    index.js            GET / 内联编辑器单页
+    health.js           GET /health
+    api/config/         GET/PUT config、catalog、revisions、rollback
+    _lib/               contract.js（契约）/ storage.js（KV+乐观锁）/ http.js
+                        + data.js、editor.js（由构建脚本生成，勿手改）
+  edgeone.json          项目配置：无构建、输出目录 public
+  .env.example          EdgeOne 环境变量样例
+  README.md             部署速查
 config/
-  seed.json             内置兜底配置（四节全部 managed:false）
+  seed.json             内置兜底配置（四节全部 managed:false）—— 两个实现共用
   site_catalog.json     35 个站点 id（含中文名、退役标记）+ 7 个导航 id
-editor/                 在线配置编辑器（零依赖静态页，同源托管）
-  index.html / app.js / style.css
-tests/                  23 个单元测试（unittest）
+editor/                 在线配置编辑器源文件（零依赖静态页）
+  index.html / app.js / style.css —— EdgeOne 版内联，FC 版同源托管
+tests/                  23 个 Python 单元测试 + test_edgeone.mjs（Node 14 项冒烟）
 docs/
-  API.md                接口说明
-  DEPLOY_FC.md          阿里云 FC 3.0 完整部署教程（构建包 / 三种存储方案 / 排错表）
+  API.md                接口说明（两种实现共用同一契约）
+  DEPLOY_EDGEONE.md     ★ 腾讯 EdgeOne Pages 完整部署教程（免费额度 / KV / 验证 / 排错）
+  DEPLOY_FC.md          阿里云 FC 3.0 备选方案（会产生按量费用）
 scripts/
-  run_local.sh          本地一键启动
-  build_fc_package.py   生成阿里云 FC 代码包（输出到 dist/，已 gitignore）
+  run_local.sh          本地一键启动 Python 版
+  build_edgeone_assets.py  ★ 生成 EdgeOne 内联资源；--check 校验；--zip 打包
+  build_fc_package.py   生成阿里云 FC 代码包（备选）
 index.py                FC Python HTTP 函数入口（index.handler）
-.env.example            环境变量样例
+.env.example            Python/FC 版环境变量样例
 requirements.txt        仅 OSS 后端需要 oss2
 ```
 
@@ -42,30 +61,42 @@ requirements.txt        仅 OSS 后端需要 oss2
 
 ```bash
 cd G:/workbuddy/puretv/pure_live_tv_cloud
-python3 -m unittest discover -s tests -v     # 23 个测试
-sh scripts/run_local.sh                       # 默认 http://127.0.0.1:8080/
+python3 -m unittest discover -s tests -v     # 23 个 Python 测试（FC/自建服务器实现）
+node --test tests/test_edgeone.mjs            # 14 项 EdgeOne 接口冒烟（内存 KV，无需部署）
+python scripts/build_edgeone_assets.py --check  # 校验内联资源与源文件一致
+sh scripts/run_local.sh                       # Python 版，默认 http://127.0.0.1:8080/
 ```
 
-## 打包部署到阿里云 FC
+## 打包部署到腾讯 EdgeOne Pages（默认）
+
+```bash
+python scripts/build_edgeone_assets.py --zip
+# -> dist/pu_tv_cloud_edgeone_v1.0.0.zip（约 24 KB / 15 文件，零依赖、零构建）
+```
+
+控制台创建 Pages 项目 → 开通 KV 并创建命名空间 → **绑定变量名 `PURETV_KV`** →
+设置 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` → 上传该 zip（或
+`edgeone pages deploy ./dist/pu_tv_cloud_edgeone_v1.0.0.zip -n pu-tv-cloud`）。
+完整步骤、验证 curl、终端接入与排错见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)。
+
+浏览器打开项目域名根路径即编辑器。首次访问自动在 KV 写入 `seed.json` 的副本
+（revision 0，四节全部 `managed:false`）。**生产环境务必配置两个 Token**；
+都为空时服务处于开发模式，接口不鉴权。
+
+KV 是最终一致性（其他边缘节点最长 60s 读到旧值），写入节点立即生效；
+本服务是单人编辑 + `If-Match` 乐观锁，个人规模足够。
+
+## 备选：阿里云 FC / 本地自建服务器
 
 ```bash
 python scripts/build_fc_package.py
 # -> dist/pu_tv_cloud_fc_v1.0.0.zip（约 26 KB，零第三方依赖）
 ```
 
-在 FC 控制台创建 Python 3.10 HTTP 函数、上传该 zip、请求处理程序填 `index.handler`，
-设置 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` 即可验证接口与在线编辑器。
-包内自带 `DEPLOY.md` 速查，完整步骤见 [docs/DEPLOY_FC.md](docs/DEPLOY_FC.md)。
-
-注意三种存储方案的区别：**file 裸跑仅供验证**（FC 无状态，重启回 seed）、
-**OSS + oss2 用于生产**（需在 FC WebIDE 执行 `pip3 install -r requirements.txt -t .`）、
-**NAS 挂载 + file 可零依赖持久化**。当前 `OSSStorage` 只支持 AK/SK，不支持函数 RAM 角色。
-
-浏览器打开 `http://127.0.0.1:8080/` 即编辑器。首次启动会自动在 `data/` 生成
-`seed.json` 的副本（revision 0，四节全部 `managed:false`），该目录不入库。
-
-生产环境务必设置 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN`（见 `.env.example`）。
-两个 Token 都为空时服务处于**开发模式**，接口不鉴权，仅限本机/内网使用。
+FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
+**OSS + oss2 用于生产**（WebIDE 执行 `pip3 install -r requirements.txt -t .`）、
+**NAS 挂载 + file 可零依赖持久化**。当前 `OSSStorage` 只支持 AK/SK 明文凭证，
+不支持函数 RAM 角色。FC 与 OSS/NAS 会持续产生按量费用，详见 [docs/DEPLOY_FC.md](docs/DEPLOY_FC.md)。
 
 ## 配置契约（v1）
 
@@ -93,9 +124,10 @@ python scripts/build_fc_package.py
 
 ## 流量与成本
 
-一次 `GET /api/config` 经 gzip 约 1–3 KB，命中 304 仅几十字节。单台电视每天开机
-5 次约 150 次/月 ≈ 0.5 MB/月。**不要把 M3U 订阅抓取放到 FC 定时触发**，出公网流量
-走 CDT 单独计费；订阅刷新仍留在客户端。
+一次 `GET /api/config` 约 1–3 KB，命中 304 仅几十字节。单台电视每天开机
+5 次约 150 次/月 ≈ 0.5 MB/月，落在 EdgeOne 免费版额度内（Edge Functions
+300 万次/月、KV 1 GB）。**不要把 M3U 订阅抓取放到云端定时触发**：出公网流量与
+抓取逻辑都不属于本服务，订阅刷新仍留在客户端。
 
 ## 安全
 
@@ -103,14 +135,15 @@ python scripts/build_fc_package.py
 - `PUT` 必须携带 `If-Match`（或 `expectedRevision`），缺版本拒绝覆盖，冲突返回 409。
 - CORS 默认关闭；跨域部署时 `CONFIG_CORS_ORIGINS` 填精确域名，**不要用 `*`**。
 - Cookie、代理凭据等敏感设置 v1 不上云；弹窗默认可关闭、强更默认关闭。
-- FC 多实例并发写时 OSS 无跨实例 CAS 原语，本实现为「读-比较-写」乐观锁，适合
-  单写入者 / 个人规模；多写入者建议 Tablestore 原子计数或把实例并发上限设为 1。
+- EdgeOne KV 为最终一致，写操作是「读-比较-写」乐观锁，适合单写入者 / 个人规模；
+  FC 多实例 + OSS 同理，多写入者场景需原子计数或把并发上限设为 1。
 
 ## 终端侧前提
 
 终端库原本依赖 `F:/media_core/packages/...` 绝对路径（10 处），已改为指向公开仓库
 `liuchuancong/media_core` 固定提交的 git 依赖。2026-11-11 已在 GitHub Actions 上完成
-**完整 release 编译验证并发布 v3.0.8 Release（6 个 APK）**：`flutter pub get`、
-`flutter analyze`、双 flavor × 3 ABI 的 R8 打包、Release 上传与 `releases.json` 回写全部通过。
+**完整 release 编译验证并发布 v3.0.8 Release**：`flutter pub get`、`flutter analyze`、
+双 flavor × 3 ABI 的 R8 打包、Release 上传与 `releases.json` 回写全部通过。
+（A 档瘦身后默认改为 **只发 impeller × armeabi-v7a/arm64-v8a 两个 ABI**，下次发版生效。）
 终端侧接入云端配置使用编译期 `--dart-define=PURE_LIVE_CONFIG_URL/TOKEN`，
 或运行时 Hive 键 `remoteConfigEndpoint` / `remoteConfigToken`（P0 暂无设置 UI）。
