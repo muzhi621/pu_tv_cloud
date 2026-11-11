@@ -1,0 +1,6 @@
+User-agent: *
+Disallow: /api/
+
+# 说明：本文件只用于让 EdgeOne 的静态输出目录 public/ 保持非空。
+# 站点根路径 "/" 由 edge-functions/index.js 提供在线编辑器，
+# 因此这里刻意不放 index.html，避免静态资源优先规则覆盖函数首页路由。

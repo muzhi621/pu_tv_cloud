@@ -48,7 +48,7 @@ jobs:
 
       - name: EdgeOne 函数 JS 语法检查
         run: |
-          for f in $(find edgeone/edge-functions -name '*.js' | sort); do
+          for f in $(find edge-functions -name '*.js' | sort); do
             node --check "$f"
           done
 

@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""生成 EdgeOne 部署所需的内联资源，并可选打包上传用的 zip。
+"""生成 EdgeOne 部署所需的内联资源，并可选打包离线归档用的 zip。
 
 用法：
-    python scripts/build_edgeone_assets.py            # 重新生成 _lib/data.js 与 _lib/editor.js
+    python scripts/build_edgeone_assets.py            # 重新生成 edge-functions/_lib/data.js 与 editor.js
     python scripts/build_edgeone_assets.py --check   # CI：校验生成物是否与源文件一致
     python scripts/build_edgeone_assets.py --zip     # 额外生成 dist/pu_tv_cloud_edgeone_v1.0.0.zip
 
 单一数据源：config/seed.json、config/site_catalog.json、editor/*。
 Edge Functions 只支持 JavaScript、代码包上限 5 MB，且不能依赖运行时文件路径，
 所以把契约数据和编辑器页面在构建前内联成 JS 常量，部署时零依赖、零构建。
+
+目录约定：本仓库根目录**就是** EdgeOne Pages 项目根目录，edge-functions/ 与
+edgeone.json 必须位于仓库根，这样「Git 导入」时根目录保持默认 ./ 即可零配置部署。
+zip 只是离线归档 / CLI 部署用，控制台「直接上传」有额外的 index.html 要求，见部署教程。
 """
 from __future__ import annotations
 
@@ -19,8 +23,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EDGEONE = ROOT / "edgeone"
-LIB = EDGEONE / "edge-functions" / "_lib"
+FUNCTIONS = ROOT / "edge-functions"
+LIB = FUNCTIONS / "_lib"
 DIST = ROOT / "dist"
 ZIP_NAME = "pu_tv_cloud_edgeone_v1.0.0.zip"
 
@@ -93,17 +97,21 @@ def write_all(check_only: bool = False) -> bool:
     return ok
 
 
+def zip_sources() -> list[Path]:
+    """只打包 EdgeOne 项目文件，不把 Python/FC 备选实现和测试打进去。"""
+    files = [ROOT / "edgeone.json", ROOT / "package.json"]
+    files += sorted(p for p in FUNCTIONS.rglob("*.js"))
+    files += sorted(p for p in (ROOT / "public").rglob("*") if p.is_file())
+    return [p for p in files if p.is_file() and "__pycache__" not in p.parts]
+
+
 def build_zip() -> Path:
     DIST.mkdir(parents=True, exist_ok=True)
     target = DIST / ZIP_NAME
-    excluded = {"__pycache__", "node_modules", ".DS_Store"}
-    files = sorted(
-        p for p in EDGEONE.rglob("*")
-        if p.is_file() and not any(part in excluded for part in p.parts)
-    )
+    files = zip_sources()
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for path in files:
-            zf.write(path, path.relative_to(EDGEONE).as_posix())
+            zf.write(path, path.relative_to(ROOT).as_posix())
     print("ZIP  %s (%d 个文件, %d bytes)" % (target, len(files), target.stat().st_size))
     return target
 
@@ -111,7 +119,7 @@ def build_zip() -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成 EdgeOne 部署资源")
     parser.add_argument("--check", action="store_true", help="只校验生成物是否与源文件一致")
-    parser.add_argument("--zip", action="store_true", help="额外生成部署 zip")
+    parser.add_argument("--zip", action="store_true", help="额外生成离线归档 zip")
     args = parser.parse_args()
 
     ok = write_all(check_only=args.check)

@@ -9,14 +9,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { onRequestGet as configGet, onRequestPut as configPut } from '../edgeone/edge-functions/api/config/index.js';
-import { onRequestGet as catalogGet } from '../edgeone/edge-functions/api/config/catalog.js';
-import { onRequestGet as revisionsGet } from '../edgeone/edge-functions/api/config/revisions.js';
-import { onRequestPost as rollbackPost } from '../edgeone/edge-functions/api/config/rollback.js';
-import { onRequestGet as healthGet } from '../edgeone/edge-functions/health.js';
-import { onRequestGet as editorGet } from '../edgeone/edge-functions/index.js';
-import { normalizeDocument, normalizeSections } from '../edgeone/edge-functions/_lib/contract.js';
-import { optionsHandler } from '../edgeone/edge-functions/_lib/http.js';
+import { onRequestGet as configGet, onRequestPut as configPut } from '../edge-functions/api/config/index.js';
+import { onRequestGet as catalogGet } from '../edge-functions/api/config/catalog.js';
+import { onRequestGet as revisionsGet } from '../edge-functions/api/config/revisions.js';
+import { onRequestPost as rollbackPost } from '../edge-functions/api/config/rollback.js';
+import { onRequestGet as healthGet } from '../edge-functions/health.js';
+import { onRequestGet as editorGet } from '../edge-functions/index.js';
+import { normalizeDocument, normalizeSections } from '../edge-functions/_lib/contract.js';
+import { optionsHandler } from '../edge-functions/_lib/http.js';
 
 class MemoryKV {
   constructor() { this.map = new Map(); }

@@ -5,6 +5,6 @@
   "type": "module",
   "description": "纯粹直播 TV 云端配置下发服务（腾讯 EdgeOne Pages Edge Functions + KV）",
   "scripts": {
-    "test": "node --test ../tests/test_edgeone.mjs"
+    "test": "node --test tests/test_edgeone.mjs"
   }
 }

@@ -17,7 +17,7 @@
 > **仓库状态**：已按用户审核同意后提交到 GitHub，默认分支 `main`。
 > 云端库 → `https://github.com/muzhi621/pu_tv_cloud`，
 > 终端库 → `https://github.com/muzhi621/pu_tv_client`。
-> 本库 CI 在 push / PR 时运行 23 个 Python 单元测试、14 项 EdgeOne 接口冒烟、
+> 本库 CI 在 push / PR 时运行 23 个 Python 单元测试、15 项 EdgeOne 接口冒烟、
 > 内联资源一致性检查与语法检查（`.github/workflows/ci.yml`）。
 
 ## 目录
@@ -28,16 +28,16 @@ cloud/                  Python/WSGI 实现（FC、自建服务器；零第三方
   storage.py            FileStorage / OSSStorage、revision 乐观锁、历史快照
   app.py                WSGI 应用：API + 鉴权 + ETag/304/409 + 静态编辑器
   server.py             本地 / 自建服务器 / FC Web 函数启动入口
-edgeone/                ★ EdgeOne Pages 部署包（默认）
-  edge-functions/
-    index.js            GET / 内联编辑器单页
-    health.js           GET /health
-    api/config/         GET/PUT config、catalog、revisions、rollback
-    _lib/               contract.js（契约）/ storage.js（KV+乐观锁）/ http.js
+★ 仓库根目录即 EdgeOne Pages 项目根（Git 导入零配置）
+edge-functions/         ★ Edge Functions（ES2023+，零依赖）
+  index.js              GET / 内联编辑器单页
+  health.js             GET /health
+  api/config/           GET/PUT config、catalog、revisions、rollback
+  _lib/                 contract.js（契约）/ storage.js（KV+乐观锁）/ http.js
                         + data.js、editor.js（由构建脚本生成，勿手改）
-  edgeone.json          项目配置：无构建、输出目录 public
-  .env.example          EdgeOne 环境变量样例
-  README.md             部署速查
+edgeone.json            ★ 项目配置：无构建、输出目录 public、Node 22.11.0
+public/robots.txt       让静态输出目录非空（不放 index.html，避免覆盖函数首页）
+package.json            仅声明 ESM 与本地测试脚本，零第三方依赖
 config/
   seed.json             内置兜底配置（四节全部 managed:false）—— 两个实现共用
   site_catalog.json     35 个站点 id（含中文名、退役标记）+ 7 个导航 id
@@ -46,7 +46,9 @@ editor/                 在线配置编辑器源文件（零依赖静态页）
 tests/                  23 个 Python 单元测试 + test_edgeone.mjs（Node 14 项冒烟）
 docs/
   API.md                接口说明（两种实现共用同一契约）
-  DEPLOY_EDGEONE.md     ★ 腾讯 EdgeOne Pages 完整部署教程（免费额度 / KV / 验证 / 排错）
+  DEPLOY_EDGEONE.md     ★ 腾讯 EdgeOne Pages 完整部署教程（Git 导入 / KV / 验证 / 排错）
+  EDGEONE_LAYOUT.md     EdgeOne 项目根目录布局与部署前必做
+  edgeone.env.example   EdgeOne 环境变量样例
   DEPLOY_FC.md          阿里云 FC 3.0 备选方案（会产生按量费用）
 scripts/
   run_local.sh          本地一键启动 Python 版
@@ -62,22 +64,30 @@ requirements.txt        仅 OSS 后端需要 oss2
 ```bash
 cd G:/workbuddy/puretv/pure_live_tv_cloud
 python3 -m unittest discover -s tests -v     # 23 个 Python 测试（FC/自建服务器实现）
-node --test tests/test_edgeone.mjs            # 14 项 EdgeOne 接口冒烟（内存 KV，无需部署）
+node --test tests/test_edgeone.mjs            # 15 项 EdgeOne 接口冒烟（内存 KV，无需部署）
 python scripts/build_edgeone_assets.py --check  # 校验内联资源与源文件一致
 sh scripts/run_local.sh                       # Python 版，默认 http://127.0.0.1:8080/
 ```
 
-## 打包部署到腾讯 EdgeOne Pages（默认）
+## 部署到腾讯 EdgeOne Pages（默认，Git 导入）
 
-```bash
-python scripts/build_edgeone_assets.py --zip
-# -> dist/pu_tv_cloud_edgeone_v1.0.0.zip（约 24 KB / 15 文件，零依赖、零构建）
-```
+**仓库根目录就是 EdgeOne 项目根目录**，所以控制台「Git 导入」后**构建设置保持默认即可**：
+`edge-functions/`、`edgeone.json` 都在根上，平台会自动读取 `edgeone.json` 的
+「无构建 + 输出目录 `public`」，以后每次 push `main` 自动重新部署。
 
-控制台创建 Pages 项目 → 开通 KV 并创建命名空间 → **绑定变量名 `PURETV_KV`** →
-设置 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` → 上传该 zip（或
-`edgeone pages deploy ./dist/pu_tv_cloud_edgeone_v1.0.0.zip -n pu-tv-cloud`）。
-完整步骤、验证 curl、终端接入与排错见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)。
+1. 控制台 **存储 → KV**：开通账户、创建命名空间、绑定项目，**变量名填 `PURETV_KV`**。
+2. 创建项目页展开「**环境变量**」，填 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN`
+   （**必须先填再点开始部署**，环境变量变更只对之后的部署生效）。
+3. 「从 Git 导入」选 `muzhi621/pu_tv_cloud`、生产分支 `main` → 开始部署。
+4. 用教程里的 5 条 curl 验证，浏览器打开项目域名根路径即在线编辑器。
+
+> ⚠️ **不要选「直接上传 zip」**：该方式要求压缩包根目录含 `index.html`（本项目首页由
+> 函数提供，放 index.html 会覆盖编辑器路由），且 `edgeone.json` 在该方式下只支持
+> redirects/rewrites/headers，还**永久无法切换回 Git 自动部署**。
+> `python scripts/build_edgeone_assets.py --zip` 生成的包仅用于离线归档 / CLI 部署。
+
+完整步骤、验证 curl、终端接入与排错见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)，
+目录约定见 [docs/EDGEONE_LAYOUT.md](docs/EDGEONE_LAYOUT.md)。
 
 浏览器打开项目域名根路径即编辑器。首次访问自动在 KV 写入 `seed.json` 的副本
 （revision 0，四节全部 `managed:false`）。**生产环境务必配置两个 Token**；
