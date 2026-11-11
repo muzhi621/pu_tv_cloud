@@ -1,0 +1,44 @@
+name: ci
+
+# 云端库零第三方依赖，CI 只做语法检查与单元测试。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: cloud-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 签出代码
+        uses: actions/checkout@v4
+
+      - name: 设置Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 设置Node环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Python 语法检查
+        run: python -m compileall -q cloud index.py
+
+      - name: 编辑器 JS 语法检查
+        run: node --check editor/app.js
+
+      - name: 配置 JSON 可解析性
+        run: python -c "import json,pathlib; [json.loads(p.read_text(encoding='utf-8')) for p in pathlib.Path('config').glob('*.json')]"
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v

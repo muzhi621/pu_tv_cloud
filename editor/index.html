@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>纯粹直播 TV · 云端配置编辑器</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">TV</span>
+      <div>
+        <h1>纯粹直播 TV · 云端配置</h1>
+        <p>只下发配置，不承载播放流量</p>
+      </div>
+    </div>
+    <div class="conn">
+      <label>API 地址<input id="apiBase" type="text" placeholder="留空 = 同源部署"></label>
+      <label>访问令牌<input id="apiToken" type="password" placeholder="Bearer Token"></label>
+      <button id="btnConnect" class="primary">连接并加载</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="statusbar">
+      <span id="statusText" class="muted">尚未连接</span>
+      <span id="revBadge" class="badge">revision —</span>
+      <span id="devBadge" class="badge warn" hidden>开发模式：接口未鉴权</span>
+      <span class="spacer"></span>
+      <button id="btnRaw" class="ghost">原始 JSON</button>
+      <button id="btnDiff" class="ghost">查看改动</button>
+      <button id="btnHistory" class="ghost">历史 / 回滚</button>
+      <button id="btnSave" class="primary" disabled>保存到云端</button>
+    </section>
+
+    <nav class="tabs" id="tabs">
+      <button data-tab="sites" class="active">直播平台</button>
+      <button data-tab="navigation">导航栏</button>
+      <button data-tab="startup">启动弹窗</button>
+      <button data-tab="update">在线更新</button>
+    </nav>
+
+    <section id="panel" class="panel"></section>
+
+    <section id="extra" class="extra" hidden></section>
+
+    <section id="message" class="message" hidden></section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
