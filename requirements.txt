@@ -1,0 +1,3 @@
+# 默认「文件后端」不需要任何第三方依赖。
+# 只有把 CONFIG_STORAGE_BACKEND=oss 部署到阿里云 OSS 时才需要：
+oss2>=2.18.0

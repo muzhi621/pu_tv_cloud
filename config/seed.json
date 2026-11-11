@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "revision": 0,
+  "updatedAt": "2026-01-01T00:00:00+08:00",
+  "sections": {
+    "sites": {
+      "managed": false,
+      "policy": "whitelist",
+      "enabledSiteIds": [
+        "weibo",
+        "niconico",
+        "bilibili",
+        "douyu",
+        "huya",
+        "douyin",
+        "kuaishou",
+        "cc",
+        "iptv",
+        "twitch",
+        "soop",
+        "yy",
+        "acfun",
+        "picarto",
+        "twitcasting",
+        "missevan",
+        "inke",
+        "kilakila",
+        "xiaohongshu",
+        "showroom",
+        "chzzk",
+        "kick",
+        "liveme",
+        "tiktok",
+        "youtube",
+        "bigo",
+        "pandalive",
+        "fc2live",
+        "steambroadcast",
+        "jdlive",
+        "kugoulive",
+        "baidulive",
+        "looklive",
+        "17live",
+        "sixroom"
+      ]
+    },
+    "navigation": {
+      "managed": false,
+      "railMenuIds": [
+        "favorite",
+        "hot",
+        "areas",
+        "favoriteAreas",
+        "moviePlayback",
+        "search",
+        "history"
+      ],
+      "sidebarExpanded": false,
+      "homeKeepAlive": true,
+      "settings": {
+        "managed": false,
+        "enabledEntryPaths": []
+      }
+    },
+    "startup": {
+      "managed": false,
+      "agreement": {
+        "enabled": true,
+        "requiredVersion": 1,
+        "titleI18n": {},
+        "bodyI18n": {}
+      },
+      "notice": {
+        "enabled": false,
+        "mode": "once_per_revision",
+        "dismissible": true,
+        "titleI18n": {},
+        "bodyI18n": {}
+      },
+      "showSplashPage": true
+    },
+    "update": {
+      "managed": false,
+      "autoCheck": true,
+      "checkIntervalHours": 24,
+      "prompt": "dialog",
+      "minSupportedVersion": "",
+      "allowPrerelease": false,
+      "allowUserOverride": true,
+      "mirrorUrls": [],
+      "changelogI18n": {}
+    }
+  }
+}

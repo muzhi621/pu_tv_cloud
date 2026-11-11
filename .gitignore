@@ -1,0 +1,11 @@
+# 运行时数据：配置文档是部署产物，不入库（首次启动自动生成 seed）
+data/
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+dist/
+.DS_Store
