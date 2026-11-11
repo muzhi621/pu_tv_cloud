@@ -46,7 +46,8 @@ editor/                 在线配置编辑器源文件（零依赖静态页）
 tests/                  23 个 Python 单元测试 + test_edgeone.mjs（Node 14 项冒烟）
 docs/
   API.md                接口说明（两种实现共用同一契约）
-  DEPLOY_EDGEONE.md     ★ 腾讯 EdgeOne Pages 完整部署教程（Git 导入 / KV / 验证 / 排错）
+  DEPLOY_GITHUB.md      ★ GitHub 直连部署方案（控制台逐项、验证、维护、排错）
+  DEPLOY_EDGEONE.md     腾讯 EdgeOne Pages 完整教程（平台能力、KV、终端接入）
   EDGEONE_LAYOUT.md     EdgeOne 项目根目录布局与部署前必做
   edgeone.env.example   EdgeOne 环境变量样例
   DEPLOY_FC.md          阿里云 FC 3.0 备选方案（会产生按量费用）
