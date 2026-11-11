@@ -3,7 +3,8 @@
 
 const state = {
   base: '',
-  token: '',
+  token: '',          // 读令牌：GET /api/* 与 /health
+  writeToken: '',     // 写令牌：PUT /api/config、POST rollback；留空时回退读令牌
   doc: null,
   original: null,
   catalog: null,
@@ -35,18 +36,22 @@ function setPath(obj, path, value) {
   cursor[keys[keys.length - 1]] = value;
 }
 
-function headers(extra) {
+function headers(extra, token) {
   const base = { 'Content-Type': 'application/json' };
-  if (state.token) base.Authorization = 'Bearer ' + state.token;
+  // 服务端读写令牌分离：读接口只认 CONFIG_READ_TOKEN，写接口只认
+  // CONFIG_WRITE_TOKEN。这里按请求类型选令牌，避免「能加载但保存 401」。
+  const value = token === undefined ? state.token : token;
+  if (value) base.Authorization = 'Bearer ' + value;
   return Object.assign(base, extra || {});
 }
 
 async function request(path, options) {
   const opts = options || {};
   const url = state.base.replace(/\/$/, '') + path;
+  const token = opts.write ? (state.writeToken || state.token) : state.token;
   const response = await fetch(url, {
     method: opts.method || 'GET',
-    headers: headers(opts.headers),
+    headers: headers(opts.headers, token),
     body: opts.body,
   });
   const text = await response.text();
@@ -329,8 +334,10 @@ async function load() {
   clearMessage();
   state.base = $('apiBase').value.trim();
   state.token = $('apiToken').value.trim();
+  state.writeToken = $('apiWriteToken').value.trim();
   localStorage.setItem('purelive_config_base', state.base);
   localStorage.setItem('purelive_config_token', state.token);
+  localStorage.setItem('purelive_config_write_token', state.writeToken);
   statusText('正在连接…');
   try {
     const health = await request('/health');
@@ -350,7 +357,10 @@ async function load() {
     toast('配置加载成功');
   } catch (error) {
     statusText('连接失败');
-    message('加载失败：' + error.message + hintOf(error), 'err');
+    const guide = error.status === 401
+      ? '\n\n「访问令牌（读）」请填 CONFIG_READ_TOKEN。写令牌只能用于保存，填到这里会 401。'
+      : '';
+    message('加载失败：' + error.message + hintOf(error) + guide, 'err');
   }
 }
 
@@ -360,6 +370,7 @@ async function save() {
   $('btnSave').disabled = true;
   try {
     const result = await request('/api/config', {
+      write: true,
       method: 'PUT',
       headers: { 'If-Match': String(state.revision) },
       body: JSON.stringify({ sections: state.doc.sections, expectedRevision: state.revision }),
@@ -381,7 +392,10 @@ async function save() {
       $('message').innerHTML += '<div class="toolbar" style="margin-top:10px">' +
         '<button class="ghost" data-conflict="reload">载入云端最新版</button></div>';
     } else {
-      message('保存失败：' + error.message + hintOf(error), 'err');
+      const guide = error.status === 401
+        ? '\n\n「保存令牌（写）」请填 CONFIG_WRITE_TOKEN。读令牌只能用于加载，保存会 401；留空时会用访问令牌。'
+        : '';
+      message('保存失败：' + error.message + hintOf(error) + guide, 'err');
     }
     render();
   }
@@ -402,6 +416,7 @@ async function rollback(revision) {
   if (!window.confirm('确认回滚到 revision ' + revision + '？将生成一个新 revision。')) return;
   try {
     const result = await request('/api/config/rollback', {
+      write: true,
       method: 'POST',
       body: JSON.stringify({ revision: Number(revision) }),
     });
@@ -499,6 +514,7 @@ function onSiteToggle(target) {
 document.addEventListener('DOMContentLoaded', () => {
   $('apiBase').value = localStorage.getItem('purelive_config_base') || '';
   $('apiToken').value = localStorage.getItem('purelive_config_token') || '';
+  $('apiWriteToken').value = localStorage.getItem('purelive_config_write_token') || '';
 
   $('btnConnect').addEventListener('click', load);
   $('btnSave').addEventListener('click', save);

@@ -46,6 +46,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .conn input:focus, .panel input:focus, .panel textarea:focus, .panel select:focus {
   outline: 2px solid var(--accent-soft); border-color: var(--accent);
 }
+.conn input.narrow { width: 150px; }
 
 main { max-width: 1180px; margin: 0 auto; padding: 20px 28px 60px; }
 .statusbar {

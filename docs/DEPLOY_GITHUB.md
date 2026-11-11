@@ -69,8 +69,8 @@ EdgeOne 的硬约定是：`edge-functions/` 与 `edgeone.json` 必须位于**项
 
 | 变量 | 说明 |
 |---|---|
-| `CONFIG_READ_TOKEN` | 读 Token，APK 与编辑器读取配置用 |
-| `CONFIG_WRITE_TOKEN` | 写 Token，`PUT` / `rollback` 用 |
+| `CONFIG_READ_TOKEN` | 读 Token，APK 与编辑器「访问令牌（读）」用 |
+| `CONFIG_WRITE_TOKEN` | 写 Token，编辑器「保存令牌（写）」与 `PUT` / `rollback` 用；与读 Token 必须分开填 |
 | `CONFIG_KV_BINDING` | 可选，默认 `PURETV_KV` |
 | `CONFIG_CORS_ORIGINS` | 可选，编辑器同源部署留空 |
 

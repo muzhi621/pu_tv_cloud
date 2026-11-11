@@ -17,7 +17,8 @@
     </div>
     <div class="conn">
       <label>API 地址<input id="apiBase" type="text" placeholder="留空 = 同源部署"></label>
-      <label>访问令牌<input id="apiToken" type="password" placeholder="Bearer Token"></label>
+      <label>访问令牌（读）<input id="apiToken" type="password" placeholder="CONFIG_READ_TOKEN"></label>
+      <label>保存令牌（写）<input id="apiWriteToken" class="narrow" type="password" placeholder="留空 = 用访问令牌"></label>
       <button id="btnConnect" class="primary">连接并加载</button>
     </div>
   </header>
