@@ -27,7 +27,7 @@ class SchemaTests(unittest.TestCase):
 
     def test_unknown_section_is_ignored_with_warning(self):
         sections, warnings = normalize_sections({"typo": {"managed": True}})
-        self.assertEqual(set(sections), {"sites", "navigation", "startup", "update"})
+        self.assertEqual(set(sections), {"sites", "navigation", "startup", "update", "iptv"})
         self.assertTrue(any("typo" in item for item in warnings))
 
     def test_unknown_and_retired_site_ids_are_filtered(self):

@@ -25,6 +25,9 @@
 
   <main>
     <section class="statusbar">
+      <label class="device-pick">配置对象
+        <select id="deviceSelect"><option value="">全局模板（新设备初始值）</option></select>
+      </label>
       <span id="statusText" class="muted">尚未连接</span>
       <span id="revBadge" class="badge">revision —</span>
       <span id="devBadge" class="badge warn" hidden>开发模式：接口未鉴权</span>
@@ -40,6 +43,8 @@
       <button data-tab="navigation">导航栏</button>
       <button data-tab="startup">启动弹窗</button>
       <button data-tab="update">在线更新</button>
+      <button data-tab="iptv">IPTV 源</button>
+      <button data-tab="devices">终端管理</button>
     </nav>
 
     <section id="panel" class="panel"></section>

@@ -3,10 +3,32 @@
  *
  * 差异（边缘运行时限制）：
  * - 不做 gzip：配置文档只有几 KB，压缩由 EdgeOne CDN 自动完成。
- * - 请求体上限由平台约束（Edge Functions 1 MB），这里再校验一次。
+ * - 请求体上限放宽到 2 MiB 以容纳 IPTV 频道列表；单份配置另受
+ *   MAX_DOCUMENT_BYTES 约束，避免出现平台无法承载的超大文档。
  */
 import { ConfigError, etagFor, SCHEMA_VERSION } from './contract.js';
-import { Conflict, StorageUnavailable } from './storage.js';
+import { Conflict, StorageUnavailable, normalizeDeviceId } from './storage.js';
+
+/**
+ * 从 query / header 解析设备范围。
+ * 终端可传 ?deviceId=xxx 或 X-Device-Id；编辑器用 query 切换设备。
+ * 不带设备 id = 全局模板（兼容 v3.0.11 及更早的终端）。
+ */
+export function deviceScope(request) {
+  const url = new URL(request.url);
+  const raw = url.searchParams.get('deviceId')
+    || request.headers.get('X-Device-Id')
+    || '';
+  return {
+    id: normalizeDeviceId(raw),
+    meta: {
+      appVersion: url.searchParams.get('appVersion')
+        || request.headers.get('X-App-Version') || '',
+      model: url.searchParams.get('model')
+        || request.headers.get('X-Device-Model') || '',
+    },
+  };
+}
 
 export class HttpError extends Error {
   constructor(status, code, message, extra = {}) {
@@ -32,7 +54,7 @@ function corsHeaders(env, request) {
   return {
     'Access-Control-Allow-Origin': configured.includes('*') ? '*' : origin,
     'Access-Control-Allow-Methods': 'GET, PUT, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type, If-Match, If-None-Match',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, If-Match, If-None-Match, X-Device-Id, X-App-Version, X-Device-Model',
     'Access-Control-Max-Age': '600',
     Vary: 'Origin',
   };
@@ -64,8 +86,8 @@ export function requireAuth(request, env, scope) {
 export async function readJsonBody(request) {
   const raw = await request.text();
   if (!raw) throw new ConfigError('请求体不能为空');
-  if (new TextEncoder().encode(raw).length > 1024 * 1024) {
-    throw new HttpError(413, 'payload_too_large', '请求体超过 1 MiB');
+  if (new TextEncoder().encode(raw).length > 2 * 1024 * 1024) {
+    throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
   }
   let value;
   try {

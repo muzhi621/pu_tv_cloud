@@ -47,6 +47,22 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   outline: 2px solid var(--accent-soft); border-color: var(--accent);
 }
 .conn input.narrow { width: 150px; }
+.device-pick { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.device-pick select { max-width: 240px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: #fff; color: var(--text); }
+.iptv-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 12px; }
+.iptv-tools .grow { flex: 1 1 320px; }
+.iptv-tools input[type="text"], .iptv-tools textarea, .device-table input {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: #fff; color: var(--text); box-sizing: border-box;
+}
+.iptv-tools textarea { min-height: 92px; resize: vertical; }
+.device-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.device-table th, .device-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
+.device-table th { color: var(--muted); font-weight: 600; }
+.device-table code { font-size: 11px; color: var(--muted); }
+.preview-list { max-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+.preview-list div { padding: 3px 0; border-bottom: 1px dashed var(--border); }
+.hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
 
 main { max-width: 1180px; margin: 0 auto; padding: 20px 28px 60px; }
 .statusbar {

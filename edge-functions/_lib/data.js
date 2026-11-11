@@ -94,6 +94,13 @@ export const SEED = {
       "allowUserOverride": true,
       "mirrorUrls": [],
       "changelogI18n": {}
+    },
+    "iptv": {
+      "managed": false,
+      "sources": [],
+      "groups": [],
+      "channels": [],
+      "epgUrl": ""
     }
   }
 };

@@ -13,11 +13,15 @@ import { SEED, CATALOG, SCHEMA_VERSION } from './data.js';
 export { SCHEMA_VERSION };
 export { CATALOG };
 
-export const SECTION_KEYS = ['sites', 'navigation', 'startup', 'update'];
+export const SECTION_KEYS = ['sites', 'navigation', 'startup', 'update', 'iptv'];
 const MAX_TEXT_LEN = 20000;
 const MAX_LIST_ITEMS = 200;
+/** 单份配置文档必须能塞进 Edge Functions 的请求体上限，频道列表要设硬上限。 */
+export const MAX_IPTV_CHANNELS = 3000;
+export const MAX_DOCUMENT_BYTES = 900 * 1024;
 const VERSION_RE = /^\d+(?:\.\d+){0,3}$/;
 const URL_RE = /^https?:\/\/[^\s]+$/i;
+const IPTV_URL_RE = /^(https?|rtmp|rtsp|udp|mms|p2p):\/\/[^\s]+$/i;
 
 const VALID_SITE_IDS = CATALOG.sites.filter((item) => !item.retired).map((item) => item.id);
 const RETIRED_SITE_IDS = new Set(CATALOG.sites.filter((item) => item.retired).map((item) => item.id));
@@ -257,11 +261,66 @@ function normalizeUpdate(part, warnings) {
   return base;
 }
 
+/**
+ * IPTV 源节：编辑器把 M3U / M3U8 / TXT 解析成精简频道列表后写进这里，
+ * 云端只做校验与下发，不代理任何播放流量。
+ *
+ * channels[] 每项 {name, url, group, logo}，按 url 去重，硬上限 MAX_IPTV_CHANNELS。
+ * sources[] 仅留原始订阅地址便于在编辑器里回显来源；epgUrl 可选。
+ */
+function normalizeIptv(part, warnings) {
+  const base = clone(SEED.sections.iptv);
+  base.managed = bool(part.managed, false, 'iptv.managed');
+
+  const epg = str(part.epgUrl, '', 'iptv.epgUrl', 500);
+  base.epgUrl = epg && URL_RE.test(epg) ? epg : '';
+  if (epg && !base.epgUrl) warnings.push('iptv.epgUrl: 仅支持 http(s)，已忽略');
+
+  const sources = strList(part.sources, 'iptv.sources');
+  if (sources !== undefined) {
+    base.sources = sources.filter((item) => URL_RE.test(item)).slice(0, 20);
+    if (base.sources.length < sources.length) {
+      warnings.push('iptv.sources: 已忽略非 http(s) 地址');
+    }
+  }
+
+  const groups = strList(part.groups, 'iptv.groups');
+  if (groups !== undefined) base.groups = groups.slice(0, MAX_LIST_ITEMS);
+
+  const raw = part.channels;
+  if (raw !== undefined && raw !== null) {
+    if (!Array.isArray(raw)) throw new ConfigError('iptv.channels 必须是数组');
+    const seen = new Set();
+    const channels = [];
+    let truncated = false;
+    for (const item of raw) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const name = String(item.name == null ? '' : item.name).trim().slice(0, 120);
+      const url = String(item.url == null ? '' : item.url).trim().slice(0, 1000);
+      if (!name || !IPTV_URL_RE.test(url)) continue;
+      const key = url.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      channels.push({
+        name,
+        url,
+        group: String(item.group == null ? '' : item.group).trim().slice(0, 64),
+        logo: String(item.logo == null ? '' : item.logo).trim().slice(0, 300),
+      });
+      if (channels.length >= MAX_IPTV_CHANNELS) { truncated = true; break; }
+    }
+    if (truncated) warnings.push(`iptv.channels: 超过 ${MAX_IPTV_CHANNELS} 条上限，已截断`);
+    base.channels = channels;
+  }
+  return base;
+}
+
 const NORMALIZERS = {
   sites: normalizeSites,
   navigation: normalizeNavigation,
   startup: normalizeStartup,
   update: normalizeUpdate,
+  iptv: normalizeIptv,
 };
 
 export function normalizeSections(raw) {

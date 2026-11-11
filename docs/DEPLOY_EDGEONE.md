@@ -215,6 +215,17 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 服务端**读写令牌分离**：读令牌 GET 有效、PUT 会 401；写令牌 PUT 有效、GET 会 401。
 两个框都要填，否则会出现「能加载但保存失败」或「加载就 401」。填完点「连接并加载」。
 
+编辑器共 6 个页签：站点 / 导航 / 启动 / 更新 / **IPTV 源** / **终端管理**。
+右上角「配置对象」下拉可选「全局模板（新设备初始值）」或某台已上线终端。
+
+- **每台终端独立配置**：终端（v3.0.12+）首次启动生成 UUID 并随请求上报
+  `deviceId` / `appVersion`，服务端自动登记并深拷一份完整配置。改全局模板
+  **不会**影响已上线设备，要批量生效请在「终端管理」逐台点「重置为模板」。
+- **IPTV 下发**：在「IPTV 源」页粘贴 M3U / M3U Plus / TXT 文本、选本地文件，
+  或填订阅 URL（由浏览器直接 fetch，流量不经 Edge Functions），点「解析」后预览，
+  再「保存到云端」。频道随配置一起下发，终端写入本地播放列表 `cloud_iptv`。
+  上限 3000 条 / 整文档 900 KB，非法协议与重复 URL 会被过滤。
+
 ### 5. 终端 APK 接入（不用改客户端代码）
 
 编译期注入（推荐）：
@@ -226,7 +237,9 @@ flutter build apk --release \
 ```
 
 或运行时写入 Hive 键 `remoteConfigEndpoint` / `remoteConfigToken`（P0 暂无设置 UI）。
-客户端请求路径为 `$base/api/config?since=<rev>`，带 `Authorization: Bearer <read token>`。
+客户端请求路径为 `$base/api/config?since=<rev>&deviceId=<uuid>&appVersion=<v>`，
+带 `Authorization: Bearer <read token>`。**旧版终端不带 `deviceId` 也能用**，
+只是所有设备共用全局模板这一份配置。
 
 ## 四、与 FC 版的差异
 

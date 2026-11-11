@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
-SECTION_KEYS = ("sites", "navigation", "startup", "update")
+SECTION_KEYS = ("sites", "navigation", "startup", "update", "iptv")
 MAX_TEXT_LEN = 20000
 MAX_LIST_ITEMS = 200
 
@@ -61,6 +61,9 @@ VALID_MENU_BY_LOWER = _id_index(VALID_MENU_IDS)
 
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
 _URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+_IPTV_URL_RE = re.compile(r"^(https?|rtmp|rtsp|udp|mms|p2p)://[^\s]+$", re.IGNORECASE)
+MAX_IPTV_CHANNELS = 3000
+MAX_DOCUMENT_BYTES = 900 * 1024
 
 
 class ConfigError(ValueError):
@@ -286,11 +289,66 @@ def normalize_update(part: dict, warnings: list[str]) -> dict:
     return base
 
 
+
+def normalize_iptv(part: dict, warnings: list[str]) -> dict:
+    """IPTV 源节：编辑器解析 M3U/TXT 后写入精简频道列表，云端只校验与下发。"""
+    base = copy.deepcopy(SEED["sections"]["iptv"])
+    base["managed"] = _bool(part.get("managed"), False, "iptv.managed")
+
+    epg = _str(part.get("epgUrl"), "", "iptv.epgUrl", 500)
+    base["epgUrl"] = epg if epg and _URL_RE.match(epg) else ""
+    if epg and not base["epgUrl"]:
+        warnings.append("iptv.epgUrl: 仅支持 http(s)，已忽略")
+
+    sources = _str_list(part.get("sources"), "iptv.sources")
+    if sources is not None:
+        base["sources"] = [item for item in sources if _URL_RE.match(item)][:20]
+        if len(base["sources"]) < len(sources):
+            warnings.append("iptv.sources: 已忽略非 http(s) 地址")
+
+    groups = _str_list(part.get("groups"), "iptv.groups")
+    if groups is not None:
+        base["groups"] = groups[:MAX_LIST_ITEMS]
+
+    raw = part.get("channels")
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise ConfigError("iptv.channels 必须是数组")
+        seen: set[str] = set()
+        channels: list[dict] = []
+        truncated = False
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()[:120]
+            url = str(item.get("url") or "").strip()[:1000]
+            if not name or not _IPTV_URL_RE.match(url):
+                continue
+            key = url.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            channels.append({
+                "name": name,
+                "url": url,
+                "group": str(item.get("group") or "").strip()[:64],
+                "logo": str(item.get("logo") or "").strip()[:300],
+            })
+            if len(channels) >= MAX_IPTV_CHANNELS:
+                truncated = True
+                break
+        if truncated:
+            warnings.append("iptv.channels: 超过 %d 条上限，已截断" % MAX_IPTV_CHANNELS)
+        base["channels"] = channels
+    return base
+
+
 _NORMALIZERS = {
     "sites": normalize_sites,
     "navigation": normalize_navigation,
     "startup": normalize_startup,
     "update": normalize_update,
+    "iptv": normalize_iptv,
 }
 
 

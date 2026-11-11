@@ -14,6 +14,7 @@ import { onRequestGet as catalogGet } from '../edge-functions/api/config/catalog
 import { onRequestGet as revisionsGet } from '../edge-functions/api/config/revisions.js';
 import { onRequestPost as rollbackPost } from '../edge-functions/api/config/rollback.js';
 import { onRequestGet as healthGet } from '../edge-functions/health.js';
+import { onRequestGet as devicesGet, onRequestPost as devicesPost } from '../edge-functions/api/devices/index.js';
 import { onRequestGet as editorGet } from '../edge-functions/index.js';
 import { normalizeDocument, normalizeSections } from '../edge-functions/_lib/contract.js';
 import { optionsHandler } from '../edge-functions/_lib/http.js';
@@ -66,7 +67,8 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     const doc = await json(res);
     assert.equal(doc.schemaVersion, 1);
     assert.equal(doc.revision, 0);
-    assert.deepEqual(Object.keys(doc.sections).sort(), ['navigation', 'sites', 'startup', 'update']);
+    assert.deepEqual(Object.keys(doc.sections).sort(),
+      ['iptv', 'navigation', 'sites', 'startup', 'update']);
   });
 
   await t.test('since / If-None-Match 命中返回 304', async () => {
@@ -333,4 +335,102 @@ test('无任何存储时给出 503 + 可执行提示', async (t) => {
   assert.equal(health.status, 'degraded');
   assert.equal(health.backend, 'none');
   assert.ok(health.storageError);
+});
+
+test('每设备完整独立配置与设备注册表', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  const fresh = new MemoryKV();
+  globalThis.PURETV_KV = fresh;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {};
+  const put = (deviceId, sections, revision) => configPut(ctx('PUT',
+    `/api/config?deviceId=${deviceId}`, {
+      env, headers: { 'If-Match': String(revision), 'Content-Type': 'application/json' },
+      body: { sections },
+    }));
+  const get = (deviceId) => configGet(ctx('GET',
+    deviceId ? `/api/config?deviceId=${deviceId}` : '/api/config', { env }));
+
+  await t.test('新设备首次拉取自动复制全局模板，revision 从 1 起（避免 since=0 命中 304）', async () => {
+    const global = await json(await get(null));
+    assert.equal(global.revision, 0);
+    const device = await json(await get('tv-living-room'));
+    assert.equal(device.revision, 1);
+    assert.deepEqual(device.sections, global.sections);
+  });
+
+  await t.test('设备 A 的修改不影响全局模板与设备 B', async () => {
+    const res = await put('tv-living-room', { sites: { managed: true, enabledSiteIds: ['bilibili'] } }, 1);
+    assert.equal(res.status, 200);
+    const global = await json(await get(null));
+    assert.equal(global.revision, 0);
+    assert.equal(global.sections.sites.managed, false);
+    const a = await json(await get('tv-living-room'));
+    assert.equal(a.revision, 2);
+    assert.deepEqual(a.sections.sites.enabledSiteIds, ['bilibili']);
+    const b = await json(await get('tv-bedroom'));
+    assert.equal(b.revision, 1);
+    assert.equal(b.sections.sites.managed, false);
+  });
+
+  await t.test('非法 deviceId 返回 400，不写入任何键', async () => {
+    const res = await configGet(ctx('GET', '/api/config?deviceId=bad/id', { env }));
+    assert.equal(res.status, 400);
+    assert.equal([...fresh.map.keys()].some((k) => k.includes('bad')), false);
+  });
+
+  await t.test('设备列表记录上线信息，可改别名与重置', async () => {
+    const list = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
+    assert.equal(list.total, 2);
+    assert.ok(list.devices.some((d) => d.id === 'tv-living-room' && d.revision === 2));
+    assert.ok(list.devices.every((d) => d.firstSeen && d.lastSeen));
+
+    const renamed = await json(await devicesPost(ctx('POST', '/api/devices', {
+      env, headers: { 'Content-Type': 'application/json' },
+      body: { action: 'rename', deviceId: 'tv-living-room', alias: '客厅电视' },
+    })));
+    assert.equal(renamed.device.alias, '客厅电视');
+
+    const reset = await json(await devicesPost(ctx('POST', '/api/devices', {
+      env, headers: { 'Content-Type': 'application/json' },
+      body: { action: 'reset', deviceId: 'tv-living-room' },
+    })));
+    assert.equal(reset.revision, 3);
+    const after = await json(await get('tv-living-room'));
+    assert.equal(after.sections.sites.managed, false);
+  });
+
+  await t.test('历史与回滚按设备隔离', async () => {
+    const a = await json(await revisionsGet(ctx('GET',
+      '/api/config/revisions?deviceId=tv-living-room', { env })));
+    assert.ok(a.revisions.length >= 2);
+    const b = await json(await revisionsGet(ctx('GET',
+      '/api/config/revisions?deviceId=tv-bedroom', { env })));
+    assert.equal(b.revisions.length, 0);
+  });
+});
+
+test('IPTV 节：解析结果校验、去重与协议白名单', async (t) => {
+  const [sections, warnings] = normalizeSections({ iptv: {
+    managed: true,
+    sources: ['https://example.com/list.m3u', 'ftp://bad'],
+    groups: ['央视', '卫视'],
+    channels: [
+      { name: 'CCTV1', url: 'http://a.example.com/1.ts', group: '央视' },
+      { name: '重复', url: 'HTTP://A.EXAMPLE.COM/1.TS', group: '央视' },
+      { name: '坏协议', url: 'javascript:alert(1)' },
+      { name: 'RTMP', url: 'rtmp://live.example.com/x', group: '卫视' },
+    ],
+  } });
+  assert.equal(sections.iptv.managed, true);
+  assert.equal(sections.iptv.channels.length, 2);
+  assert.equal(sections.iptv.channels[1].url, 'rtmp://live.example.com/x');
+  assert.deepEqual(sections.iptv.groups, ['央视', '卫视']);
+  assert.deepEqual(sections.iptv.sources, ['https://example.com/list.m3u']);
+  assert.ok(warnings.some((w) => w.includes('非 http(s)')));
+
+  await t.test('channels 非数组直接 400', () => {
+    assert.throws(() => normalizeSections({ iptv: { channels: 'oops' } }), /必须是数组/);
+  });
 });

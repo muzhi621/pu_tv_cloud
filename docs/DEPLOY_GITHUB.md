@@ -108,7 +108,16 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
   -d '{"revision":1}'
 ```
 
-浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器：API 地址留空（同源），只填 Token 即可编辑、保存、看差异、回滚。
+浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器：API 地址留空（同源），
+分别填「访问令牌（读）」「保存令牌（写）」后点「连接并加载」，即可编辑、保存、看差异、回滚。
+
+编辑器新增两个页签：
+
+- **终端管理**：列出所有已上线终端（自动 UUID + 别名、首/末上线时间、版本、revision），
+  可逐台改名、编辑配置、重置为模板、移除。右上角「配置对象」下拉切换编辑目标。
+  每台设备保存**完整独立**的配置，改全局模板不会覆盖已有设备。
+- **IPTV 源**：支持网络 URL、本地文件、粘贴文本三种导入，浏览器内解析 M3U / M3U Plus /
+  TXT genre，解析结果随配置下发到终端（单设备最多 3000 条）。云端不抓取订阅、不转发流。
 
 ## 5. 日常维护
 
@@ -124,7 +133,7 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 
 ```bash
 python -m unittest discover -s tests        # 25 个 Python 单测
-node --test tests/test_edgeone.mjs          # 22 项 EdgeOne 冒烟
+node --test tests/test_edgeone.mjs          # 30 项 EdgeOne 冒烟
 python scripts/build_edgeone_assets.py --check
 ```
 

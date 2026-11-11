@@ -5,6 +5,10 @@ const state = {
   base: '',
   token: '',          // 读令牌：GET /api/* 与 /health
   writeToken: '',     // 写令牌：PUT /api/config、POST rollback；留空时回退读令牌
+  deviceId: '',       // 空 = 全局模板；非空 = 某台终端的独立配置
+  devices: [],        // 上线终端注册表
+  iptvText: '',       // IPTV 导入框里粘贴的文本
+  iptvSummary: '',    // 最近一次解析结果摘要
   doc: null,
   original: null,
   catalog: null,
@@ -47,7 +51,12 @@ function headers(extra, token) {
 
 async function request(path, options) {
   const opts = options || {};
-  const url = state.base.replace(/\/$/, '') + path;
+  // 配置类接口按设备隔离：全局模板不带 deviceId，选中终端后所有读写都指向它。
+  // /health、/api/config/catalog、/api/devices 不需要带设备范围。
+  let url = state.base.replace(/\/$/, '') + path;
+  if (state.deviceId && /^\/api\/config(?:\/|\?|$)/.test(path)) {
+    url += (url.includes('?') ? '&' : '?') + 'deviceId=' + encodeURIComponent(state.deviceId);
+  }
   const token = opts.write ? (state.writeToken || state.token) : state.token;
   const response = await fetch(url, {
     method: opts.method || 'GET',
@@ -265,12 +274,252 @@ function renderUpdate() {
       '<textarea data-special="mirror-urls">' + esc(mirrors) + '</textarea></div>';
 }
 
+
+/* ---------------- 终端与 IPTV ---------------- */
+
+const IPTV_PROTOCOL_RE = /^(https?|rtmp|rtsp|udp|mms|p2p):\/\/[^\s]+$/i;
+const MAX_IPTV_CHANNELS = 3000;
+
+function deviceLabel() {
+  if (!state.deviceId) return '全局模板';
+  const item = state.devices.find((d) => d.id === state.deviceId);
+  return item && item.alias ? item.alias + '（' + state.deviceId + '）' : state.deviceId;
+}
+
+function renderDeviceSelect() {
+  const select = $('deviceSelect');
+  if (!select) return;
+  const rows = ['<option value="">全局模板（新设备初始值）</option>'];
+  for (const d of state.devices) {
+    const label = d.alias ? esc(d.alias) + ' · ' + esc(d.id) : esc(d.id);
+    rows.push('<option value="' + esc(d.id) + '"' +
+      (d.id === state.deviceId ? ' selected' : '') + '>' + label + '</option>');
+  }
+  if (state.deviceId && !state.devices.some((d) => d.id === state.deviceId)) {
+    rows.push('<option value="' + esc(state.deviceId) + '" selected>' + esc(state.deviceId) + '</option>');
+  }
+  select.innerHTML = rows.join('');
+}
+
+/**
+ * 前端解析 M3U / M3U Plus / TXT genre，产出云端 iptv 节的精简频道列表。
+ * 云端只存解析结果并做二次校验，不代理任何播放流量。
+ */
+function parsePlaylist(text) {
+  const channels = [];
+  const seen = new Set();
+  const groups = [];
+  let pending = null;
+  let group = '';
+  let truncated = false;
+  const push = (name, url, grp, logo) => {
+    const n = String(name || '').trim().slice(0, 120);
+    const u = String(url || '').trim().slice(0, 1000);
+    if (!n || !IPTV_PROTOCOL_RE.test(u)) return;
+    const key = u.toLowerCase();
+    if (seen.has(key) || truncated) return;
+    seen.add(key);
+    const g = String(grp || '').trim().slice(0, 64);
+    if (g && !groups.includes(g)) groups.push(g);
+    channels.push({ name: n, url: u, group: g, logo: String(logo || '').trim().slice(0, 300) });
+    if (channels.length >= MAX_IPTV_CHANNELS) truncated = true;
+  };
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^#EXTINF/i.test(line)) {
+      const gm = /group-title="([^"]*)"/i.exec(line);
+      const lm = /tvg-logo="([^"]*)"/i.exec(line);
+      const comma = line.lastIndexOf(',');
+      pending = {
+        name: comma >= 0 ? line.slice(comma + 1).trim() : '',
+        group: gm ? gm[1].trim() : group,
+        logo: lm ? lm[1].trim() : '',
+      };
+      continue;
+    }
+    if (/^#EXTGRP/i.test(line)) { group = line.replace(/^#EXTGRP:?/i, '').trim(); continue; }
+    if (line.startsWith('#')) continue;
+    if (line.includes(',#genre#')) {
+      group = line.split(',')[0].trim();
+      if (group && !groups.includes(group)) groups.push(group);
+      continue;
+    }
+    if (IPTV_PROTOCOL_RE.test(line)) {
+      push(pending ? pending.name : '', line, pending ? pending.group : group,
+        pending ? pending.logo : '');
+      pending = null;
+      continue;
+    }
+    // TXT: 名称,url1#url2（多线路）
+    if (line.includes(',')) {
+      const parts = line.split(',');
+      const name = parts.shift();
+      for (const u of parts.join(',').split('#')) push(name, u, group, '');
+    }
+  }
+  return { channels, groups, truncated };
+}
+
+function iptvSection() {
+  if (!state.doc.sections.iptv) {
+    state.doc.sections.iptv = { managed: false, sources: [], groups: [], channels: [], epgUrl: '' };
+  }
+  return state.doc.sections.iptv;
+}
+
+function applyPlaylist(text, source) {
+  const result = parsePlaylist(text);
+  const iptv = iptvSection();
+  iptv.channels = result.channels;
+  iptv.groups = result.groups;
+  iptv.managed = true;
+  if (source) {
+    const sources = iptv.sources || [];
+    if (!sources.includes(source)) sources.push(source);
+    iptv.sources = sources.slice(0, 20);
+  }
+  state.iptvSummary = '解析完成：' + result.channels.length + ' 个频道、'
+    + result.groups.length + ' 个分组'
+    + (result.truncated ? '（已达 3000 条上限，多余的被丢弃）' : '')
+    + '。请点「保存到云端」下发。';
+  markDirty();
+  render();
+  message(state.iptvSummary, 'ok');
+}
+
+function renderIptv() {
+  const iptv = iptvSection();
+  const list = iptv.channels || [];
+  const preview = list.slice(0, 25).map((c) =>
+    '<div>' + esc(c.group || '未分组') + ' · <strong>' + esc(c.name) + '</strong> '
+    + '<code>' + esc(c.url) + '</code></div>').join('');
+  return managedHtml('iptv', 'IPTV 频道列表')
+    + '<div class="iptv-tools">'
+    + '<div class="grow"><span>订阅地址（http/https，一行一个）</span>'
+    + '<textarea data-iptv="urls" placeholder="https://example.com/list.m3u">'
+    + esc((iptv.sources || []).join('\n')) + '</textarea></div>'
+    + '<div class="grow"><span>或粘贴 M3U / M3U8 / TXT 内容</span>'
+    + '<textarea data-iptv="text" placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;央视&quot;,CCTV1&#10;http://...">'
+    + esc(state.iptvText) + '</textarea></div>'
+    + '<div><span>本地文件</span><br><input type="file" data-iptv="file" accept=".m3u,.m3u8,.txt"></div>'
+    + '</div>'
+    + '<div class="toolbar">'
+    + '<button class="primary" data-iptv="parse">解析并写入配置</button>'
+    + '<button class="ghost" data-iptv="fetch">从 URL 抓取并解析</button>'
+    + '<button class="ghost" data-iptv="clear">清空频道</button>'
+    + '</div>'
+    + '<p class="hint">支持标准 M3U / M3U Plus（group-title、tvg-logo）与 TXT genre'
+    + '（分组,#genre# + 名称,url，多线路用 # 分隔）。按地址去重，仅保留'
+    + ' http/https/rtmp/rtsp/udp/mms/p2p，最多 3000 条。'
+    + '跨域抓取受浏览器 CORS 限制，失败时请改用本地文件或粘贴内容。'
+    + '解析结果只写进当前配置对象，点「保存到云端」才真正下发。</p>'
+    + textField('iptv.epgUrl', 'EPG 地址（可选，http/https）', 'text')
+    + '<p><strong>当前 ' + list.length + ' 个频道 / ' + (iptv.groups || []).length + ' 个分组</strong></p>'
+    + (state.iptvSummary ? '<p class="hint">' + esc(state.iptvSummary) + '</p>' : '')
+    + '<div class="preview-list">' + (preview || '<p class="muted">暂无频道</p>') + '</div>';
+}
+
+function renderDevices() {
+  const rows = state.devices.map((d) =>
+    '<tr><td><input data-device-alias="' + esc(d.id) + '" value="' + esc(d.alias || '')
+    + '" placeholder="未命名"></td>'
+    + '<td><code>' + esc(d.id) + '</code></td>'
+    + '<td>' + esc(d.appVersion || '—') + '</td>'
+    + '<td>' + esc(d.firstSeen || '—') + '</td>'
+    + '<td>' + esc(d.lastSeen || '—') + '</td>'
+    + '<td>r' + esc(d.revision) + '</td>'
+    + '<td><button class="tiny" data-device="rename" data-id="' + esc(d.id) + '">改名</button> '
+    + '<button class="tiny" data-device="edit" data-id="' + esc(d.id) + '">编辑配置</button> '
+    + '<button class="tiny" data-device="reset" data-id="' + esc(d.id) + '">重置为模板</button> '
+    + '<button class="tiny" data-device="delete" data-id="' + esc(d.id) + '">移除</button></td></tr>').join('');
+  return '<h2>上线终端</h2>'
+    + '<p class="hint">终端每次启动拉取配置时自动登记；「上线」= 最后一次成功拉取，'
+    + '不额外发送心跳。每台终端保存一份<b>完整独立</b>的配置：新设备首次上线会复制当前'
+    + '全局模板，之后改全局模板<b>不会</b>影响已登记的设备。要批量生效，请逐台编辑，'
+    + '或对设备执行「重置为模板」（会生成一个新 revision）。</p>'
+    + '<table class="device-table"><thead><tr><th>别名</th><th>设备 ID</th><th>App 版本</th>'
+    + '<th>首次上线</th><th>最后上线</th><th>版本</th><th>操作</th></tr></thead><tbody>'
+    + (rows || '<tr><td colspan="7">还没有终端上线。安装并打开一次 App 即会出现在这里。</td></tr>')
+    + '</tbody></table>';
+}
+
+async function refreshDevices() {
+  try {
+    const data = await request('/api/devices');
+    state.devices = data.devices || [];
+    renderDeviceSelect();
+    if (state.activeTab === 'devices') renderPanel();
+  } catch (error) {
+    message('读取终端列表失败：' + error.message, 'err');
+  }
+}
+
+async function deviceAction(action, id) {
+  const body = { action, deviceId: id };
+  if (action === 'rename') {
+    const input = document.querySelector('[data-device-alias="' + id + '"]');
+    body.alias = input ? input.value.trim() : '';
+  }
+  if (action === 'delete' && !window.confirm('移除设备 ' + id + '？该设备的配置仍保留，重新上线会再次出现。')) return;
+  if (action === 'reset' && !window.confirm('把设备 ' + id + ' 的配置重置为当前全局模板？此操作会生成新 revision。')) return;
+  try {
+    await request('/api/devices', {
+      write: true, method: 'POST', body: JSON.stringify(body),
+    });
+    toast('操作成功');
+    await refreshDevices();
+    if (action === 'reset' && state.deviceId === id) await load();
+  } catch (error) {
+    message('操作失败：' + error.message, 'err');
+  }
+}
+
+async function fetchIptvUrl() {
+  const box = document.querySelector('[data-iptv="urls"]');
+  const url = (box ? box.value : '').split('\n').map((x) => x.trim()).filter(Boolean)[0];
+  if (!url) { message('请先在「订阅地址」里填一个 http(s) 地址', 'err'); return; }
+  try {
+    const response = await fetch(url, { headers: { Accept: '*/*' } });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const text = await response.text();
+    state.iptvText = text;
+    applyPlaylist(text, url);
+  } catch (error) {
+    message('抓取失败：' + error.message
+      + '\n\n多半是源站未开放跨域（CORS）。请下载后用「本地文件」导入，或直接粘贴内容。', 'err');
+  }
+}
+
+function onIptvAction(button) {
+  const kind = button.dataset.iptv;
+  if (kind === 'parse') {
+    const box = document.querySelector('[data-iptv="text"]');
+    const text = box ? box.value : '';
+    state.iptvText = text;
+    if (!text.trim()) { message('请先粘贴内容或选择本地文件', 'err'); return; }
+    applyPlaylist(text, '');
+  } else if (kind === 'fetch') {
+    fetchIptvUrl();
+  } else if (kind === 'clear') {
+    const iptv = iptvSection();
+    iptv.channels = [];
+    iptv.groups = [];
+    iptv.sources = [];
+    state.iptvSummary = '已清空频道列表，保存后终端将不再收到云端 IPTV 配置。';
+    markDirty();
+    render();
+  }
+}
+
 function renderPanel() {
   if (!state.doc) {
     $('panel').innerHTML = '<p class="muted">请先点击右上角「连接并加载」。</p>';
     return;
   }
-  const renderers = { sites: renderSites, navigation: renderNavigation, startup: renderStartup, update: renderUpdate };
+  const renderers = { sites: renderSites, navigation: renderNavigation,
+    startup: renderStartup, update: renderUpdate,
+    iptv: renderIptv, devices: renderDevices };
   $('panel').innerHTML = renderers[state.activeTab]();
 }
 
@@ -342,17 +591,20 @@ async function load() {
   try {
     const health = await request('/health');
     state.devMode = !!health.devMode;
-    const [doc, catalog] = await Promise.all([
+    const [doc, catalog, deviceData] = await Promise.all([
       request('/api/config'),
       request('/api/config/catalog'),
+      request('/api/devices').catch(() => ({ devices: [] })),
     ]);
+    state.devices = deviceData.devices || [];
+    renderDeviceSelect();
     state.doc = doc;
     state.original = clone(doc);
     state.catalog = catalog;
     state.revision = doc.revision;
     state.dirty = false;
     state.extraMode = null;
-    statusText('已连接（schemaVersion ' + doc.schemaVersion + '）');
+    statusText('已连接（' + deviceLabel() + '，schemaVersion ' + doc.schemaVersion + '）');
     render();
     toast('配置加载成功');
   } catch (error) {
@@ -559,6 +811,61 @@ document.addEventListener('DOMContentLoaded', () => {
     if (kind === 'close') { state.extraMode = null; renderExtra(); }
     else if (kind === 'raw-apply') applyRaw();
     else if (kind === 'rollback') rollback(button.dataset.rev);
+  });
+
+
+  $('deviceSelect').addEventListener('change', async (event) => {
+    const next = event.target.value.trim();
+    if (next === state.deviceId) return;
+    if (state.dirty && !window.confirm('当前有未保存的改动，切换配置对象会丢弃，继续？')) {
+      renderDeviceSelect();
+      return;
+    }
+    state.deviceId = next;
+    state.iptvSummary = '';
+    if (state.doc) await load();
+    else renderDeviceSelect();
+  });
+
+  $('panel').addEventListener('click', (event) => {
+    const iptvButton = event.target.closest('button[data-iptv]');
+    if (iptvButton) { if (!state.doc) return; onIptvAction(iptvButton); return; }
+    const deviceButton = event.target.closest('button[data-device]');
+    if (!deviceButton) return;
+    const id = deviceButton.dataset.id;
+    const action = deviceButton.dataset.device;
+    if (action === 'edit') {
+      state.deviceId = id;
+      renderDeviceSelect();
+      load();
+    } else {
+      deviceAction(action, id);
+    }
+  });
+
+  $('panel').addEventListener('change', (event) => {
+    const target = event.target;
+    if (!state.doc) return;
+    if (target.dataset.iptv === 'file') {
+      const file = target.files && target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        state.iptvText = String(reader.result || '');
+        const box = document.querySelector('[data-iptv="text"]');
+        if (box) box.value = state.iptvText;
+        applyPlaylist(state.iptvText, '');
+      };
+      reader.onerror = () => message('文件读取失败', 'err');
+      reader.readAsText(file, 'UTF-8');
+      return;
+    }
+    if (target.dataset.iptv === 'urls') {
+      const urls = target.value.split('\n').map((x) => x.trim())
+        .filter((x) => /^https?:\/\//i.test(x)).slice(0, 20);
+      iptvSection().sources = urls;
+      markDirty();
+    }
   });
 
   $('message').addEventListener('click', (event) => {
