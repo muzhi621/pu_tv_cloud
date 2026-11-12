@@ -205,6 +205,10 @@
     {
       "id": "history",
       "name": "历史记录"
+    },
+    {
+      "id": "iptv",
+      "name": "IPTV 频道"
     }
   ],
   "updatePrompts": [

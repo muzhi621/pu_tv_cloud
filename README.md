@@ -17,7 +17,7 @@
 > **仓库状态**：已按用户审核同意后提交到 GitHub，默认分支 `main`。
 > 云端库 → `https://github.com/muzhi621/pu_tv_cloud`，
 > 终端库 → `https://github.com/muzhi621/pu_tv_client`。
-> 本库 CI 在 push / PR 时运行 25 个 Python 单元测试、30 项 EdgeOne 接口冒烟、
+> 本库 CI 在 push / PR 时运行 58 个 Python 单元测试、51 项 EdgeOne 接口冒烟、
 > 内联资源一致性检查与语法检查（`.github/workflows/ci.yml`）。
 
 ## 目录
@@ -30,23 +30,27 @@ cloud/                  Python/WSGI 实现（FC、自建服务器；零第三方
   server.py             本地 / 自建服务器 / FC Web 函数启动入口
 ★ 仓库根目录即 EdgeOne Pages 项目根（Git 导入零配置）
 edge-functions/         ★ Edge Functions（ES2023+，唯一运行时依赖 @edgeone/pages-blob）
-  index.js              GET / 内联编辑器单页
+  index.js              GET / 内联编辑器单页 + 从环境变量注入连接信息
   health.js             GET /health（含存储后端与 degraded 状态）
   api/config/           GET/PUT config、catalog、revisions、rollback（均支持 deviceId 隔离）
-  api/devices/          GET /api/devices 设备注册表；POST 改名 / 重置 / 移除
-  _lib/                 contract.js（五节契约）/ storage.js（KV/Blob 双后端 +
-                        全局模板 + 每设备独立文档 + 设备注册表 + 乐观锁）/ http.js
+  api/devices/          GET 注册表（在线/离线）；POST 改名 / 重置 / 软删 / 恢复 /
+                        彻底删除并拉黑 / 解绑 / 显式下发，支持 deviceIds 批量
+  api/iptv/fetch.js     POST 云端代抓订阅（SSRF 防护、UTF-8/GBK 自动识别）
+  _lib/                 contract.js（五节契约 + 套餐展开 + GET 轻量视图）/ storage.js
+                        （KV/Blob 双后端 + 全局模板 + 每设备独立文档 + 注册表 +
+                         在线状态 / 拉黑 / 乐观锁）/ http.js
                         + data.js、editor.js（由构建脚本生成，勿手改）
 edgeone.json            ★ 项目配置：无构建、npm install 装 Blob SDK、输出目录 public
 public/robots.txt       让静态输出目录非空（不放 index.html，避免覆盖函数首页）
 package.json            声明 ESM 与 @edgeone/pages-blob 依赖（Blob 兜底用）
 config/
   seed.json             内置兜底配置（五节全部 managed:false）—— 两个实现共用
-  site_catalog.json     35 个站点 id（含中文名、退役标记）+ 7 个导航 id
+  site_catalog.json     35 个站点 id（含中文名、退役标记）+ 8 个导航 id（含 iptv）
 editor/                 在线配置编辑器源文件（零依赖静态页）
-  index.html / app.js / style.css —— 站点/导航/启动/更新 + IPTV 源 + 终端管理 6 个页签
-tests/                  25 个 Python 单元测试 + test_edgeone.mjs（Node 30 项冒烟，含
-                        Blob 回退、驼峰 id 回归、每设备隔离与 IPTV 校验）
+  index.html / app.js / style.css —— 6 个页签 + 套餐管理 + 在线状态 + 单终端全设置
+                        面板 + 显式「配置下发」按钮
+tests/                  58 个 Python 单元测试 + test_edgeone.mjs（Node 51 项冒烟，含
+                        Blob 回退、驼峰 id、每设备隔离、套餐展开、SSRF、在线状态）
 docs/
   API.md                接口说明（两种实现共用同一契约）
   DEPLOY_GITHUB.md      ★ GitHub 直连部署方案（控制台逐项、验证、维护、排错）
@@ -67,8 +71,8 @@ requirements.txt        仅 OSS 后端需要 oss2
 
 ```bash
 cd G:/workbuddy/puretv/pure_live_tv_cloud
-python3 -m unittest discover -s tests -v     # 25 个 Python 测试（FC/自建服务器实现）
-node --test tests/test_edgeone.mjs            # 30 项 EdgeOne 接口冒烟（内存 KV/Blob，无需部署）
+python3 -m unittest discover -s tests -v     # 58 个 Python 测试（FC/自建服务器实现）
+node --test tests/test_edgeone.mjs            # 51 项 EdgeOne 冒烟（内存 KV/Blob，无需部署）
 python scripts/build_edgeone_assets.py --check  # 校验内联资源与源文件一致
 sh scripts/run_local.sh                       # Python 版，默认 http://127.0.0.1:8080/
 ```
@@ -86,6 +90,8 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
      默认命名空间 `pu_tv_cloud` 自动创建。KV 未绑定时服务**自动走 Blob**，不用改代码。
 2. 创建项目页展开「**环境变量**」，填 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN`
    （**必须先填再点开始部署**，环境变量变更只对之后的部署生效）。
+   可选：`CONFIG_EDITOR_PRELOAD=1`（默认，自动预填编辑器三个连接框）、
+   `CONFIG_ONLINE_WINDOW_MINUTES=30`（在线判定窗口）、`CONFIG_CORS_ORIGINS`（跨域时）。
 3. 「从 Git 导入」选 `muzhi621/pu_tv_cloud`、生产分支 `main` → 开始部署。
    安装命令由 `edgeone.json` 设为 `npm install`，用于装 Blob SDK（部署因此多花十几秒）。
 4. 用教程里的 5 条 curl 验证，浏览器打开项目域名根路径即在线编辑器。
@@ -98,7 +104,10 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
 完整步骤、验证 curl、终端接入与排错见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)，
 目录约定见 [docs/EDGEONE_LAYOUT.md](docs/EDGEONE_LAYOUT.md)。
 
-浏览器打开项目域名根路径即编辑器。编辑器右上「配置对象」下拉可选**全局模板**或
+浏览器打开项目域名根路径即编辑器，**三个连接框会自动填好并直接连上**：API 地址取当前
+域名，两个令牌由 Edge Function 从 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` 注入，
+**不写进公开仓库**。设 `CONFIG_EDITOR_PRELOAD=0` 可恢复手动填写；注意能访问该页面的人
+可在源码里看到写令牌，请勿公开传播编辑器域名。右上「配置对象」下拉可选**全局模板**或
 **任意已上线终端**；首次访问自动写入 `seed.json` 的副本（revision 0，五节全部
 `managed:false`）。**生产环境务必配置两个 Token**；都为空时服务处于开发模式，接口不鉴权。
 
@@ -126,15 +135,16 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 | 节 | 接管内容 | 对应需求 |
 |---|---|---|
 | `sites` | `enabledSiteIds` 平台白名单（关闭斗鱼 → 终端不显示斗鱼页签） | FR-04 |
-| `navigation` | `railMenuIds` 首页 rail 白名单与顺序、`sidebarExpanded`、`homeKeepAlive`；`settings` 为 P1 预留 | FR-05 / FR-08 |
-| `startup` | 协议 `requiredVersion`、公告内容与频率、`showSplashPage` | FR-06 |
+| `navigation` | `railMenuIds` 二级菜单白名单与顺序、`groups`（IPTV / 影音 / 直播 / 设置四个一级块及其 children）、`defaultGroupId`（默认 `iptv`）、`sidebarExpanded`、`homeKeepAlive` | FR-05 / FR-08 |
+| `startup` | 协议 `requiredVersion`、开机公告、`exitDialog`（退出 App 弹窗：开关 / 频率 / 可取消 / 捐赠码 / 文案）、`showSplashPage` | FR-06 |
 | `update` | 自动检查、间隔、提示策略、最低版本、镜像列表、更新日志 | FR-07 |
-| `iptv` | `managed` + 已解析的 `sources` / `groups` / `channels`（最多 3000 条） / `epgUrl` | 新增 |
+| `iptv` | `managed` + `sources` / `groups` / `epgUrl` / **套餐库 `packages`** / **每台设备勾选的 `selectedPackageIds`** / `channels`（选中套餐时由服务端展开，最多 3000 条） | 新增 |
 
 服务端兜底规则：未知 / 退役 id 静默过滤；白名单过滤后为空则回退内置全量（防止终端
 `global_room_push.dart:79` 的 `.first` 崩溃）；未知节忽略并记 warning；类型错误返回 400；
-`iptv` 频道按 URL 去重、协议白名单 `http(s)/rtmp(s)/rtsp/udp/mms/p2p`、总文档上限
-900 KB；`update.prompt=force` 与不可关闭公告会输出风险 warning。字段字典见需求文档 4.3。
+`iptv` 频道按 URL 去重、协议白名单 `http(s)/rtmp(s)/rtsp/udp/mms/p2p`、单包 3000 条、
+套餐库合计 5000 条、最多 12 个套餐、总文档上限 900 KB；`update.prompt=force`
+与不可关闭公告/不可取消退出弹窗会输出风险 warning。字段字典见需求文档 4.3。
 
 ## 每设备独立配置与设备注册表
 

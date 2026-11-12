@@ -59,11 +59,29 @@ VALID_SITE_BY_LOWER = _id_index(VALID_SITE_IDS)
 RETIRED_SITE_BY_LOWER = _id_index(RETIRED_SITE_IDS)
 VALID_MENU_BY_LOWER = _id_index(VALID_MENU_IDS)
 
+# 一级导航块（IPTV / 影音 / 直播 / 设置）；二级项沿用菜单 id 或字面量 'settings'。
+# children 用「原始大小写」精确比对（与 contract.js 的 VALID_CHILD_IDS 一致）。
+VALID_GROUP_IDS: frozenset[str] = frozenset({"iptv", "vod", "live", "settings"})
+VALID_CHILD_IDS: frozenset[str] = frozenset(VALID_MENU_IDS) | {"settings"}
+MAX_NAV_GROUPS = 8
+MAX_NAV_CHILDREN = 30
+MAX_NAV_LABEL_LEN = 32
+MAX_NAV_ICON_LEN = 64
+
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
 _URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 _IPTV_URL_RE = re.compile(r"^(https?|rtmp|rtsp|udp|mms|p2p)://[^\s]+$", re.IGNORECASE)
 MAX_IPTV_CHANNELS = 3000
 MAX_DOCUMENT_BYTES = 900 * 1024
+# 套餐库上限：套餐里的频道是「频道库」，只在 GET 时展开到 channels，不重复存两份。
+# MAX_IPTV_PACKAGES 同时是 selectedPackageIds 上限；MAX_PACKAGE_CHANNELS_TOTAL 是
+# 所有套餐频道数之和的硬上限，用于稳在 MAX_DOCUMENT_BYTES=900KB 内。
+MAX_IPTV_PACKAGES = 12
+MAX_PACKAGE_CHANNELS_TOTAL = 5000
+MAX_PACKAGE_SOURCES = 20
+MAX_PACKAGE_ID_LEN = 64
+MAX_PACKAGE_NAME_LEN = 64
+_PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}$" % MAX_PACKAGE_ID_LEN)
 
 
 class ConfigError(ValueError):
@@ -198,6 +216,62 @@ def normalize_navigation(part: dict, warnings: list[str]) -> dict:
         VALID_MENU_BY_LOWER, base["railMenuIds"],
         "navigation.railMenuIds", warnings,
     )
+
+    # 一级导航块 + 二级菜单：选中某个块后右侧展开它的 children。
+    # 结构与客户端内置默认分组一致；未提供时沿用 seed，保证旧配置平滑升级。
+    groups = part.get("groups")
+    if groups is not None:
+        if not isinstance(groups, list):
+            raise ConfigError("navigation.groups 必须是数组")
+        if len(groups) > MAX_NAV_GROUPS:
+            warnings.append("navigation.groups: 超过 %d 个上限，已截断" % MAX_NAV_GROUPS)
+        seen_groups: set[str] = set()
+        normalized: list[dict] = []
+        for item in groups[:MAX_NAV_GROUPS]:
+            if not isinstance(item, dict):
+                continue
+            gid = str(item.get("id") or "").strip().lower()
+            if gid not in VALID_GROUP_IDS or gid in seen_groups:
+                warnings.append("navigation.groups: 忽略非法或重复的一级块 %s" % gid)
+                continue
+            children = _str_list(item.get("children"),
+                                 "navigation.groups[%s].children" % gid) or []
+            valid_children: list[str] = []
+            seen_children: set[str] = set()
+            for child in children:
+                if child not in VALID_CHILD_IDS:
+                    warnings.append("navigation.groups[%s]: 忽略未知二级项 %s"
+                                    % (gid, child))
+                    continue
+                if child in seen_children:
+                    continue
+                seen_children.add(child)
+                valid_children.append(child)
+                if len(valid_children) >= MAX_NAV_CHILDREN:
+                    break
+            seen_groups.add(gid)
+            normalized.append({
+                "id": gid,
+                "label": _str(item.get("label"), gid,
+                              "navigation.groups[%s].label" % gid, MAX_NAV_LABEL_LEN),
+                "icon": _str(item.get("icon"), "",
+                             "navigation.groups[%s].icon" % gid, MAX_NAV_ICON_LEN),
+                "children": valid_children[:MAX_NAV_CHILDREN],
+            })
+        if not normalized:
+            warnings.append("navigation.groups: 全部非法，已回退内置默认分组")
+            normalized = copy.deepcopy(SEED["sections"]["navigation"]["groups"])
+        base["groups"] = normalized
+
+    default_group = part.get("defaultGroupId")
+    if default_group is not None:
+        wanted = _str(default_group, "", "navigation.defaultGroupId", 32).lower()
+        if any(group["id"] == wanted for group in base["groups"]):
+            base["defaultGroupId"] = wanted
+        else:
+            warnings.append("navigation.defaultGroupId: %s 不在分组里，已回退 %s"
+                            % (wanted, base["defaultGroupId"]))
+
     base["sidebarExpanded"] = _bool(
         part.get("sidebarExpanded"), base["sidebarExpanded"], "navigation.sidebarExpanded")
     base["homeKeepAlive"] = _bool(
@@ -256,10 +330,44 @@ def normalize_startup(part: dict, warnings: list[str]) -> dict:
     elif notice is not None:
         raise ConfigError("startup.notice 必须是对象")
 
+    # 退出 App 时的告别/确认弹窗，与开机公告对称，由云端下发。
+    # enabled=false 表示不接管，终端沿用本地写死的原弹窗，保证升级平滑。
+    # 统一用 .get() 取值，未知字段忽略，不假设任何键一定存在。
+    exit_dialog = part.get("exitDialog")
+    if isinstance(exit_dialog, dict):
+        target = copy.deepcopy(base.get("exitDialog") or {})
+        target["enabled"] = _bool(exit_dialog.get("enabled"),
+                                  target.get("enabled", False),
+                                  "startup.exitDialog.enabled")
+        target["mode"] = _enum(exit_dialog.get("mode"), target.get("mode", "always"),
+                               VALID_NOTICE_MODES, "startup.exitDialog.mode")
+        target["dismissible"] = _bool(exit_dialog.get("dismissible"),
+                                      target.get("dismissible", True),
+                                      "startup.exitDialog.dismissible")
+        target["showDonate"] = _bool(exit_dialog.get("showDonate"),
+                                     target.get("showDonate", True),
+                                     "startup.exitDialog.showDonate")
+        if "titleI18n" in exit_dialog:
+            target["titleI18n"] = _i18n(exit_dialog["titleI18n"],
+                                        "startup.exitDialog.titleI18n")
+        else:
+            target.setdefault("titleI18n", {})
+        if "bodyI18n" in exit_dialog:
+            target["bodyI18n"] = _i18n(exit_dialog["bodyI18n"],
+                                       "startup.exitDialog.bodyI18n")
+        else:
+            target.setdefault("bodyI18n", {})
+        base["exitDialog"] = target
+    elif exit_dialog is not None:
+        raise ConfigError("startup.exitDialog 必须是对象")
+
     base["showSplashPage"] = _bool(part.get("showSplashPage"), base["showSplashPage"],
                                    "startup.showSplashPage")
     if base["notice"]["enabled"] and not base["notice"]["dismissible"]:
         warnings.append("startup.notice: 不可关闭公告有阻断主界面风险，请复核")
+    exit_cfg = base.get("exitDialog") or {}
+    if exit_cfg.get("enabled") and not exit_cfg.get("dismissible", True):
+        warnings.append("startup.exitDialog: 不可取消的退出弹窗会让用户无法留在 App，请复核")
     return base
 
 
@@ -290,6 +398,92 @@ def normalize_update(part: dict, warnings: list[str]) -> dict:
 
 
 
+def _normalize_channels(raw: Any, field: str, warnings: list[str]) -> list[dict] | None:
+    """规范化频道列表；raw 为 None 表示未提供，调用方保留 seed 值。
+
+    顶层 iptv.channels、packages[].channels 与 GET 展开共用同一套规则：
+    URL 协议白名单、按 URL 小写去重、字段长度截断、MAX_IPTV_CHANNELS 上限。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ConfigError("%s 必须是数组" % field)
+    seen: set[str] = set()
+    channels: list[dict] = []
+    truncated = False
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:120]
+        url = str(item.get("url") or "").strip()[:1000]
+        if not name or not _IPTV_URL_RE.match(url):
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        channels.append({
+            "name": name,
+            "url": url,
+            "group": str(item.get("group") or "").strip()[:64],
+            "logo": str(item.get("logo") or "").strip()[:300],
+        })
+        if len(channels) >= MAX_IPTV_CHANNELS:
+            truncated = True
+            break
+    if truncated:
+        warnings.append("%s: 超过 %d 条上限，已截断" % (field, MAX_IPTV_CHANNELS))
+    return channels
+
+
+def _normalize_packages(raw: Any, warnings: list[str]) -> list[dict] | None:
+    """规范化套餐库；raw 为 None 表示未提供，调用方保留 seed 值。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ConfigError("iptv.packages 必须是数组")
+    if len(raw) > MAX_IPTV_PACKAGES:
+        warnings.append("iptv.packages: 超过 %d 个上限，已截断" % MAX_IPTV_PACKAGES)
+    packages: list[dict] = []
+    seen_ids: set[str] = set()
+    total_channels = 0
+    for index, item in enumerate(raw[:MAX_IPTV_PACKAGES]):
+        if not isinstance(item, dict):
+            continue
+        field = "iptv.packages[%d]" % index
+        pkg_id = str(item.get("id") or "").strip()
+        if not _PACKAGE_ID_RE.match(pkg_id):
+            warnings.append("%s: 非法 id %r，已忽略套餐" % (field, pkg_id))
+            continue
+        if pkg_id in seen_ids:
+            warnings.append("%s: 重复 id %r，已忽略套餐" % (field, pkg_id))
+            continue
+        # 所有套餐频道数之和的硬上限：按剩余额度截断，避免整份文档撑爆 900KB。
+        room = MAX_PACKAGE_CHANNELS_TOTAL - total_channels
+        if room <= 0:
+            warnings.append("iptv.packages: 频道总数达到 %d 上限，已截断"
+                            % MAX_PACKAGE_CHANNELS_TOTAL)
+            break
+        channels = _normalize_channels(item.get("channels") or [],
+                                       field + ".channels", warnings)[:room]
+        sources = _str_list(item.get("sources"), field + ".sources")
+        if sources is None:
+            pkg_sources: list[str] = []
+        else:
+            pkg_sources = [src for src in sources if _URL_RE.match(src)][:MAX_PACKAGE_SOURCES]
+            if len(pkg_sources) < len(sources):
+                warnings.append("%s.sources: 已忽略非 http(s) 地址" % field)
+        total_channels += len(channels)
+        seen_ids.add(pkg_id)
+        packages.append({
+            "id": pkg_id,
+            "name": _str(item.get("name"), pkg_id, field + ".name", MAX_PACKAGE_NAME_LEN),
+            "sources": pkg_sources,
+            "channels": channels,
+        })
+    return packages
+
+
 def normalize_iptv(part: dict, warnings: list[str]) -> dict:
     """IPTV 源节：编辑器解析 M3U/TXT 后写入精简频道列表，云端只校验与下发。"""
     base = copy.deepcopy(SEED["sections"]["iptv"])
@@ -310,37 +504,86 @@ def normalize_iptv(part: dict, warnings: list[str]) -> dict:
     if groups is not None:
         base["groups"] = groups[:MAX_LIST_ITEMS]
 
-    raw = part.get("channels")
-    if raw is not None:
-        if not isinstance(raw, list):
-            raise ConfigError("iptv.channels 必须是数组")
-        seen: set[str] = set()
-        channels: list[dict] = []
-        truncated = False
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()[:120]
-            url = str(item.get("url") or "").strip()[:1000]
-            if not name or not _IPTV_URL_RE.match(url):
-                continue
-            key = url.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            channels.append({
-                "name": name,
-                "url": url,
-                "group": str(item.get("group") or "").strip()[:64],
-                "logo": str(item.get("logo") or "").strip()[:300],
-            })
-            if len(channels) >= MAX_IPTV_CHANNELS:
-                truncated = True
-                break
-        if truncated:
-            warnings.append("iptv.channels: 超过 %d 条上限，已截断" % MAX_IPTV_CHANNELS)
+    # 顶层 channels 与 packages[].channels 共用同一套校验规则。
+    channels = _normalize_channels(part.get("channels"), "iptv.channels", warnings)
+    if channels is not None:
         base["channels"] = channels
+
+    packages = _normalize_packages(part.get("packages"), warnings)
+    if packages is not None:
+        base["packages"] = packages
+
+    selected = _str_list(part.get("selectedPackageIds"), "iptv.selectedPackageIds")
+    if selected is not None:
+        valid_ids = {pkg["id"] for pkg in base["packages"]}
+        kept: list[str] = []
+        seen: set[str] = set()
+        for pid in selected:
+            if pid not in valid_ids:
+                warnings.append("iptv.selectedPackageIds: 忽略未知套餐 id %s" % pid)
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            kept.append(pid)
+            if len(kept) >= MAX_IPTV_PACKAGES:
+                break
+        base["selectedPackageIds"] = kept
+
+    # 约定：选中套餐时，频道只在 packages 里存一份；服务端 GET /api/config 会
+    # 调用 expand_iptv_channels() 按套餐动态展开到 channels，避免存储两份重复频道。
+    # selectedPackageIds 为空时顶层 channels 保持原有行为，兼容旧配置。
+    if base["selectedPackageIds"]:
+        base["channels"] = []
     return base
+
+
+def expand_iptv_channels(sections: dict) -> dict:
+    """按选中套餐展开 iptv.channels（供 API 层 GET /api/config 调用）。
+
+    深拷贝入参后返回，不污染调用方。selectedPackageIds 为空时原样返回；非空时
+    按 selectedPackageIds 的顺序把对应套餐的 channels 合并，复用同一套频道校验
+    规则（协议白名单、按 URL 小写去重、字段截断、MAX_IPTV_CHANNELS 上限）后写入
+    iptv.channels，并把 iptv.groups 重算成合并结果里出现的分组（保序去重）。
+
+    注意：packages 在存储态保留完整 channels；GET 视图是否把套餐剥成摘要是
+    API/视图层的优化，不属于本契约字段。
+    """
+    result = copy.deepcopy(sections)
+    iptv = result.get("iptv")
+    if not isinstance(iptv, dict):
+        return result
+    selected = iptv.get("selectedPackageIds")
+    if not isinstance(selected, list) or not selected:
+        return result
+    packages = iptv.get("packages")
+    if not isinstance(packages, list):
+        packages = []
+    by_id: dict[str, dict] = {}
+    for pkg in packages:
+        if isinstance(pkg, dict) and isinstance(pkg.get("id"), str):
+            by_id.setdefault(pkg["id"], pkg)
+    merged: list[Any] = []
+    for pid in selected:
+        pkg = by_id.get(pid) if isinstance(pid, str) else None
+        if not isinstance(pkg, dict):
+            continue
+        chans = pkg.get("channels")
+        if isinstance(chans, list):
+            merged.extend(chans)
+    iptv["channels"] = _normalize_channels(merged, "iptv.channels(expand)", [])
+    groups: list[str] = []
+    seen_groups: set[str] = set()
+    for channel in iptv["channels"]:
+        group = channel.get("group") or ""
+        if not group or group in seen_groups:
+            continue
+        seen_groups.add(group)
+        groups.append(group)
+        if len(groups) >= MAX_LIST_ITEMS:
+            break
+    iptv["groups"] = groups
+    return result
 
 
 _NORMALIZERS = {

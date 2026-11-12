@@ -171,7 +171,40 @@ textarea.raw {
   position: fixed; right: 24px; bottom: 24px; padding: 11px 18px; border-radius: 8px;
   background: #1e293b; color: #fff; box-shadow: 0 8px 24px rgba(15,23,42,.22); z-index: 20;
 }
+/* ---- 在线状态 / 套餐 / 单终端设置面板 ---- */
+.badge.ok { background: #dcfce7; color: #15803d; }
+.badge.off { background: #f1f5f9; color: #64748b; }
+.meta { color: var(--muted); font-size: 11px; }
+.row-hidden { opacity: .62; }
+.device-table td.ops { min-width: 320px; }
+.device-table td.ops button { margin: 2px 2px 2px 0; }
+button.tiny.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.tiny.danger { color: var(--danger); border-color: #fecaca; }
+.device-batch { align-items: center; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.device-batch label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.panel h3, .extra h3 { margin: 22px 0 8px; font-size: 14px; }
+.pkg-name, .df-field input, .df-field select {
+  padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: #fff; color: var(--text); font-size: 13px;
+}
+.pkg-name { min-width: 260px; }
+.pkg-list { display: grid; gap: 8px; margin: 10px 0 16px; }
+.pkg-row {
+  display: grid; grid-template-columns: 190px 1fr 1fr auto; align-items: center; gap: 10px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+}
+.pkg-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.pkg-actions { white-space: nowrap; }
+.df-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 12px; }
+.df-block { padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.df-block h3 { margin: 0 0 10px; }
+.df-check { display: flex; align-items: center; gap: 7px; margin: 7px 0; font-size: 13px; }
+.df-field { display: grid; gap: 5px; margin: 9px 0; font-size: 12px; }
+.df-field > span { color: var(--muted); }
+.df-multi { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 10px 0; }
+.df-multi label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
 @media (max-width: 720px) {
   .conn input { width: 150px; }
   main { padding: 16px; }
+  .pkg-row { grid-template-columns: 1fr; }
 }

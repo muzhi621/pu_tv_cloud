@@ -19,6 +19,10 @@ const MAX_LIST_ITEMS = 200;
 /** 单份配置文档必须能塞进 Edge Functions 的请求体上限，频道列表要设硬上限。 */
 export const MAX_IPTV_CHANNELS = 3000;
 export const MAX_DOCUMENT_BYTES = 900 * 1024;
+/** 套餐库上限：套餐里的频道是「频道库」，只在 GET 时展开到 channels，不重复存两份。 */
+export const MAX_IPTV_PACKAGES = 12;
+export const MAX_PACKAGE_CHANNELS_TOTAL = 5000;
+const PACKAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const VERSION_RE = /^\d+(?:\.\d+){0,3}$/;
 const URL_RE = /^https?:\/\/[^\s]+$/i;
 const IPTV_URL_RE = /^(https?|rtmp|rtsp|udp|mms|p2p):\/\/[^\s]+$/i;
@@ -172,6 +176,11 @@ function normalizeSites(part, warnings) {
   return base;
 }
 
+/** 一级导航块：IPTV / 影音（类 TVBox）/ 直播 / 设置；二级项沿用菜单 id。 */
+const VALID_GROUP_IDS = new Set(['iptv', 'vod', 'live', 'settings']);
+const VALID_CHILD_IDS = new Set([...VALID_MENU_IDS, 'settings']);
+const MAX_NAV_GROUPS = 8;
+
 function normalizeNavigation(part, warnings) {
   const base = clone(SEED.sections.navigation);
   base.managed = bool(part.managed, false, 'navigation.managed');
@@ -182,6 +191,50 @@ function normalizeNavigation(part, warnings) {
     'navigation.railMenuIds',
     warnings,
   );
+
+  // 一级块 + 二级菜单：选中某个块后右侧展开它的 children。
+  // 结构与客户端内置默认分组一致；未下发时客户端使用内置默认，保证旧配置平滑升级。
+  const groups = part.groups;
+  if (groups !== undefined && groups !== null) {
+    if (!Array.isArray(groups)) throw new ConfigError('navigation.groups 必须是数组');
+    if (groups.length > MAX_NAV_GROUPS) {
+      warnings.push(`navigation.groups: 超过 ${MAX_NAV_GROUPS} 个上限，已截断`);
+    }
+    const seen = new Set();
+    base.groups = [];
+    for (const item of groups.slice(0, MAX_NAV_GROUPS)) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const id = String(item.id == null ? '' : item.id).trim().toLowerCase();
+      if (!VALID_GROUP_IDS.has(id) || seen.has(id)) {
+        warnings.push(`navigation.groups: 忽略非法或重复的一级块 ${id}`);
+        continue;
+      }
+      const children = strList(item.children, `navigation.groups[${id}].children`) || [];
+      const validChildren = [];
+      for (const child of children) {
+        if (VALID_CHILD_IDS.has(child)) validChildren.push(child);
+        else warnings.push(`navigation.groups[${id}]: 忽略未知二级项 ${child}`);
+      }
+      seen.add(id);
+      base.groups.push({
+        id,
+        label: str(item.label, id, `navigation.groups[${id}].label`, 32),
+        icon: str(item.icon, '', `navigation.groups[${id}].icon`, 64),
+        children: [...new Set(validChildren)].slice(0, 30),
+      });
+    }
+    if (!base.groups.length) {
+      warnings.push('navigation.groups: 全部非法，已回退内置默认分组');
+      base.groups = clone(SEED.sections.navigation.groups);
+    }
+  }
+  if (part.defaultGroupId !== undefined && part.defaultGroupId !== null) {
+    const wanted = str(part.defaultGroupId, '', 'navigation.defaultGroupId', 32).toLowerCase();
+    if (base.groups.some((group) => group.id === wanted)) base.defaultGroupId = wanted;
+    else {
+      warnings.push(`navigation.defaultGroupId: ${wanted} 不在分组里，已回退 ${base.defaultGroupId}`);
+    }
+  }
   base.sidebarExpanded = bool(part.sidebarExpanded, base.sidebarExpanded, 'navigation.sidebarExpanded');
   base.homeKeepAlive = bool(part.homeKeepAlive, base.homeKeepAlive, 'navigation.homeKeepAlive');
 
@@ -232,9 +285,36 @@ function normalizeStartup(part, warnings) {
     base.notice = target;
   }
 
+  // 退出 App 时的告别/确认弹窗，与开机公告对称，由云端下发（v3.0.14 起）。
+  // enabled=false 表示不接管，终端沿用本地写死的原弹窗，保证升级平滑。
+  const exitDialog = part.exitDialog;
+  if (exitDialog !== undefined && exitDialog !== null) {
+    if (typeof exitDialog !== 'object' || Array.isArray(exitDialog)) {
+      throw new ConfigError('startup.exitDialog 必须是对象');
+    }
+    const target = clone(base.exitDialog);
+    target.enabled = bool(exitDialog.enabled, target.enabled, 'startup.exitDialog.enabled');
+    target.mode = enumeration(exitDialog.mode, target.mode, VALID_NOTICE_MODES,
+      'startup.exitDialog.mode');
+    target.dismissible = bool(exitDialog.dismissible, target.dismissible,
+      'startup.exitDialog.dismissible');
+    target.showDonate = bool(exitDialog.showDonate, target.showDonate,
+      'startup.exitDialog.showDonate');
+    if ('titleI18n' in exitDialog) {
+      target.titleI18n = i18n(exitDialog.titleI18n, 'startup.exitDialog.titleI18n');
+    }
+    if ('bodyI18n' in exitDialog) {
+      target.bodyI18n = i18n(exitDialog.bodyI18n, 'startup.exitDialog.bodyI18n');
+    }
+    base.exitDialog = target;
+  }
+
   base.showSplashPage = bool(part.showSplashPage, base.showSplashPage, 'startup.showSplashPage');
   if (base.notice.enabled && !base.notice.dismissible) {
     warnings.push('startup.notice: 不可关闭公告有阻断主界面风险，请复核');
+  }
+  if (base.exitDialog.enabled && !base.exitDialog.dismissible) {
+    warnings.push('startup.exitDialog: 不可取消的退出弹窗会让用户无法留在 App，请复核');
   }
   return base;
 }
@@ -268,6 +348,37 @@ function normalizeUpdate(part, warnings) {
  * channels[] 每项 {name, url, group, logo}，按 url 去重，硬上限 MAX_IPTV_CHANNELS。
  * sources[] 仅留原始订阅地址便于在编辑器里回显来源；epgUrl 可选。
  */
+/** 顶层 channels 与 packages[].channels 共用同一套校验（协议白名单、去重、上限）。 */
+function normalizeChannelList(raw, field, warnings) {
+  if (!Array.isArray(raw)) throw new ConfigError(`${field} 必须是数组`);
+  const seen = new Set();
+  const channels = [];
+  let truncated = false;
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const name = String(item.name == null ? '' : item.name).trim().slice(0, 120);
+    const url = String(item.url == null ? '' : item.url).trim().slice(0, 1000);
+    if (!name || !IPTV_URL_RE.test(url)) continue;
+    const key = url.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    channels.push({
+      name,
+      url,
+      group: String(item.group == null ? '' : item.group).trim().slice(0, 64),
+      logo: String(item.logo == null ? '' : item.logo).trim().slice(0, 300),
+    });
+    if (channels.length >= MAX_IPTV_CHANNELS) { truncated = true; break; }
+  }
+  if (truncated) warnings.push(`${field}: 超过 ${MAX_IPTV_CHANNELS} 条上限，已截断`);
+  return channels;
+}
+
+/**
+ * 套餐 = 命名的频道库。编辑器把一次或多次 M3U/TXT 解析结果存进 packages，
+ * 每台设备只在 selectedPackageIds 里勾选要下发的套餐；GET /api/config 时由
+ * expandIptvChannels 展开成终端认识的 channels 字段，终端无需任何改动。
+ */
 function normalizeIptv(part, warnings) {
   const base = clone(SEED.sections.iptv);
   base.managed = bool(part.managed, false, 'iptv.managed');
@@ -287,32 +398,114 @@ function normalizeIptv(part, warnings) {
   const groups = strList(part.groups, 'iptv.groups');
   if (groups !== undefined) base.groups = groups.slice(0, MAX_LIST_ITEMS);
 
-  const raw = part.channels;
-  if (raw !== undefined && raw !== null) {
-    if (!Array.isArray(raw)) throw new ConfigError('iptv.channels 必须是数组');
-    const seen = new Set();
-    const channels = [];
-    let truncated = false;
-    for (const item of raw) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-      const name = String(item.name == null ? '' : item.name).trim().slice(0, 120);
-      const url = String(item.url == null ? '' : item.url).trim().slice(0, 1000);
-      if (!name || !IPTV_URL_RE.test(url)) continue;
-      const key = url.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      channels.push({
-        name,
-        url,
-        group: String(item.group == null ? '' : item.group).trim().slice(0, 64),
-        logo: String(item.logo == null ? '' : item.logo).trim().slice(0, 300),
-      });
-      if (channels.length >= MAX_IPTV_CHANNELS) { truncated = true; break; }
+  const rawPackages = part.packages;
+  if (rawPackages !== undefined && rawPackages !== null) {
+    if (!Array.isArray(rawPackages)) throw new ConfigError('iptv.packages 必须是数组');
+    if (rawPackages.length > MAX_IPTV_PACKAGES) {
+      warnings.push(`iptv.packages: 超过 ${MAX_IPTV_PACKAGES} 个上限，已截断`);
     }
-    if (truncated) warnings.push(`iptv.channels: 超过 ${MAX_IPTV_CHANNELS} 条上限，已截断`);
-    base.channels = channels;
+    const ids = new Set();
+    let total = 0;
+    base.packages = [];
+    for (const item of rawPackages.slice(0, MAX_IPTV_PACKAGES)) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const id = String(item.id == null ? '' : item.id).trim();
+      if (!PACKAGE_ID_RE.test(id) || ids.has(id)) {
+        warnings.push('iptv.packages: 忽略非法或重复的套餐 id');
+        continue;
+      }
+      const room = MAX_PACKAGE_CHANNELS_TOTAL - total;
+      if (room <= 0) {
+        warnings.push(`iptv.packages: 频道总数达到 ${MAX_PACKAGE_CHANNELS_TOTAL} 上限，已截断`);
+        break;
+      }
+      const channels = normalizeChannelList(item.channels || [],
+        `iptv.packages[${id}].channels`, warnings).slice(0, room);
+      const pkgSources = strList(item.sources, `iptv.packages[${id}].sources`) || [];
+      total += channels.length;
+      ids.add(id);
+      base.packages.push({
+        id,
+        name: str(item.name, id, `iptv.packages[${id}].name`, 64),
+        sources: pkgSources.filter((url) => URL_RE.test(url)).slice(0, 20),
+        channels,
+      });
+    }
   }
+
+  const rawSelected = part.selectedPackageIds;
+  if (rawSelected !== undefined && rawSelected !== null) {
+    if (!Array.isArray(rawSelected) || rawSelected.some((id) => typeof id !== 'string')) {
+      throw new ConfigError('iptv.selectedPackageIds 必须是字符串数组');
+    }
+    const valid = new Set(base.packages.map((pkg) => pkg.id));
+    const picked = [];
+    for (const raw of rawSelected) {
+      const id = String(raw).trim();
+      if (!valid.has(id)) {
+        warnings.push(`iptv.selectedPackageIds: 忽略不存在的套餐 ${id}`);
+        continue;
+      }
+      if (!picked.includes(id)) picked.push(id);
+      if (picked.length >= MAX_IPTV_PACKAGES) break;
+    }
+    base.selectedPackageIds = picked;
+  }
+
+  if (part.channels !== undefined && part.channels !== null) {
+    base.channels = normalizeChannelList(part.channels, 'iptv.channels', warnings);
+  }
+  // 选了套餐就只由套餐派生 channels，避免存储两份重复频道把文档撑爆 900 KB。
+  if (base.selectedPackageIds.length) base.channels = [];
   return base;
+}
+
+/** 把选中套餐的频道按 id 顺序合并去重，写进 iptv.channels（供终端读取）。 */
+export function expandIptvChannels(sections) {
+  const iptv = sections && sections.iptv;
+  if (!iptv) return sections;
+  const ids = Array.isArray(iptv.selectedPackageIds) ? iptv.selectedPackageIds : [];
+  if (!ids.length) return sections;
+  const byId = new Map((Array.isArray(iptv.packages) ? iptv.packages : [])
+    .map((pkg) => [pkg.id, pkg]));
+  const seen = new Set();
+  const channels = [];
+  for (const id of ids) {
+    const pkg = byId.get(id);
+    if (!pkg || !Array.isArray(pkg.channels)) continue;
+    for (const channel of pkg.channels) {
+      const key = String(channel.url || '').toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      channels.push(channel);
+      if (channels.length >= MAX_IPTV_CHANNELS) break;
+    }
+    if (channels.length >= MAX_IPTV_CHANNELS) break;
+  }
+  const out = clone(sections);
+  out.iptv.channels = channels;
+  out.iptv.groups = [...new Set(channels.map((c) => c.group).filter(Boolean))]
+    .slice(0, MAX_LIST_ITEMS);
+  return out;
+}
+
+/**
+ * GET 视图：终端只拿展开后的 channels，不带套餐库里的全量频道（否则 15 分钟
+ * 一次的心跳会重复传几百 KB）。编辑器带 ?withPackages=1 才拿完整套餐库。
+ */
+export function viewDocument(document, withPackages = false) {
+  const out = clone(document);
+  if (!out.sections || !out.sections.iptv) return out;
+  out.sections = expandIptvChannels(out.sections);
+  if (!withPackages && Array.isArray(out.sections.iptv.packages)) {
+    out.sections.iptv.packages = out.sections.iptv.packages.map((pkg) => ({
+      id: pkg.id,
+      name: pkg.name,
+      sources: pkg.sources || [],
+      channelCount: Array.isArray(pkg.channels) ? pkg.channels.length : 0,
+    }));
+  }
+  return out;
 }
 
 const NORMALIZERS = {

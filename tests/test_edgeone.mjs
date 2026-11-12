@@ -15,9 +15,17 @@ import { onRequestGet as revisionsGet } from '../edge-functions/api/config/revis
 import { onRequestPost as rollbackPost } from '../edge-functions/api/config/rollback.js';
 import { onRequestGet as healthGet } from '../edge-functions/health.js';
 import { onRequestGet as devicesGet, onRequestPost as devicesPost } from '../edge-functions/api/devices/index.js';
-import { onRequestGet as editorGet } from '../edge-functions/index.js';
-import { normalizeDocument, normalizeSections } from '../edge-functions/_lib/contract.js';
+import {
+  onRequestGet as editorGet, preloadDefaults, injectDefaults,
+} from '../edge-functions/index.js';
+import {
+  normalizeDocument, normalizeSections, expandIptvChannels, viewDocument,
+} from '../edge-functions/_lib/contract.js';
 import { optionsHandler } from '../edge-functions/_lib/http.js';
+import { listDevices as storageListDevices } from '../edge-functions/_lib/storage.js';
+import {
+  onRequestPost as iptvFetchPost, checkFetchUrl, decodeSubscription,
+} from '../edge-functions/api/iptv/fetch.js';
 
 class MemoryKV {
   constructor() { this.map = new Map(); }
@@ -167,7 +175,8 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(res.status, 200);
     const data = await json(res);
     assert.equal(data.sites.length, 35);
-    assert.equal(data.menus.length, 7);
+    assert.equal(data.menus.length, 8);
+    assert.ok(data.menus.some((item) => item.id === 'iptv'));
     assert.deepEqual(data.updatePrompts, ['silent', 'dialog', 'force']);
   });
 
@@ -390,13 +399,13 @@ test('每设备完整独立配置与设备注册表', async (t) => {
       env, headers: { 'Content-Type': 'application/json' },
       body: { action: 'rename', deviceId: 'tv-living-room', alias: '客厅电视' },
     })));
-    assert.equal(renamed.device.alias, '客厅电视');
+    assert.equal(renamed.results[0].device.alias, '客厅电视');
 
     const reset = await json(await devicesPost(ctx('POST', '/api/devices', {
       env, headers: { 'Content-Type': 'application/json' },
       body: { action: 'reset', deviceId: 'tv-living-room' },
     })));
-    assert.equal(reset.revision, 3);
+    assert.equal(reset.results[0].revision, 3);
     const after = await json(await get('tv-living-room'));
     assert.equal(after.sections.sites.managed, false);
   });
@@ -432,5 +441,241 @@ test('IPTV 节：解析结果校验、去重与协议白名单', async (t) => {
 
   await t.test('channels 非数组直接 400', () => {
     assert.throws(() => normalizeSections({ iptv: { channels: 'oops' } }), /必须是数组/);
+  });
+});
+
+test('编辑器连接信息由环境变量注入，且不写进仓库文件', async (t) => {
+  const env = { CONFIG_READ_TOKEN: 'READ-TOKEN', CONFIG_WRITE_TOKEN: 'WRITE-TOKEN' };
+  const req = new Request('https://tv.example.com/');
+
+  await t.test('预填值与自动连接开关', () => {
+    const defaults = preloadDefaults(env, req);
+    assert.equal(defaults.base, 'https://tv.example.com');
+    assert.equal(defaults.readToken, 'READ-TOKEN');
+    assert.equal(defaults.writeToken, 'WRITE-TOKEN');
+    assert.equal(defaults.autoConnect, true);
+    assert.equal(preloadDefaults({ ...env, CONFIG_EDITOR_PRELOAD: '0' }, req), null);
+    assert.equal(preloadDefaults({}, req), null);
+  });
+
+  await t.test('注入脚本转义 < ，不会闭合 script 标签', () => {
+    const html = injectDefaults('<html><head></head><body></body></html>',
+      { base: 'https://x', readToken: '</script><script>alert(1)', writeToken: 'W' });
+    assert.match(html, /window\.__PURETV_DEFAULTS__/);
+    assert.ok(!html.includes('</script><script>alert(1)'));
+    assert.match(html, /\\u003c\/script/);
+  });
+
+  await t.test('带令牌环境变量的页面含默认值，未配置时不含', async () => {
+    const withDefaults = await (await editorGet(ctx('GET', '/', { env }))).text();
+    assert.match(withDefaults, /window\.__PURETV_DEFAULTS__/);
+    assert.match(withDefaults, /READ-TOKEN/);
+    assert.match(withDefaults, /WRITE-TOKEN/);
+    const plain = await (await editorGet(ctx('GET', '/'))).text();
+    // app.js 源码里本来就有读取 window.__PURETV_DEFAULTS__ 的代码，
+    // 所以只能断言「没有注入赋值语句、也没有令牌值」。
+    assert.ok(!plain.includes('window.__PURETV_DEFAULTS__={'));
+    assert.ok(!plain.includes('READ-TOKEN'));
+  });
+});
+
+test('IPTV 云端代理：SSRF 防护、编码识别与失败隔离', async (t) => {
+  await t.test('拒绝内网 / 环回 / 危险端口 / 非 http(s) 地址', () => {
+    const blocked = [
+      'http://127.0.0.1/x', 'http://192.168.1.1/list.m3u', 'http://10.0.0.5/x',
+      'http://172.20.1.1/x', 'http://169.254.169.254/latest/meta-data',
+      'http://localhost/x', 'http://nas.local/list.m3u', 'http://[::1]/x',
+      'http://[fc00::1]/x', 'ftp://example.com/x', 'javascript:alert(1)',
+      'http://user:pw@example.com/x', 'http://example.com:6379/x', 'http://intranet/x',
+    ];
+    for (const url of blocked) {
+      assert.equal(checkFetchUrl(url).ok, false, `${url} 应被拒绝`);
+    }
+    assert.equal(checkFetchUrl('https://example.com/list.m3u').ok, true);
+    assert.equal(checkFetchUrl('http://example.com:8080/a.txt').ok, true);
+  });
+
+  await t.test('UTF-8 与 GBK 自动识别', () => {
+    assert.deepEqual(decodeSubscription(new TextEncoder().encode('#EXTM3U\n央视')),
+      { text: '#EXTM3U\n央视', encoding: 'utf-8' });
+    const gbk = decodeSubscription(new Uint8Array([0xD1, 0xEB, 0xCA, 0xD3]));
+    assert.equal(gbk.encoding, 'gbk');
+    assert.equal(gbk.text, '央视');
+  });
+
+  await t.test('单个地址失败不影响整批响应', async () => {
+    const res = await iptvFetchPost(ctx('POST', '/api/iptv/fetch', {
+      headers: { 'Content-Type': 'application/json' },
+      body: { urls: ['http://127.0.0.1/x', 'ftp://bad/x'] },
+    }));
+    assert.equal(res.status, 200);
+    const data = await json(res);
+    assert.equal(data.total, 2);
+    assert.equal(data.succeeded, 0);
+    assert.ok(data.results.every((item) => item.ok === false));
+    assert.ok(!('text' in data.results[0]));
+  });
+});
+
+test('IPTV 套餐：组成套餐、按设备选择下发、GET 轻量视图', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  const fresh = new MemoryKV();
+  globalThis.PURETV_KV = fresh;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+  const env = {};
+  const channelsA = [
+    { name: 'CCTV1', url: 'http://a.example.com/1.ts', group: '央视' },
+    { name: 'CCTV2', url: 'http://a.example.com/2.ts', group: '央视' },
+  ];
+  const channelsB = [
+    { name: 'CCTV1-replay', url: 'http://a.example.com/1.ts', group: '央视' },
+    { name: 'Hunan', url: 'rtmp://b.example.com/live', group: '卫视' },
+  ];
+  const sections = {
+    iptv: {
+      managed: true,
+      packages: [
+        { id: 'p1', name: '央视', sources: ['https://example.com/a.m3u'], channels: channelsA },
+        { id: 'p2', name: '卫视', channels: channelsB },
+        { id: 'BAD ID', name: '非法', channels: [] },
+      ],
+      selectedPackageIds: ['p1', 'p2', 'missing'],
+      channels: [{ name: '旧', url: 'http://old.example.com/x.ts' }],
+    },
+  };
+
+  await t.test('非法套餐被忽略，选中套餐时顶层 channels 不重复存储', () => {
+    const [normalized, warnings] = normalizeSections(sections);
+    assert.equal(normalized.iptv.packages.length, 2);
+    assert.deepEqual(normalized.iptv.selectedPackageIds, ['p1', 'p2']);
+    assert.deepEqual(normalized.iptv.channels, []);
+    assert.ok(warnings.some((w) => w.includes('不存在的套餐')));
+  });
+
+  await t.test('按选中套餐顺序合并、URL 去重、重算分组', () => {
+    const [normalized] = normalizeSections(sections);
+    const expanded = expandIptvChannels(normalized);
+    assert.equal(expanded.iptv.channels.length, 3);
+    assert.equal(expanded.iptv.channels[0].name, 'CCTV1');
+    assert.deepEqual(expanded.iptv.groups, ['央视', '卫视']);
+    assert.equal(normalized.iptv.channels.length, 0); // 深拷贝，不污染入参
+  });
+
+  await t.test('端到端：终端只拿轻量文档，编辑器带 withPackages 拿完整套餐库', async () => {
+    const putRes = await configPut(ctx('PUT', '/api/config', {
+      env, headers: { 'If-Match': '0', 'Content-Type': 'application/json' },
+      body: { sections },
+    }));
+    assert.equal(putRes.status, 200);
+
+    const terminal = await json(await configGet(ctx('GET', '/api/config', { env })));
+    assert.equal(terminal.sections.iptv.channels.length, 3);
+    assert.equal(terminal.sections.iptv.packages.length, 2);
+    assert.equal(terminal.sections.iptv.packages[0].channelCount, 2);
+    assert.ok(!('channels' in terminal.sections.iptv.packages[0]));
+    assert.ok(terminal.sections.iptv.channels.some((c) => c.url === 'http://a.example.com/2.ts'));
+
+    const editor = await json(await configGet(ctx('GET', '/api/config?withPackages=1', { env })));
+    assert.equal(editor.sections.iptv.packages[0].channels.length, 2);
+    assert.equal(editor.sections.iptv.channels.length, 3);
+  });
+});
+
+test('终端在线状态、软删除 / 拉黑 / 解绑与显式下发', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  const fresh = new MemoryKV();
+  globalThis.PURETV_KV = fresh;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+  const env = { CONFIG_ONLINE_WINDOW_MINUTES: 30 };
+  const post = (body) => devicesPost(ctx('POST', '/api/devices', {
+    env, headers: { 'Content-Type': 'application/json' }, body,
+  }));
+  const list = () => devicesGet(ctx('GET', '/api/devices', { env })).then(json);
+
+  await t.test('上线登记、在线状态与超时兜底', async () => {
+    await configGet(ctx('GET', '/api/config?deviceId=tv-a', { env }));
+    const data = await list();
+    assert.equal(data.total, 1);
+    assert.equal(data.online, 1);
+    assert.equal(data.onlineWindowMinutes, 30);
+    assert.equal(data.devices[0].status, 'online');
+    assert.ok(data.devices[0].lastSeenAgo <= 2);
+    const later = await storageListDevices(env, Date.now() + 31 * 60 * 1000);
+    assert.equal(later[0].status, 'offline');
+  });
+
+  await t.test('显式下发即使无改动也生成新 revision', async () => {
+    const before = (await list()).devices[0].revision;
+    const pushed = await json(await post({ action: 'push', deviceId: 'tv-a' }));
+    assert.equal(pushed.results[0].ok, true);
+    assert.equal(pushed.results[0].revision, before + 1);
+    assert.ok(pushed.results[0].pushedAt);
+    assert.equal((await list()).devices[0].pushedRevision, before + 1);
+  });
+
+  await t.test('软删除仍保留设备，可恢复', async () => {
+    const removed = await json(await post({ action: 'delete', deviceId: 'tv-a' }));
+    assert.equal(removed.results[0].hidden, true);
+    assert.equal((await list()).total, 1);
+    const restored = await json(await post({ action: 'restore', deviceId: 'tv-a' }));
+    assert.equal(restored.results[0].hidden, false);
+  });
+
+  await t.test('彻底删除并拉黑：终端 403，解绑后恢复', async () => {
+    const purged = await json(await post({ action: 'purge', deviceId: 'tv-a' }));
+    assert.equal(purged.results[0].purged, true);
+    const data = await list();
+    assert.equal(data.total, 0);
+    assert.deepEqual(data.blocked, ['tv-a']);
+    const denied = await configGet(ctx('GET', '/api/config?deviceId=tv-a', { env }));
+    assert.equal(denied.status, 403);
+    assert.equal((await json(denied)).error, 'device_blocked');
+    await post({ action: 'unblock', deviceId: 'tv-a' });
+    assert.equal((await configGet(ctx('GET', '/api/config?deviceId=tv-a', { env }))).status, 200);
+    assert.equal((await list()).total, 1);
+  });
+
+  await t.test('批量操作多台设备', async () => {
+    await configGet(ctx('GET', '/api/config?deviceId=tv-b', { env }));
+    const bulk = await json(await post({ action: 'delete', deviceIds: ['tv-a', 'tv-b'] }));
+    assert.equal(bulk.total, 2);
+    assert.equal(bulk.failed, 0);
+    assert.ok((await list()).devices.every((item) => item.hidden));
+  });
+});
+
+test('退出弹窗与一级导航分组契约', async (t) => {
+  await t.test('startup.exitDialog 校验、warning 与非法枚举', () => {
+    const [sections, warnings] = normalizeSections({ startup: { exitDialog: {
+      enabled: true, mode: 'never', dismissible: false, showDonate: false,
+      titleI18n: { zh: '再见' }, bodyI18n: { zh: '欢迎再来' },
+    } } });
+    assert.equal(sections.startup.exitDialog.enabled, true);
+    assert.equal(sections.startup.exitDialog.mode, 'never');
+    assert.equal(sections.startup.exitDialog.dismissible, false);
+    assert.equal(sections.startup.exitDialog.showDonate, false);
+    assert.equal(sections.startup.exitDialog.titleI18n.zh, '再见');
+    assert.ok(warnings.some((w) => w.includes('无法留在 App')));
+    assert.throws(() => normalizeSections({ startup: { exitDialog: { mode: 'sometimes' } } }),
+      /必须是 .* 之一/);
+  });
+
+  await t.test('navigation.groups 四大类与 defaultGroupId 兜底', () => {
+    const [defaults] = normalizeSections({});
+    assert.equal(defaults.navigation.groups.length, 4);
+    assert.deepEqual(defaults.navigation.groups.map((g) => g.id),
+      ['iptv', 'vod', 'live', 'settings']);
+    assert.equal(defaults.navigation.defaultGroupId, 'iptv');
+    const [custom, warnings] = normalizeSections({ navigation: {
+      groups: [
+        { id: 'iptv', label: '电视', children: ['iptv', 'unknown'] },
+        { id: 'nope', label: '非法', children: [] },
+      ],
+      defaultGroupId: 'nope',
+    } });
+    assert.equal(custom.navigation.groups.length, 1);
+    assert.deepEqual(custom.navigation.groups[0].children, ['iptv']);
+    assert.equal(custom.navigation.defaultGroupId, 'iptv');
+    assert.ok(warnings.some((w) => w.includes('非法或重复的一级块')));
   });
 });

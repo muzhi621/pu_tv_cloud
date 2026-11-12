@@ -29,6 +29,7 @@ from .schema import (
     SCHEMA_VERSION,
     ConfigError,
     etag_for,
+    expand_iptv_channels,
     normalize_sections,
 )
 from .storage import Conflict, Storage, create_storage
@@ -225,7 +226,21 @@ def create_app(env: dict[str, str] | None = None, storage: Storage | None = None
             if (since and since == str(revision)) or (inm and inm == str(revision)):
                 return _send(start_response, 304, environ=environ,
                              headers=_headers_for_document(document), compress=False)
-            return _send(start_response, 200, _json_bytes(document), environ=environ,
+            # 与 Edge Functions 版一致：选中套餐时把频道展开成终端认识的 channels；
+            # 终端不带 withPackages=1 时只返回套餐元数据，避免心跳重复传几百 KB。
+            view = dict(document)
+            sections_view = expand_iptv_channels(document["sections"])
+            iptv = sections_view.get("iptv") or {}
+            packages = iptv.get("packages")
+            if isinstance(packages, list) and query.get("withPackages", [""])[0] != "1":
+                iptv["packages"] = [
+                    {"id": pkg.get("id", ""), "name": pkg.get("name", ""),
+                     "sources": pkg.get("sources", []),
+                     "channelCount": len(pkg.get("channels") or [])}
+                    for pkg in packages
+                ]
+            view["sections"] = sections_view
+            return _send(start_response, 200, _json_bytes(view), environ=environ,
                          headers=_headers_for_document(document))
 
         # ---- PUT /api/config ----

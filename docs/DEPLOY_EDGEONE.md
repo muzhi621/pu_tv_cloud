@@ -8,8 +8,11 @@
 > 开机/定时拉取一份几 KB 的 JSON（命中 ETag 时只回 304），EdgeOne Pages 免费版
 > 的额度对这种用量等于零成本。
 >
-> **接口与 FC 版完全一致**，终端 APK 不需要改代码，只要把配置服务地址换成新的域名。
-> 原 FC 方案保留在 [DEPLOY_FC.md](DEPLOY_FC.md)，可随时切回。
+> **核心配置契约与 FC 版一致**（五节结构、字段校验、ETag / 304 / 409、核心错误码），
+> 终端 APK 不需要改配置读取逻辑，只要把服务地址换成新的域名。但 EdgeOne 版**额外**
+> 提供 `/api/iptv/fetch`、完整 `/api/devices` 设备管理、按 `deviceId` 的设备维度隔离
+> 与在线判定、编辑器令牌预填；FC 版没有这些接口。逐项对照见 [API.md](API.md) 的
+> 「与 FC 版的差异（API 视角）」。原 FC 方案保留在 [DEPLOY_FC.md](DEPLOY_FC.md)，可随时切回。
 
 ---
 
@@ -149,6 +152,16 @@ Blob 是 EdgeOne 的分布式对象存储，**免申请**：首次调用 `getSto
 | `CONFIG_STORAGE` | 可选，`auto`（默认，有 KV 用 KV，否则 Blob）/ `kv` / `blob`。KV 审批期间建议显式写 `blob`，避免日志里反复出现探测失败 |
 | `CONFIG_BLOB_NAMESPACE` | 可选，Blob 命名空间名，默认 `pu_tv_cloud`；不存在时首次写入自动创建 |
 | `CONFIG_CORS_ORIGINS` | 可选；编辑器同源部署留空，跨域时填精确域名（逗号分隔），**不要用 `*`** |
+| `CONFIG_EDITOR_PRELOAD` | 可选，默认 `1`。打开编辑器时把读写令牌与当前域名注入页面，自动预填并自动连接；设 `0`（或 `false` / `off` / `no` / `disabled`）关闭，恢复手动填写 |
+| `CONFIG_ONLINE_WINDOW_MINUTES` | 可选，默认 `30`。终端在线判定窗口（分钟）；客户端前台约每 15 分钟同步一次配置 |
+
+> **令牌预填的安全边界（务必阅读）**：`CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 在
+> 响应编辑器 HTML 时把 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` / 当前域名写成
+> `window.__PURETV_DEFAULTS__` 注入页面（令牌**不写进公开仓库**，响应带
+> `Cache-Control: no-store`）。代价是：**能打开编辑器页面的人可在页面源码里看到写令牌**。
+> 因此不要把编辑器域名公开传播；公开站点请配合访问控制（或反向代理鉴权），
+> 或直接设 `CONFIG_EDITOR_PRELOAD=0` 让使用者手动填写。连接信息的优先级为
+> 「本机 localStorage 改过的值 > 注入默认值 > 空白」，用户改过之后不再被覆盖。
 
 样例见 [edgeone.env.example](edgeone.env.example)。生成随机 Token：`openssl rand -hex 24`。
 
@@ -204,7 +217,9 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
   -d '{"revision":1}'
 ```
 
-浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器。右上角三个框：
+浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器。默认 `CONFIG_EDITOR_PRELOAD=1` 时，
+右上角三个框**已由服务端预填，且页面加载后自动连接**，通常无需手动操作
+（关闭预填、或本机 localStorage 里改过连接信息时，按下表手动填写并点「连接并加载」）：
 
 | 输入框 | 填什么 |
 |---|---|
@@ -213,18 +228,29 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 | 保存令牌（写） | `CONFIG_WRITE_TOKEN`，用于「保存到云端」和「回滚」；留空则用访问令牌（仅当读写同一个 Token 或开发模式时可行） |
 
 服务端**读写令牌分离**：读令牌 GET 有效、PUT 会 401；写令牌 PUT 有效、GET 会 401。
-两个框都要填，否则会出现「能加载但保存失败」或「加载就 401」。填完点「连接并加载」。
+手动填写时两个框都要填，否则会出现「能加载但保存失败」或「加载就 401」。
+令牌预填的安全边界见第 2 步环境变量说明——公开站点请配合访问控制或设 `0`。
 
 编辑器共 6 个页签：站点 / 导航 / 启动 / 更新 / **IPTV 源** / **终端管理**。
 右上角「配置对象」下拉可选「全局模板（新设备初始值）」或某台已上线终端。
 
 - **每台终端独立配置**：终端（v3.0.12+）首次启动生成 UUID 并随请求上报
   `deviceId` / `appVersion`，服务端自动登记并深拷一份完整配置。改全局模板
-  **不会**影响已上线设备，要批量生效请在「终端管理」逐台点「重置为模板」。
-- **IPTV 下发**：在「IPTV 源」页粘贴 M3U / M3U Plus / TXT 文本、选本地文件，
-  或填订阅 URL（由浏览器直接 fetch，流量不经 Edge Functions），点「解析」后预览，
-  再「保存到云端」。频道随配置一起下发，终端写入本地播放列表 `cloud_iptv`。
-  上限 3000 条 / 整文档 900 KB，非法协议与重复 URL 会被过滤。
+  **不会**影响已上线设备，要批量生效请在「终端管理」逐台操作。
+- **IPTV 云端导入与套餐**：在「IPTV 源」页可填订阅 URL（一行一个，最多 10 个）、
+  选本地 `txt|m3u|m3u8` 文件、或直接粘贴文本。点「云端抓取 URL」时由
+  `POST /api/iptv/fetch` 出公网代抓（绕过浏览器 CORS，需写令牌，详见 [API.md](API.md)）；
+  解析仍在编辑器内完成。解析结果可「存为新套餐 / 追加到套餐 / 直接写入频道」，
+  套餐可勾选组合。选中套餐后频道只在套餐库存一份，`GET /api/config` 按勾选顺序
+  展开到 `channels`。若云端代抓接口不可用（例如自建服务未部署该函数），编辑器会
+  **回退浏览器直连**，此时仍受 CORS 限制，失败时请改用本地文件或粘贴文本。
+  约束：套餐最多 12 个、所有套餐频道合计 5000 条、展开后 `channels` 最多 3000 条、
+  整文档 `sections` 900 KB、请求体 2 MiB；非法协议与重复 URL 会被过滤。
+- **终端管理**：显示在线 / 离线（`CONFIG_ONLINE_WINDOW_MINUTES`，默认 30 分钟）、
+  批量勾选操作、编辑单台终端的完整配置，以及「配置下发」按钮（先保存，再对目标设备
+  执行 `push` 生成新 revision）。管理动作共 8 种：`rename` / `comment` / `delete`
+  （软删除，可 `restore`）/ `restore` / `purge`（彻底删除 + 拉黑）/ `unblock` /
+  `reset` / `push`。被 `purge` 拉黑的设备再请求 `/api/config` 返回 `403 device_blocked`。
 
 ### 5. 终端 APK 接入（不用改客户端代码）
 
@@ -251,10 +277,11 @@ flutter build apk --release \
 | 压缩 | 应用内 gzip | 由平台 CDN 自动压缩，配置文档很小，无影响 |
 | 一致性 | OSS 强一致 + 进程内锁 | KV 最终一致（其他节点最长 60s） |
 | 费用 | 函数 + 流量 + OSS/NAS 按量计费 | 免费版额度内 0 元 |
-| 接口契约 | **完全相同**（路径、头、状态码、JSON 结构） | 同左 |
+| 接口契约 | **核心配置契约相同**；但 FC 无 `/api/devices` / `/api/iptv/fetch`、无设备维度与在线判定，请求体 1 MiB、PUT 不校验 900 KB 文档上限 | 额外提供上述能力；请求体 2 MiB、PUT 校验 900 KB 文档上限 |
 
-切换到 EdgeOne **不需要改终端 APK**；`cloud/` Python 版继续保留，本地自建服务器、
-阿里云 FC、任何 WSGI 环境仍可用，CI 也仍在跑它的 23 个单测。
+切换到 EdgeOne **不需要改终端 APK 的配置读取逻辑**；`cloud/` Python 版继续保留，
+本地自建服务器、阿里云 FC、任何 WSGI 环境仍可用，CI 也仍在跑它的全量单测
+（`python -m unittest discover -s tests`，当前 58 项）。逐项差异见 [API.md](API.md)。
 
 ## 五、排错
 
@@ -280,3 +307,22 @@ python scripts/build_fc_package.py
 
 完整步骤见 [DEPLOY_FC.md](DEPLOY_FC.md)。注意 FC 侧的 `OSSStorage` **只支持 AK/SK 明文凭证**，
 不支持函数 RAM 角色；且会产生按量费用。
+
+## 七、本轮新增能力速查（2026-11-12）
+
+| 类别 | 新增 | 说明 |
+|---|---|---|
+| 环境变量 | `CONFIG_EDITOR_PRELOAD=1` | 编辑器连接信息自动预填 + 自动连接；设 `0` 关闭。安全边界见第 2 步 |
+| 环境变量 | `CONFIG_ONLINE_WINDOW_MINUTES=30` | 终端在线判定窗口（分钟） |
+| 接口 | `POST /api/iptv/fetch` | **写令牌**；一次最多 10 个公网 http(s) 订阅地址，单源 2 MiB / 10s，手动跟随最多 3 跳重定向且逐跳复核 SSRF，UTF-8 / GBK 自动识别。仅 EdgeOne，FC 版无此接口 |
+| 接口 | `GET /api/devices` | 返回 `{devices,total,online,blocked,onlineWindowMinutes}`；每台带 `online` / `status` / `lastSeenAgo` / `hidden` / `blocked` / `comment` / `pushedAt` / `pushedRevision` |
+| 接口 | `POST /api/devices` | 8 种动作 `rename` / `comment` / `delete` / `restore` / `purge` / `unblock` / `reset` / `push`；单台或批量（去重≤50）；响应 `{action,total,failed,results}`，单台失败不影响其它台 |
+| 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备请求 `/api/config` 被拒 |
+| 契约 | `navigation.groups` / `defaultGroupId` | 四大类一级栏（`iptv` / `vod` / `live` / `settings`）+ 右侧二级菜单；最多 8 组，默认 `iptv` |
+| 契约 | `startup.exitDialog` | 退出 App 弹窗，云端下发；`enabled=false` 时终端沿用本地原弹窗 |
+| 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 `channels` 上限 3000 |
+| 视图 | `GET /api/config?withPackages=1` | 默认轻量视图把套餐剥离为 `{id,name,sources,channelCount}`；编辑器带此参数取完整套餐库（**FC 版同样实现该视图**） |
+
+> 云端代抓是**带鉴权的受限代理**：不做定时抓取、不解析播放列表、不转发直播流；
+> DNS rebinding 无法在边缘运行时先验解析，请只填可信订阅地址。编辑器在云端代抓失败时
+> 回退浏览器直连（受 CORS 限制）。完整接口与安全约束见 [API.md](API.md)。

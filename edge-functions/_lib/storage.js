@@ -253,13 +253,42 @@ export async function rollback(env, revision, deviceId = null) {
 
 /* ---------------- 设备注册表 ---------------- */
 
+const KEY_BLOCKED = 'devices_blocked';
+const DEFAULT_ONLINE_MINUTES = 30;
+
+function onlineWindowMs(env) {
+  const raw = Number((env && env.CONFIG_ONLINE_WINDOW_MINUTES) || DEFAULT_ONLINE_MINUTES);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_ONLINE_MINUTES * 60 * 1000;
+  return Math.min(raw, 24 * 60) * 60 * 1000;
+}
+
+export function onlineWindowMinutes(env) {
+  return onlineWindowMs(env) / 60000;
+}
+
+async function readBlocked(env) {
+  const db = await backend(env);
+  return (await db.getJSON(KEY_BLOCKED)) || [];
+}
+
+export async function isBlocked(env, deviceId) {
+  if (!deviceId) return false;
+  return (await readBlocked(env)).includes(deviceId);
+}
+
+export async function listBlocked(env) {
+  return readBlocked(env);
+}
+
 /**
- * 终端每次拉配置时登记/刷新上线信息。「上线」= 最后一次成功拉取，不额外做心跳，
- * 因此不会给云端带来任何额外流量。
+ * 终端每次拉配置时登记/刷新上线信息。客户端 v3.0.14 起前台每 15 分钟同步一次，
+ * 因此 lastSeen 既是「最后上线」也是在线判据；云端另有 30 分钟超时兜底。
+ * 被彻底删除（拉黑）的设备不再登记，且 GET /api/config 会直接 403。
  */
 export async function touchDevice(env, deviceId, meta = {}) {
   if (!deviceId) return null;
   const db = await backend(env);
+  if (((await db.getJSON(KEY_BLOCKED)) || []).includes(deviceId)) return null;
   const devices = (await db.getJSON(KEY_DEVICES)) || [];
   const now = nowIso();
   let item = devices.find((entry) => entry.id === deviceId);
@@ -267,6 +296,11 @@ export async function touchDevice(env, deviceId, meta = {}) {
     item = {
       id: deviceId,
       alias: '',
+      comment: '',
+      hidden: false,
+      hiddenAt: '',
+      pushedAt: '',
+      pushedRevision: 0,
       firstSeen: now,
       lastSeen: now,
       appVersion: '',
@@ -281,14 +315,31 @@ export async function touchDevice(env, deviceId, meta = {}) {
   if (meta.model) item.model = String(meta.model).slice(0, 64);
   if (meta.deviceAlias && !item.alias) item.alias = String(meta.deviceAlias).slice(0, 64);
   const doc = await db.getJSON(scopeKeys(deviceId).current);
-  if (doc) item.revision = doc.revision;
+  if (doc && doc.sections) item.revision = doc.revision;
   await db.put(KEY_DEVICES, JSON.stringify(devices.slice(0, MAX_DEVICES)));
   return item;
 }
 
-export async function listDevices(env) {
+/** 返回带在线状态的视图；所有连接过的设备都在里面（含已移除的，由编辑器筛选）。 */
+export async function listDevices(env, now = Date.now()) {
   const db = await backend(env);
-  return (await db.getJSON(KEY_DEVICES)) || [];
+  const devices = (await db.getJSON(KEY_DEVICES)) || [];
+  const blocked = (await db.getJSON(KEY_BLOCKED)) || [];
+  const window = onlineWindowMs(env);
+  return devices.map((item) => {
+    const ts = Date.parse(item.lastSeen || '');
+    const lastSeenAgo = Number.isFinite(ts)
+      ? Math.max(0, Math.floor((now - ts) / 1000)) : null;
+    const online = lastSeenAgo !== null && lastSeenAgo * 1000 <= window;
+    return {
+      ...clone(item),
+      hidden: !!item.hidden,
+      blocked: blocked.includes(item.id),
+      online,
+      status: online ? 'online' : 'offline',
+      lastSeenAgo,
+    };
+  });
 }
 
 export async function updateDevice(env, deviceId, patch = {}) {
@@ -297,18 +348,57 @@ export async function updateDevice(env, deviceId, patch = {}) {
   const item = devices.find((entry) => entry.id === deviceId);
   if (!item) throw new ConfigError(`找不到设备 ${deviceId}`);
   if (typeof patch.alias === 'string') item.alias = patch.alias.trim().slice(0, 64);
+  if (typeof patch.comment === 'string') item.comment = patch.comment.trim().slice(0, 200);
+  if (typeof patch.hidden === 'boolean') {
+    item.hidden = patch.hidden;
+    item.hiddenAt = patch.hidden ? nowIso() : '';
+  }
   await db.put(KEY_DEVICES, JSON.stringify(devices));
   return item;
 }
 
-/** 删除只移除注册项；该设备的文档与快照保留，重新上线时会恢复显示。 */
-export async function deleteDevice(env, deviceId) {
+/** 记录一次显式「配置下发」，供编辑器展示最近下发时间与 revision。 */
+export async function markPushed(env, deviceId, revision) {
+  if (!deviceId) return;
   const db = await backend(env);
   const devices = (await db.getJSON(KEY_DEVICES)) || [];
-  const next = devices.filter((entry) => entry.id !== deviceId);
-  if (next.length === devices.length) throw new ConfigError(`找不到设备 ${deviceId}`);
-  await db.put(KEY_DEVICES, JSON.stringify(next));
-  return { id: deviceId, removed: true };
+  const item = devices.find((entry) => entry.id === deviceId);
+  if (!item) return;
+  item.pushedAt = nowIso();
+  item.pushedRevision = revision;
+  item.editedAt = item.pushedAt;
+  await db.put(KEY_DEVICES, JSON.stringify(devices));
+}
+
+/** 软删除：只从默认列表隐藏，配置与历史都保留，可随时恢复。 */
+export async function deleteDevice(env, deviceId) {
+  return updateDevice(env, deviceId, { hidden: true });
+}
+
+export async function restoreDevice(env, deviceId) {
+  return updateDevice(env, deviceId, { hidden: false });
+}
+
+/**
+ * 彻底删除：移除注册项并拉黑。拉黑后终端 GET /api/config 返回 403、不再登记，
+ * 除非管理员执行 unblock。旧配置文档本身不物理删除（Blob/KV 适配层没有 list/delete，
+ * 且已不可访问），成本可忽略。
+ */
+export async function purgeDevice(env, deviceId) {
+  const db = await backend(env);
+  const devices = (await db.getJSON(KEY_DEVICES)) || [];
+  await db.put(KEY_DEVICES, JSON.stringify(devices.filter((entry) => entry.id !== deviceId)));
+  const blocked = (await db.getJSON(KEY_BLOCKED)) || [];
+  if (!blocked.includes(deviceId)) blocked.push(deviceId);
+  await db.put(KEY_BLOCKED, JSON.stringify(blocked.slice(-MAX_DEVICES)));
+  return { id: deviceId, purged: true, blocked: true };
+}
+
+export async function unblockDevice(env, deviceId) {
+  const db = await backend(env);
+  const blocked = (await db.getJSON(KEY_BLOCKED)) || [];
+  await db.put(KEY_BLOCKED, JSON.stringify(blocked.filter((id) => id !== deviceId)));
+  return { id: deviceId, unblocked: true };
 }
 
 /** 把某台设备的配置重置为当前全局模板，生成该设备的新 revision。 */

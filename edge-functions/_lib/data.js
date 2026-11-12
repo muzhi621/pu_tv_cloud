@@ -58,8 +58,49 @@ export const SEED = {
         "favoriteAreas",
         "moviePlayback",
         "search",
-        "history"
+        "history",
+        "iptv"
       ],
+      "groups": [
+        {
+          "id": "iptv",
+          "label": "IPTV",
+          "icon": "live_tv",
+          "children": [
+            "iptv"
+          ]
+        },
+        {
+          "id": "vod",
+          "label": "影音",
+          "icon": "movie",
+          "children": [
+            "moviePlayback"
+          ]
+        },
+        {
+          "id": "live",
+          "label": "直播",
+          "icon": "tv",
+          "children": [
+            "favorite",
+            "hot",
+            "areas",
+            "favoriteAreas",
+            "search",
+            "history"
+          ]
+        },
+        {
+          "id": "settings",
+          "label": "设置",
+          "icon": "settings",
+          "children": [
+            "settings"
+          ]
+        }
+      ],
+      "defaultGroupId": "iptv",
       "sidebarExpanded": false,
       "homeKeepAlive": true,
       "settings": {
@@ -82,6 +123,14 @@ export const SEED = {
         "titleI18n": {},
         "bodyI18n": {}
       },
+      "exitDialog": {
+        "enabled": false,
+        "mode": "always",
+        "dismissible": true,
+        "showDonate": true,
+        "titleI18n": {},
+        "bodyI18n": {}
+      },
       "showSplashPage": true
     },
     "update": {
@@ -100,7 +149,9 @@ export const SEED = {
       "sources": [],
       "groups": [],
       "channels": [],
-      "epgUrl": ""
+      "epgUrl": "",
+      "packages": [],
+      "selectedPackageIds": []
     }
   }
 };
@@ -312,6 +363,10 @@ export const CATALOG = {
     {
       "id": "history",
       "name": "历史记录"
+    },
+    {
+      "id": "iptv",
+      "name": "IPTV 频道"
     }
   ],
   "updatePrompts": [

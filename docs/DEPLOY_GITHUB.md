@@ -70,9 +70,17 @@ EdgeOne 的硬约定是：`edge-functions/` 与 `edgeone.json` 必须位于**项
 | 变量 | 说明 |
 |---|---|
 | `CONFIG_READ_TOKEN` | 读 Token，APK 与编辑器「访问令牌（读）」用 |
-| `CONFIG_WRITE_TOKEN` | 写 Token，编辑器「保存令牌（写）」与 `PUT` / `rollback` 用；与读 Token 必须分开填 |
+| `CONFIG_WRITE_TOKEN` | 写 Token，编辑器「保存令牌（写）」与 `PUT` / `rollback` / `/api/devices` / `/api/iptv/fetch` 用；与读 Token 必须分开填 |
 | `CONFIG_KV_BINDING` | 可选，默认 `PURETV_KV` |
 | `CONFIG_CORS_ORIGINS` | 可选，编辑器同源部署留空 |
+| `CONFIG_EDITOR_PRELOAD` | 可选，默认 `1`。打开编辑器时注入 `{base, readToken, writeToken, autoConnect:true}`，自动预填并自动连接；设 `0` 关闭 |
+| `CONFIG_ONLINE_WINDOW_MINUTES` | 可选，默认 `30`。终端在线判定窗口（分钟） |
+
+> **令牌预填的安全边界**：`CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 在响应页面时把
+> 读写令牌与当前域名注入为 `window.__PURETV_DEFAULTS__`（令牌不写进公开仓库，
+> 响应带 `Cache-Control: no-store`）。**能打开编辑器页面的人可在源码里看到写令牌**：
+> 不要把编辑器域名公开传播，公开站点请配合访问控制，或设 `CONFIG_EDITOR_PRELOAD=0`
+> 恢复手动填写。连接信息优先级为「本机 localStorage > 注入默认值 > 空白」。
 
 > 环境变量改动**只对之后的部署生效**；先填后部署，可省一次重部署。
 
@@ -108,16 +116,25 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
   -d '{"revision":1}'
 ```
 
-浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器：API 地址留空（同源），
-分别填「访问令牌（读）」「保存令牌（写）」后点「连接并加载」，即可编辑、保存、看差异、回滚。
+浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器：默认 `CONFIG_EDITOR_PRELOAD=1` 时，
+连接框（API 地址 / 读令牌 / 写令牌）**已自动预填且页面加载后自动连接**，通常无需手动填写。
+关闭预填或本机改过连接信息时，再手动填写并点「连接并加载」。安全边界见上文环境变量说明。
 
-编辑器新增两个页签：
+编辑器共 6 个页签，本轮重点扩展了其中两个：
 
-- **终端管理**：列出所有已上线终端（自动 UUID + 别名、首/末上线时间、版本、revision），
-  可逐台改名、编辑配置、重置为模板、移除。右上角「配置对象」下拉切换编辑目标。
-  每台设备保存**完整独立**的配置，改全局模板不会覆盖已有设备。
-- **IPTV 源**：支持网络 URL、本地文件、粘贴文本三种导入，浏览器内解析 M3U / M3U Plus /
-  TXT genre，解析结果随配置下发到终端（单设备最多 3000 条）。云端不抓取订阅、不转发流。
+- **IPTV 源**：支持订阅 URL（一行一个，最多 10 个）、本地 `txt|m3u|m3u8` 文件、
+  粘贴文本三种导入。URL 导入默认走 `POST /api/iptv/fetch` **云端代抓**（写令牌鉴权，
+  绕过浏览器 CORS），解析仍在编辑器内完成；解析结果可「存为新套餐 / 追加到套餐 /
+  直接写入频道」，套餐可勾选组合。选中套餐后频道只在套餐库存一份，`GET /api/config`
+  按勾选顺序展开。云端代抓接口不可用时**回退浏览器直连**（仍受 CORS 限制，失败请改用
+  本地文件或粘贴文本）。约束：套餐最多 12 个、频道合计 5000、展开后 3000、
+  整文档 900 KB、请求体 2 MiB。云端仍只保存解析结果，不定时抓取、不转发直播流。
+- **终端管理**：显示在线 / 离线（`CONFIG_ONLINE_WINDOW_MINUTES`，默认 30 分钟）、
+  批量勾选操作、编辑单台终端完整配置，以及「配置下发」按钮（先保存再 `push`）。
+  8 种动作：`rename` / `comment` / `delete`（软删除）/ `restore` / `purge`（彻底删除 +
+  拉黑）/ `unblock` / `reset` / `push`；被拉黑设备请求 `/api/config` 返回
+  `403 device_blocked`。右上角「配置对象」下拉切换编辑目标，每台设备保存**完整独立**
+  的配置，改全局模板不会覆盖已有设备。
 
 ## 5. 日常维护
 
@@ -132,8 +149,8 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 发布前本地自检（CI 也会跑同一套）：
 
 ```bash
-python -m unittest discover -s tests        # 25 个 Python 单测
-node --test tests/test_edgeone.mjs          # 30 项 EdgeOne 冒烟
+python -m unittest discover -s tests        # 58 个 Python 单测
+node --test tests/test_edgeone.mjs          # 51 项 EdgeOne 冒烟
 python scripts/build_edgeone_assets.py --check
 ```
 
@@ -166,3 +183,20 @@ flutter build apk --release \
 - 免费额度：Edge Functions 300 万次/月、KV 1 GB、构建 500 次/月，本服务远低于上限。
 - **不要用控制台「直接上传 zip」**：该方式要求根目录含 `index.html`、`edgeone.json` 只支持
   redirects/rewrites/headers，且永久无法切回 Git 自动部署。
+
+## 9. 本轮新增能力（2026-11-12）
+
+| 类别 | 新增 | 说明 |
+|---|---|---|
+| 环境变量 | `CONFIG_EDITOR_PRELOAD=1` / `CONFIG_ONLINE_WINDOW_MINUTES=30` | 编辑器令牌预填 + 自动连接、终端在线判定窗口；样例见 [edgeone.env.example](edgeone.env.example) |
+| 接口 | `POST /api/iptv/fetch` | **写令牌**、最多 10 个公网 http(s) 地址、单源 2 MiB / 10s、最多 3 跳重定向逐跳复核 SSRF、UTF-8 / GBK 自动识别；仅 EdgeOne |
+| 接口 | `GET/POST /api/devices` | GET 返回在线离线与 `pushedAt` 等；POST 8 种动作、单台或批量（≤50）、`{action,total,failed,results}`，单台失败不影响其它 |
+| 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备被拒绝下发配置 |
+| 契约 | `navigation.groups` / `defaultGroupId` / `startup.exitDialog` | 四大类一级栏 + 右侧二级菜单、退出 App 弹窗云端下发 |
+| 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 3000 |
+| 视图 | `GET /api/config?withPackages=1` | 默认轻量视图剥离套餐频道为 `{id,name,sources,channelCount}`；FC 版同样实现 |
+
+> **核心配置契约与 FC 版一致，但 EdgeOne 版额外提供 `/api/iptv/fetch` 与完整设备管理
+> 动作**。FC 版（`cloud/app.py`）没有这两个接口、没有设备维度、请求体上限 1 MiB、
+> 无 900 KB 文档校验。逐项对照见 [API.md](API.md) 的「与 FC 版的差异（API 视角）」。
+> 云端代抓是带鉴权的受限代理，DNS rebinding 无法先验解析，请只填可信订阅地址。
