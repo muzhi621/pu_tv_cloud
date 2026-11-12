@@ -193,8 +193,8 @@ FC 版**没有**全局资源库（`/api/library` 返回 404 `not_supported`）�
 ```
 iptv.sources[{id:'s_xxxxxxxx', name, url, type, channelCount, addedAt, note}]
 iptv.packages[{id:'pkg_xxxxxxxx', name, sources:[sourceId], channels:[{name,url,group,logo}]}]
-vod.sources[{id:'vs_xxxxxxxx', name, url, siteCount, addedAt, note}]
-vod.sites[{id:'<sourceId>:<key>', sourceId, key, name, api, type, searchable, quickSearch, note}]
+vod.sources[{id:'vs_xxxxxxxx', name, url, jar, siteCount, addedAt, note}]
+vod.sites[{id:'<sourceId>:<key>', sourceId, key, name, api, ext, type, searchable, quickSearch, note}]
 ```
 
 - **一台设备都没连也能先建库**：源、套餐、TVBox 站点都存在库里，编辑器「IPTV 源」
@@ -206,8 +206,16 @@ vod.sites[{id:'<sourceId>:<key>', sourceId, key, name, api, type, searchable, qu
 - **锁定**：设备 `lockLibrary=true` 时完全忽略库，只用设备内联内容。PUT 时若
   `lockLibrary=true`、`channels` 为空且 `packageIds` 非空，服务端会用库展开一次写进
   `channels` / `groups`，让这台设备离线也自包含。锁定设备不计入「预计影响台数」。
-- **TVBox 本期只存不播**：库只负责维护站点清单与设备引用，终端侧播放链路未接，
-  下发内容终端会忽略（待真机验证）。
+- **TVBox 源的两个关键字段**：`vod.sources[].jar` 是爬虫包地址（TVBox 配置里的
+  `spider`），`vod.sites[].ext` 是站点透传给 spider 的扩展参数。`api` 以 `csp_` 开头的
+  站点**没有 `jar` 就完全无法运行**——它不是一个 http 接口，而是一段要现场加载的代码。
+  编辑器导入 TVBox 配置时会自动提取顶层 `spider` 记成源 jar，并在源列表里对缺 jar
+  的源标红。
+- **按源展开**：`GET /api/config` 会把设备的 `vod.sourceIds` 展开成扁平的
+  `sources` + `sites`（`siteIds` 非空时收窄成白名单），终端拿到就能直接用，
+  不必再请求库。`lockLibrary=true` 时不读库，只用设备内联的 `sources` / `sites`。
+- **终端消费进度**：v3.0.15 起终端可以加载 `csp_` 站点的 spider jar 并调用
+  `homeContent`（影音板块「TVBox 诊断」页可逐步自检）；站点浏览与播放界面在下一版。
 - **FC 版不支持**：`cloud/app.py` 只有单份全局文档，没有 `library_current` 也没有
   per-device 文档，`GET/PUT /api/library` 返回 `404 not_supported`，编辑器按
   「服务端未升级」降级；`sections` 仍兼容 `vod` 与 `packageIds`，但引用不会被展开。

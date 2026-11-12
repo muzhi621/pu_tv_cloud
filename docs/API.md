@@ -184,10 +184,15 @@ curl -X PUT "$BASE/api/config" \
   内容，忽略资源库后续变化。
 - `iptv.libraryRevision`（int ≥ 0，默认 0）：设备文档已追平到库的哪个 revision，
   **由服务端维护**（懒触发时 bump），客户端不要自行加一或伪造。
-- `vod`：TVBox 源/站点节，`{managed:false, sourceIds:[], siteIds:[], lockLibrary:false,
-  libraryRevision:0}`。`sourceIds` ≤ 20，元素形如 `vs_1a2b3c4d`；`siteIds` ≤ 500，
-  元素形如 `vs_1a2b3c4d:csp_X`（`^[A-Za-z0-9_:-]{1,96}$`）。设备只存引用，站点清单
-  在库里存一份。老文档没有这一节时读出来自动补默认值。
+- `vod`：TVBox 源/站点节，`{managed:false, sourceIds:[], siteIds:[], sources:[],
+  sites:[], lockLibrary:false, libraryRevision:0}`。`sourceIds` ≤ 20，元素形如
+  `vs_1a2b3c4d`；`siteIds` ≤ 500，元素形如 `vs_1a2b3c4d:csp_X`
+  （`^[A-Za-z0-9_:-]{1,96}$`）。设备只存引用，站点清单在库里存一份。
+  老文档没有这一节时读出来自动补默认值。
+  - `sources` / `sites` 是**展开产物**：GET `/api/config` 时由服务端按当前库实时写入，
+    编辑器保存时会清掉未锁定设备的这两个字段（写了也等于把库的快照固化成人工配置）。
+  - `vod.lockLibrary === true` 时相反：服务端完全不读库，只用这两个字段充当
+    **锁定快照**，PUT 时若为空会先按库展开一次再落地。
 
 **IPTV 节（两端一致）**：`channels` 每项为 `{name, url, group?, logo?}`；服务端按
 URL 小写去重，只接受 `http(s)/rtmp(s)/rtsp/udp/mms/p2p` 协议，最多 3000 条。
@@ -203,8 +208,10 @@ URL 小写去重，只接受 `http(s)/rtmp(s)/rtsp/udp/mms/p2p` 协议，最多 
 **锁定快照（仅 EdgeOne）**：PUT 时若 `iptv.lockLibrary === true` 且 `iptv.channels`
 为空、`iptv.packageIds` 非空，服务端会用当前资源库**展开一次**，把频道写入
 `channels` / `groups` 并回填 `libraryRevision`（`vod.libraryRevision` 同步回填）。
+`vod` 同样处理：`vod.lockLibrary === true` 且 `vod.sites` 为空、`vod.sourceIds` 非空时，
+用 `expandVodSites` 展开一次写进 `sources` / `sites`。
 这样锁定设备是**自包含**的：离线也能播，库以后怎么改都不影响它。已经带了非空
-`channels` 的请求不会被改写（尊重人工填写的频道）。
+`channels`（或非空 `sites`）的请求不会被改写（尊重人工填写的内容）。
 
 **订阅导入分工**：编辑器负责解析 M3U / M3U Plus / TXT genre，云端**只保存解析结果**、
 不定时抓取、不转发直播流。但 EdgeOne 新增 `POST /api/iptv/fetch` 作为**受限云端代理**，
@@ -244,11 +251,13 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
     "epgUrl": ""
   },
   "vod": {
-    "sources": [{"id": "vs_1a2b3c4d", "name": "某 TVBox 接口",
-                 "url": "https://.../api.php/provide/vod/", "siteCount": 1,
+    "sources": [{"id": "vs_1a2b3c4d", "name": "某 TVBox 配置",
+                 "url": "https://.../tvbox.json",
+                 "jar": "https://.../spider.jar",
+                 "siteCount": 2,
                  "addedAt": "2026-11-10T09:00:00+08:00", "note": ""}],
     "sites": [{"id": "vs_1a2b3c4d:csp_X", "sourceId": "vs_1a2b3c4d", "key": "csp_X",
-               "name": "测试站点", "api": "csp_X", "type": 1,
+               "name": "测试站点", "api": "csp_X", "ext": "token-abc", "type": 3,
                "searchable": 1, "quickSearch": 0, "note": ""}]
   }
 }
