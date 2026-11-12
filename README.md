@@ -201,7 +201,8 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 **完整 release 编译验证并发布 v3.0.8 Release**：`flutter pub get`、`flutter analyze`、
 双 flavor × 3 ABI 的 R8 打包、Release 上传与 `releases.json` 回写全部通过。
 （A 档瘦身后默认改为 **只发 impeller × armeabi-v7a/arm64-v8a 两个 ABI**；
-v3.0.12 起进一步收敛到单 MPV 内核 + WebP 表情以压体积。）
+v3.0.12 起收敛到单 MPV 内核 + WebP 表情；v3.0.13 起 native 库压缩打包，
+两个 APK 降至 38.25 MB / 40.18 MB。）
 终端侧接入云端配置使用编译期 `--dart-define=PURE_LIVE_CONFIG_URL/TOKEN`，
 或运行时 Hive 键 `remoteConfigEndpoint` / `remoteConfigToken`（P0 暂无设置 UI）。
 v3.0.12 起终端上报 `deviceId` / `appVersion`、并把 `iptv` 节落地本地 Drift。
