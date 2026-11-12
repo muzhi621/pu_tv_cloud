@@ -111,6 +111,9 @@ DEFAULT_VOD: dict = {
     "managed": False,
     "sourceIds": [],
     "siteIds": [],
+    # 展开产物 / 锁定快照载体，与 contract.js 的 DEFAULT_VOD 对齐。
+    "sources": [],
+    "sites": [],
     "lockLibrary": False,
     "libraryRevision": 0,
 }
@@ -709,7 +712,74 @@ def normalize_vod(part: dict, warnings: list[str]) -> dict:
     base["lockLibrary"] = _bool(part.get("lockLibrary"), False, "vod.lockLibrary")
     base["libraryRevision"] = _int(part.get("libraryRevision"), 0, 0,
                                    MAX_LIBRARY_REVISION, "vod.libraryRevision")
+
+    # 内联源 / 站点：既可能是服务端展开的产物，也可能是人工写死的快照。
+    # FC 版没有全局资源库，这两个字段是 TVBox 配置唯一的落地处。
+    base["sources"] = _inline_vod_sources(part.get("sources"), warnings)
+    base["sites"] = _inline_vod_sites(part.get("sites"), warnings)
     return base
+
+
+def _inline_vod_sources(raw: Any, warnings: list[str]) -> list[dict]:
+    """校验设备内联的 TVBox 源（id / name / jar）。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        warnings.append("vod.sources: 必须是数组，已忽略")
+        return []
+    out: list[dict] = []
+    for entry in raw[:MAX_VOD_SOURCES]:
+        if not isinstance(entry, dict):
+            continue
+        source_id = _str(entry.get("id"), "", "vod.sources.id", 32)
+        if not source_id:
+            continue
+        jar = _str(entry.get("jar"), "", "vod.sources.jar", 1000)
+        name = _str(entry.get("name"), "", "vod.sources.name", 64)
+        out.append({
+            "id": source_id,
+            "name": name or source_id,
+            "jar": jar if jar and _URL_RE.match(jar) else "",
+        })
+    if len(raw) > MAX_VOD_SOURCES:
+        warnings.append("vod.sources: 超过 %d 个上限，已截断" % MAX_VOD_SOURCES)
+    return out
+
+
+def _inline_vod_sites(raw: Any, warnings: list[str]) -> list[dict]:
+    """校验设备内联的 TVBox 站点；不再校验「必须属于某个源」。
+
+    锁定快照里的源和站点是同一时刻拍下来的，可能已经和库对不上，
+    这里强制引用关系合法反而会把快照清空。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        warnings.append("vod.sites: 必须是数组，已忽略")
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw[:MAX_VOD_SITES]:
+        if not isinstance(entry, dict):
+            continue
+        site_id = _str(entry.get("id"), "", "vod.sites.id", 96)
+        api = _str(entry.get("api"), "", "vod.sites.api", 500)
+        if not site_id or not api or site_id in seen:
+            continue
+        seen.add(site_id)
+        out.append({
+            "id": site_id,
+            "sourceId": _str(entry.get("sourceId"), "", "vod.sites.sourceId", 32),
+            "name": _str(entry.get("name"), "", "vod.sites.name", 64) or site_id,
+            "api": api,
+            "ext": _str(entry.get("ext"), "", "vod.sites.ext", 1000),
+            "type": _lenient_int(entry.get("type"), 0, 0, 4),
+            "searchable": _lenient_int(entry.get("searchable"), 0, 0, 2),
+            "quickSearch": _lenient_int(entry.get("quickSearch"), 0, 0, 2),
+        })
+    if len(raw) > MAX_VOD_SITES:
+        warnings.append("vod.sites: 超过 %d 个上限，已截断" % MAX_VOD_SITES)
+    return out
 
 
 def expand_iptv_channels(sections: dict, library: dict | None = None) -> dict:

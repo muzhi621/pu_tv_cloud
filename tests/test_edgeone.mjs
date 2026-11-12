@@ -22,8 +22,8 @@ import {
   onRequestGet as editorGet, preloadDefaults, injectDefaults,
 } from '../edge-functions/index.js';
 import {
-  normalizeDocument, normalizeSections, expandIptvChannels, viewDocument, normalizeLibrary,
-  emptyLibrary,
+  normalizeDocument, normalizeSections, expandIptvChannels, expandVodSites, viewDocument,
+  normalizeLibrary, emptyLibrary,
 } from '../edge-functions/_lib/contract.js';
 import { optionsHandler } from '../edge-functions/_lib/http.js';
 import { listDevices as storageListDevices } from '../edge-functions/_lib/storage.js';
@@ -790,7 +790,8 @@ test('资源库文档模型：id 规则、上限与协议校验', async (t) => {
   await t.test('设备 vod 节：默认值、上限与类型校验', () => {
     const [sections] = normalizeSections({});
     assert.deepEqual(sections.vod, {
-      managed: false, sourceIds: [], siteIds: [], lockLibrary: false, libraryRevision: 0,
+      managed: false, sourceIds: [], siteIds: [], sources: [], sites: [],
+      lockLibrary: false, libraryRevision: 0,
     });
 
     const sourceIds = Array.from({ length: 21 }, (_, i) => `vs_${String(i).padStart(8, '0')}`);
@@ -1144,7 +1145,8 @@ test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔
     // 没有库引用 → 不 bump，revision 原样
     assert.equal(doc.revision, 5);
     assert.deepEqual(doc.sections.vod, {
-      managed: false, sourceIds: [], siteIds: [], lockLibrary: false, libraryRevision: 0,
+      managed: false, sourceIds: [], siteIds: [], sources: [], sites: [],
+      lockLibrary: false, libraryRevision: 0,
     });
     assert.deepEqual(doc.sections.iptv.packageIds, []);
   });
@@ -1202,5 +1204,132 @@ test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔
       // 设备 id 允许连字符，键名只需落在 KV 支持的字符集内
       assert.match(key, /^[A-Za-z0-9_-]+$/, `非法 KV key: ${key}`);
     }
+  });
+});
+
+/* ================= TVBox 源：库字段与按源展开 ================= */
+
+test('TVBox 源与站点：库字段、按源展开、白名单与锁定隔离', async (t) => {
+  const SOURCE_A = 'vs_aaaaaaaa';
+  const SOURCE_B = 'vs_bbbbbbbb';
+
+  const buildLibrary = () => {
+    const [library] = normalizeLibrary({
+      vod: {
+        sources: [
+          {
+            id: SOURCE_A,
+            name: '源A',
+            url: 'https://a.example.com/config.json',
+            jar: 'https://a.example.com/spider.jar',
+          },
+          {
+            id: SOURCE_B,
+            name: '源B',
+            url: 'https://b.example.com/config.json',
+            // 非 http(s) 的 jar 必须被清空，否则终端会拿它去下载然后报 IO 错
+            jar: 'ftp://bad.example.com/spider.jar',
+          },
+        ],
+        sites: [
+          { sourceId: SOURCE_A, key: 'a1', name: 'A1', api: 'csp_A1', ext: 'token-a1', type: 3 },
+          { sourceId: SOURCE_A, key: 'a2', name: 'A2', api: 'https://a.example.com/api.php/provide/vod', type: 1 },
+          { sourceId: SOURCE_B, key: 'b1', name: 'B1', api: 'csp_B1', type: 3 },
+        ],
+      },
+    });
+    return library;
+  };
+
+  await t.test('库内源保存 jar（仅 http(s)），站点保存 ext', () => {
+    const library = buildLibrary();
+    assert.equal(library.vod.sources[0].jar, 'https://a.example.com/spider.jar');
+    assert.equal(library.vod.sources[1].jar, '');
+    assert.equal(library.vod.sites[0].ext, 'token-a1');
+    assert.equal(library.vod.sites[1].ext, '');
+  });
+
+  await t.test('只引用源时展开该源下全部站点，并下发源 jar', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({ vod: { managed: true, sourceIds: [SOURCE_A] } });
+    const out = expandVodSites(sections, library);
+
+    assert.deepEqual(out.vod.sources.map((item) => item.id), [SOURCE_A]);
+    assert.equal(out.vod.sources[0].jar, 'https://a.example.com/spider.jar');
+    assert.deepEqual(out.vod.sites.map((item) => item.id), [`${SOURCE_A}:a1`, `${SOURCE_A}:a2`]);
+    assert.equal(out.vod.sites[0].api, 'csp_A1');
+    assert.equal(out.vod.sites[0].ext, 'token-a1');
+    assert.equal(out.vod.sites[0].type, 3);
+    // 纯管理字段不下发：站点多的时候这些能占掉一半体积
+    assert.equal(out.vod.sites[0].note, undefined);
+    assert.equal(out.vod.sites[0].addedAt, undefined);
+    assert.equal(out.vod.sites[0].key, undefined);
+  });
+
+  await t.test('siteIds 白名单把站点收窄到一个', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({
+      vod: { managed: true, sourceIds: [SOURCE_A], siteIds: [`${SOURCE_A}:a2`] },
+    });
+    const out = expandVodSites(sections, library);
+    assert.deepEqual(out.vod.sites.map((item) => item.id), [`${SOURCE_A}:a2`]);
+  });
+
+  await t.test('多源同时选中：站点合并、源按引用顺序', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({
+      vod: { managed: true, sourceIds: [SOURCE_B, SOURCE_A] },
+    });
+    const out = expandVodSites(sections, library);
+    assert.deepEqual(out.vod.sources.map((item) => item.id), [SOURCE_B, SOURCE_A]);
+    assert.deepEqual(
+      out.vod.sites.map((item) => item.id).sort(),
+      [`${SOURCE_A}:a1`, `${SOURCE_A}:a2`, `${SOURCE_B}:b1`].sort(),
+    );
+  });
+
+  await t.test('锁定后完全不读库，只用设备内联快照', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({
+      vod: {
+        managed: true,
+        sourceIds: [SOURCE_A],
+        lockLibrary: true,
+        sources: [{ id: SOURCE_A, name: '快照源', jar: 'https://old.example.com/spider.jar' }],
+        sites: [{ id: `${SOURCE_A}:only`, sourceId: SOURCE_A, name: '快照站点', api: 'csp_Old' }],
+      },
+    });
+    const out = expandVodSites(sections, library);
+    // 库里有 a1/a2，但锁定后必须看不见
+    assert.deepEqual(out.vod.sites.map((item) => item.id), [`${SOURCE_A}:only`]);
+    assert.equal(out.vod.sources[0].jar, 'https://old.example.com/spider.jar');
+  });
+
+  await t.test('未选源的设备原样返回内联内容（老文档兼容）', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({ vod: { managed: false } });
+    const out = expandVodSites(sections, library);
+    assert.deepEqual(out.vod.sources, []);
+    assert.deepEqual(out.vod.sites, []);
+  });
+
+  await t.test('库不可用时不炸，站点退化为空', () => {
+    const [sections] = normalizeSections({ vod: { managed: true, sourceIds: [SOURCE_A] } });
+    const out = expandVodSites(sections, null);
+    assert.deepEqual(out.vod.sources, []);
+    assert.deepEqual(out.vod.sites, []);
+  });
+
+  await t.test('viewDocument 同时展开 vod 与 iptv，互不干扰', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({
+      vod: { managed: true, sourceIds: [SOURCE_A] },
+    });
+    const document = { schemaVersion: 1, revision: 7, updatedAt: '2026-01-01T00:00:00+08:00', sections };
+    const view = viewDocument(document, false, library);
+    assert.equal(view.revision, 7);
+    assert.equal(view.sections.vod.sites.length, 2);
+    // 原始文档不能被视图函数改写
+    assert.deepEqual(document.sections.vod.sites, []);
   });
 });

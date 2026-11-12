@@ -93,6 +93,10 @@ export const DEFAULT_VOD = {
   managed: false,
   sourceIds: [],
   siteIds: [],
+  // 展开后的产物（GET 时由 expandVodSites 写入），也是锁定快照的载体：
+  // lockLibrary 为 true 时终端只认这两个字段，不再跟随资源库。
+  sources: [],
+  sites: [],
   lockLibrary: false,
   libraryRevision: 0,
 };
@@ -641,8 +645,12 @@ export function expandIptvChannels(sections, library = null) {
  */
 export function viewDocument(document, withPackages = false, library = null) {
   const out = clone(document);
-  if (!out.sections || !out.sections.iptv) return out;
+  if (!out.sections) return out;
   ensureSectionDefaults(out.sections);
+  // vod 与 iptv 彼此独立：只有 vod 的文档也要能展开 TVBox 站点，
+  // 所以先展开 vod，再对 iptv 做原有的早退判断。
+  out.sections = expandVodSites(out.sections, library);
+  if (!out.sections.iptv) return out;
   out.sections = expandIptvChannels(out.sections, library);
 
   const iptv = out.sections.iptv;
@@ -718,7 +726,138 @@ function normalizeVod(part, warnings) {
 
   base.lockLibrary = bool(part.lockLibrary, false, 'vod.lockLibrary');
   base.libraryRevision = int(part.libraryRevision, 0, 0, 1e9, 'vod.libraryRevision');
+
+  // 锁定快照 / 手工内联：只做字段级裁剪，不深究语义（它们本来就是从
+  // expandVodSites 产物或编辑器写回来的，结构已经受控）。
+  base.sources = inlineVodSources(part.sources, warnings);
+  base.sites = inlineVodSites(part.sites, warnings);
   return base;
+}
+
+/** 设备内联的源：展开产物或人工添加，字段少且固定。 */
+function inlineVodSources(raw, warnings) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    warnings.push('vod.sources: 必须是数组，已忽略');
+    return [];
+  }
+  const out = [];
+  for (const entry of raw.slice(0, MAX_VOD_SOURCES)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const id = str(entry.id, '', 'vod.sources.id', 32);
+    const name = str(entry.name, '', 'vod.sources.name', 64);
+    const jar = str(entry.jar, '', 'vod.sources.jar', 1000);
+    if (!id) continue;
+    out.push({
+      id,
+      name: name || id,
+      jar: jar && URL_RE.test(jar) ? jar : '',
+    });
+  }
+  if (raw.length > MAX_VOD_SOURCES) {
+    warnings.push(`vod.sources: 超过 ${MAX_VOD_SOURCES} 个上限，已截断`);
+  }
+  return out;
+}
+
+/**
+ * 设备内联的站点。与库里的站点同构，但不再做「必须属于某个源」的校验：
+ * 锁定快照里源和站点是同一个时刻拍下来的，可能已经和当前库对不上。
+ */
+function inlineVodSites(raw, warnings) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    warnings.push('vod.sites: 必须是数组，已忽略');
+    return [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (const entry of raw.slice(0, MAX_VOD_SITES)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const id = str(entry.id, '', 'vod.sites.id', 96);
+    const api = str(entry.api, '', 'vod.sites.api', 500);
+    if (!id || !api || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      sourceId: str(entry.sourceId, '', 'vod.sites.sourceId', 32),
+      name: str(entry.name, '', 'vod.sites.name', 64) || id,
+      api,
+      ext: str(entry.ext, '', 'vod.sites.ext', 1000),
+      type: lenientInt(entry.type, 0, 0, 4),
+      searchable: lenientInt(entry.searchable, 0, 0, 2),
+      quickSearch: lenientInt(entry.quickSearch, 0, 0, 2),
+    });
+  }
+  if (raw.length > MAX_VOD_SITES) {
+    warnings.push(`vod.sites: 超过 ${MAX_VOD_SITES} 个上限，已截断`);
+  }
+  return out;
+}
+
+/**
+ * 把设备 vod 节的 id 引用展开成终端可以直接用的源与站点列表。
+ *
+ * 和 IPTV 是同一套做法：库改了设备不用改，GET 的时候按当前库实时展开。
+ *   1. `lockLibrary === true`：只用设备内联的 sources/sites（锁定快照），
+ *      资源库再改也不影响这台设备。
+ *   2. `sourceIds` 为空：同样只认内联内容，等价于「这台设备没选源」。
+ *   3. `sourceIds` 非空：从库里取这些源；站点默认取这些源下的全部，
+ *      只有 `siteIds` 里显式列了白名单时才收窄。
+ *
+ * 输出字段刻意压到终端真正需要的量：站点只带 id/name/api/ext/type 与两个
+ * 搜索标记，把 note、addedAt 之类纯管理字段丢掉，心跳体才不至于过大。
+ */
+export function expandVodSites(sections, library = null) {
+  const vod = sections && sections.vod;
+  if (!vod) return sections;
+  const out = clone(sections);
+  const locked = vod.lockLibrary === true;
+  const inlineSources = Array.isArray(vod.sources) ? vod.sources : [];
+  const inlineSites = Array.isArray(vod.sites) ? vod.sites : [];
+  const refSourceIds = (!locked && Array.isArray(vod.sourceIds)) ? vod.sourceIds : [];
+  if (!refSourceIds.length) {
+    out.vod.sources = inlineSources;
+    out.vod.sites = inlineSites;
+    return out;
+  }
+
+  const libSources = (library && library.vod && Array.isArray(library.vod.sources))
+    ? library.vod.sources : [];
+  const libSites = (library && library.vod && Array.isArray(library.vod.sites))
+    ? library.vod.sites : [];
+  const picked = [];
+  for (const id of refSourceIds) {
+    const source = libSources.find((item) => item.id === id);
+    if (source) picked.push(source);
+  }
+  const sourceIdSet = new Set(picked.map((item) => item.id));
+  const allowSiteIds = Array.isArray(vod.siteIds) && vod.siteIds.length
+    ? new Set(vod.siteIds)
+    : null;
+  const sites = [];
+  for (const site of libSites) {
+    if (!sourceIdSet.has(site.sourceId)) continue;
+    if (allowSiteIds && !allowSiteIds.has(site.id)) continue;
+    sites.push({
+      id: site.id,
+      sourceId: site.sourceId,
+      name: site.name,
+      api: site.api,
+      ext: site.ext || '',
+      type: site.type,
+      searchable: site.searchable,
+      quickSearch: site.quickSearch,
+    });
+    if (sites.length >= MAX_VOD_SITES) break;
+  }
+  out.vod.sources = picked.map((item) => ({
+    id: item.id,
+    name: item.name,
+    jar: item.jar || '',
+  }));
+  out.vod.sites = sites;
+  return out;
 }
 
 const NORMALIZERS = {
@@ -932,10 +1071,15 @@ function normalizeLibraryVod(part, warnings) {
         continue;
       }
       taken.add(id);
+      // jar 是这个源的爬虫包地址（TVBox 配置里的 spider 字段）。
+      // 站点 api 以 csp_ 开头时终端必须靠它加载代码，缺失则该源下的
+      // csp_ 站点全部不可用，所以这里允许为空但要在编辑器侧提示。
+      const jar = str(item.jar, '', 'library.vod.sources.jar', 1000);
       out.sources.push({
         id,
         name: str(item.name, '', 'library.vod.sources.name', 64) || url,
         url,
+        jar: jar && URL_RE.test(jar) ? jar : '',
         siteCount: lenientInt(item.siteCount, 0, 0, MAX_VOD_SITES),
         addedAt: str(item.addedAt, nowIso(), 'library.vod.sources.addedAt', 40),
         note: str(item.note, '', 'library.vod.sources.note', 200),
@@ -991,6 +1135,9 @@ function normalizeLibraryVod(part, warnings) {
         key,
         name: str(item.name, '', `library.vod.sites[${id}].name`, 64) || key,
         api,
+        // ext 是站点的扩展参数，spider 初始化时原样透传（token、接口地址等）。
+        // 大量站点离了它就取不到数据，所以必须存进库、随配置下发。
+        ext: str(item.ext, '', `library.vod.sites[${id}].ext`, 1000),
         type: lenientInt(item.type, 0, 0, 4),
         searchable: lenientInt(item.searchable, 0, 0, 2),
         quickSearch: lenientInt(item.quickSearch, 0, 0, 2),

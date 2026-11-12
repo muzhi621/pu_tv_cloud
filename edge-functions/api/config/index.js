@@ -1,6 +1,7 @@
 /** GET/PUT /api/config —— 与终端 RemoteConfigService 的主接口。 */
 import {
-  ConfigError, expandIptvChannels, MAX_DOCUMENT_BYTES, normalizeSections, viewDocument,
+  ConfigError, expandIptvChannels, expandVodSites, MAX_DOCUMENT_BYTES, normalizeSections,
+  viewDocument,
 } from '../../_lib/contract.js';
 import {
   deviceScope, handle, HttpError, optionsHandler, readJsonBody, requireAuth, send,
@@ -96,22 +97,39 @@ export async function onRequestGet(context) {
 
 /**
  * 锁定设备的自包含快照：lockLibrary=true 表示「以后不跟库变」，
- * 但设备自己未必有完整频道，所以服务端用库展开一次写进 channels。
+ * 但设备自己未必有完整内容，所以服务端用库展开一次写进设备文档。
+ *
+ * IPTV 落 channels/groups，TVBox 落 sources/sites —— 两者锁定时语义一致：
+ * 之后 expandVodSites / expandIptvChannels 看到 lockLibrary 就不再读库。
  */
 async function freezeLockedChannels(env, sections) {
   const iptv = sections.iptv;
-  if (!iptv || iptv.lockLibrary !== true) return sections;
-  if (Array.isArray(iptv.channels) && iptv.channels.length) return sections;
-  const refIds = Array.isArray(iptv.packageIds) ? iptv.packageIds : [];
-  if (!refIds.length) return sections;
+  const vod = sections.vod;
+  const needIptv = iptv && iptv.lockLibrary === true
+    && !(Array.isArray(iptv.channels) && iptv.channels.length)
+    && Array.isArray(iptv.packageIds) && iptv.packageIds.length > 0;
+  const needVod = vod && vod.lockLibrary === true
+    && !(Array.isArray(vod.sites) && vod.sites.length)
+    && Array.isArray(vod.sourceIds) && vod.sourceIds.length > 0;
+  if (!needIptv && !needVod) return sections;
+
   const library = await safeReadLibrary(env);
   if (!library) return sections;
-  // 复用展开逻辑，但把 lockLibrary 临时置 false，才能读到库里的套餐。
-  const probe = { ...sections, iptv: { ...iptv, lockLibrary: false } };
-  const expanded = expandIptvChannels(probe, library);
-  sections.iptv.channels = expanded.iptv.channels;
-  sections.iptv.groups = expanded.iptv.groups;
-  sections.iptv.libraryRevision = library.revision;
+
+  if (needIptv) {
+    // 复用展开逻辑，但把 lockLibrary 临时置 false，才能读到库里的套餐。
+    const probe = { ...sections, iptv: { ...iptv, lockLibrary: false } };
+    const expanded = expandIptvChannels(probe, library);
+    sections.iptv.channels = expanded.iptv.channels;
+    sections.iptv.groups = expanded.iptv.groups;
+  }
+  if (needVod) {
+    const probe = { ...sections, vod: { ...vod, lockLibrary: false } };
+    const expanded = expandVodSites(probe, library);
+    sections.vod.sources = expanded.vod.sources;
+    sections.vod.sites = expanded.vod.sites;
+  }
+  if (sections.iptv) sections.iptv.libraryRevision = library.revision;
   if (sections.vod) sections.vod.libraryRevision = library.revision;
   return sections;
 }

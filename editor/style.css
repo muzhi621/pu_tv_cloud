@@ -226,8 +226,8 @@ button.tiny.danger { color: var(--danger); border-color: #fecaca; }
 }
 .lib-input:focus, .lib-table input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 .lib-table { margin-bottom: 6px; }
-.lib-table td { vertical-align: middle; }
-.lib-table td input.lib-input { min-width: 120px; }
+.lib-table td { vertical-align: middle; max-width: 240px; }
+.lib-table td input.lib-input { min-width: 110px; }
 .lib-source-block {
   margin-bottom: 12px; padding: 12px 14px;
   border: 1px solid var(--border); border-radius: 9px; background: var(--surface);
@@ -241,7 +241,10 @@ button.tiny.danger { color: var(--danger); border-color: #fecaca; }
   border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
 }
 .lib-site-row {
-  display: grid; grid-template-columns: 90px minmax(110px, 1fr) minmax(150px, 1.4fr) minmax(120px, 200px);
+  /* ext 和备注各占一列：ext 是 csp_ 站点的必需参数，必须能直接看见并改，
+     藏进详情弹窗会让「导入完发现播不了」变成常态问题。 */
+  display: grid;
+  grid-template-columns: 84px minmax(96px, 1fr) minmax(130px, 1.3fr) minmax(130px, 1fr) minmax(110px, 0.9fr);
   gap: 8px; align-items: center; padding: 5px 0; border-bottom: 1px dashed var(--border);
 }
 .lib-site-row:last-child { border-bottom: 0; }

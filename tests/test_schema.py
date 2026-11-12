@@ -474,6 +474,29 @@ class ExpandIptvChannelsTests(unittest.TestCase):
 class VodSectionTests(unittest.TestCase):
     """vod 节（TVBox 源/站点引用）：默认值、格式校验、上限与老文档兼容。"""
 
+    def test_vod_inline_sources_and_sites(self):
+        """内联源/站点：jar 仅存 http(s)，ext 原样保留，非法条目被丢弃。"""
+        sections, warnings = normalize_sections({
+            "vod": {
+                "sources": [
+                    {"id": "vs_aaaaaaaa", "name": "源A", "jar": "https://a.example.com/spider.jar"},
+                    {"id": "vs_bbbbbbbb", "jar": "ftp://bad.example.com/spider.jar"},
+                    {"name": "没有 id"},
+                ],
+                "sites": [
+                    {"id": "vs_aaaaaaaa:a1", "sourceId": "vs_aaaaaaaa", "api": "csp_A1", "ext": "token-a1"},
+                    {"id": "vs_aaaaaaaa:a2", "sourceId": "vs_aaaaaaaa", "ext": "缺少 api"},
+                ],
+            },
+        })
+        vod = sections["vod"]
+        self.assertEqual(len(vod["sources"]), 2)
+        self.assertEqual(vod["sources"][0]["jar"], "https://a.example.com/spider.jar")
+        self.assertEqual(vod["sources"][1]["jar"], "")
+        # 缺 id / 缺 api 的条目直接丢弃，不产生 warning（属于结构性冗余）
+        self.assertEqual([site["id"] for site in vod["sites"]], ["vs_aaaaaaaa:a1"])
+        self.assertEqual(vod["sites"][0]["ext"], "token-a1")
+
     def test_vod_defaults_and_old_document_compat(self):
         sections, warnings = normalize_sections({})
         vod = sections["vod"]

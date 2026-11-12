@@ -761,14 +761,26 @@ function renderVodLibrary() {
   const sites = arr(doc.vod.sites);
   const countOf = (sourceId) => sites.filter((site) => site.sourceId === sourceId).length;
 
-  const sourceRows = sources.map((src) =>
-    '<tr>'
-    + '<td><strong>' + esc(src.name || src.id) + '</strong></td>'
-    + '<td><code title="' + esc(src.url || '') + '">' + esc(src.url || '—') + '</code></td>'
-    + '<td>' + countOf(src.id) + '</td>'
-    + '<td><span class="meta">' + esc(formatWhen(src.addedAt)) + '</span></td>'
-    + '<td><button class="tiny danger" data-lib="delete-vod-source" data-id="' + esc(src.id)
-    + '">删除</button></td></tr>').join('');
+  const spiderCountOf = (sourceId) =>
+    sites.filter((site) => site.sourceId === sourceId
+      && String(site.api || '').startsWith('csp_')).length;
+  const sourceRows = sources.map((src) => {
+    const needJar = spiderCountOf(src.id);
+    return '<tr>'
+      + '<td><strong>' + esc(src.name || src.id) + '</strong>'
+      + (needJar && !src.jar
+        ? '<br><span class="badge off">缺 jar</span>'
+        : '') + '</td>'
+      + '<td><code title="' + esc(src.url || '') + '">' + esc(src.url || '—') + '</code></td>'
+      + '<td><input class="lib-input" data-lib-input="vod-source-jar" data-id="' + esc(src.id)
+      + '" value="' + esc(src.jar || '') + '" placeholder="spider.jar 地址'
+      + (needJar ? '（必填）' : '（可留空）') + '"></td>'
+      + '<td>' + countOf(src.id) + (needJar ? '<br><span class="meta">' + needJar
+        + ' 个 csp_</span>' : '') + '</td>'
+      + '<td><span class="meta">' + esc(formatWhen(src.addedAt)) + '</span></td>'
+      + '<td><button class="tiny danger" data-lib="delete-vod-source" data-id="' + esc(src.id)
+      + '">删除</button></td></tr>';
+  }).join('');
 
   const groups = sources.map((src) => {
     const own = sites.filter((site) => site.sourceId === src.id);
@@ -777,6 +789,8 @@ function renderVodLibrary() {
       '<div class="lib-site-row"><code>' + esc(site.key) + '</code>'
       + '<span class="lib-site-name">' + esc(site.name || site.key) + '</span>'
       + '<code class="lib-site-api" title="' + esc(site.api || '') + '">' + esc(site.api || '') + '</code>'
+      + '<input class="lib-input" data-lib-input="site-ext" data-id="' + esc(site.id)
+      + '" value="' + esc(site.ext || '') + '" placeholder="ext（多数留空）">'
       + '<input class="lib-input" data-lib-input="site-note" data-id="' + esc(site.id)
       + '" value="' + esc(site.note || '') + '" placeholder="备注"></div>').join('');
     return '<div class="lib-source-block">'
@@ -797,13 +811,17 @@ function renderVodLibrary() {
     + '</div>'
     + '<p class="hint">从配置里取 <code>sites</code>，映射成库站点；'
     + '<code>api</code> 不是 http(s):// 或 csp_ 开头、<code>key</code> 缺失或重复的站点会被跳过并统计。'
-    + '同时兼容顶层数组，以及 <code>urls</code> 里指向多份子配置的写法（最多取 5 个子配置）。</p>'
+    + '同时兼容顶层数组，以及 <code>urls</code> 里指向多份子配置的写法（最多取 5 个子配置）。'
+    + '<br>配置顶层的 <code>spider</code> 会自动记成该源的 <b>spider jar</b>；'
+    + '站点的 <code>ext</code> 也会一并保存。'
+    + '<b>api 以 csp_ 开头的站点必须有 jar 才能播</b>，缺了会在列表里标红。</p>'
     + (state.tvboxSummary ? '<p class="hint">' + esc(state.tvboxSummary) + '</p>' : '')
 
     + '<h3>源列表（' + sources.length + '）</h3>'
     + (sources.length
-      ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>URL</th><th>站点数</th>'
-        + '<th>添加时间</th><th></th></tr></thead><tbody>' + sourceRows + '</tbody></table>'
+      ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>配置 URL</th>'
+        + '<th>spider jar</th><th>站点数</th><th>添加时间</th><th></th></tr></thead>'
+        + '<tbody>' + sourceRows + '</tbody></table>'
       : '<p class="muted">还没有 TVBox 源，先在上面添加。</p>')
 
     + '<h3>站点（' + sites.length + '）</h3>'
@@ -1337,7 +1355,7 @@ function collectTvboxConfigs(json) {
     if (!node) return;
     if (Array.isArray(node)) {
       if (node.some((item) => isObj(item) && typeof item.api === 'string')) {
-        configs.push({ name: '', sites: node, urls: [] });
+        configs.push({ name: '', spider: '', sites: node, urls: [] });
         return;
       }
       for (const item of node) walk(item);
@@ -1346,6 +1364,9 @@ function collectTvboxConfigs(json) {
     if (!isObj(node)) return;
     configs.push({
       name: typeof node.name === 'string' ? node.name : '',
+      // 顶层 spider 就是 csp_ 站点要用的爬虫 jar。它决定了这台设备能不能
+      // 加载 type 3 的站点，必须跟着源一起存进库。
+      spider: typeof node.spider === 'string' ? node.spider.trim() : '',
       sites: arr(node.sites),
       urls: arr(node.urls).filter((item) => typeof item === 'string' && /^https?:\/\//i.test(item)),
     });
@@ -1388,6 +1409,11 @@ function tvboxSitesFrom(list, sourceId, seen, seenIds) {
       key: key.slice(0, 64),
       name: (String(raw.name == null ? key : raw.name).trim() || key).slice(0, 64),
       api: api.slice(0, 1000),
+      // ext 是 spider 初始化时原样透传的参数（token、接口地址等）。
+      // 少数配置写成对象，统一序列化成字符串，终端直接收字符串。
+      ext: raw.ext == null
+        ? ''
+        : (typeof raw.ext === 'string' ? raw.ext.trim() : JSON.stringify(raw.ext)).slice(0, 1000),
       type: String(raw.type == null ? '' : raw.type).trim().slice(0, 16),
       searchable: raw.searchable == null ? true : !!raw.searchable,
       quickSearch: !!raw.quickSearch,
@@ -1414,11 +1440,13 @@ async function addVodSource() {
     const seen = new Set();
     const seenIds = new Set();
     const names = [];
+    let spiderJar = '';
     let sites = [];
     let skipped = 0;
     const configs = collectTvboxConfigs(json);
     for (const cfg of configs) {
       if (cfg.name) names.push(cfg.name);
+      if (!spiderJar && cfg.spider && /^https?:\/\//i.test(cfg.spider)) spiderJar = cfg.spider;
       const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
       sites = sites.concat(part.sites);
       skipped += part.skipped;
@@ -1432,6 +1460,7 @@ async function addVodSource() {
         const subJson = JSON.parse(await fetchRemoteText(sub));
         for (const cfg of collectTvboxConfigs(subJson)) {
           if (cfg.name) names.push(cfg.name);
+          if (!spiderJar && cfg.spider && /^https?:\/\//i.test(cfg.spider)) spiderJar = cfg.spider;
           const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
           sites = sites.concat(part.sites);
           skipped += part.skipped;
@@ -1461,7 +1490,8 @@ async function addVodSource() {
     if (sites.length > room) { dropped = sites.length - room; sites = sites.slice(0, room); }
     const name = (names[0] || sourceNameFromUrl(url)).slice(0, 64);
     state.library.vod.sources.push({
-      id: sourceId, name, url, siteCount: sites.length, addedAt: nowIso(), note: '',
+      id: sourceId, name, url, jar: spiderJar,
+      siteCount: sites.length, addedAt: nowIso(), note: '',
     });
     state.library.vod.sites.push(...sites);
     state.tvboxSummary = '已导入「' + name + '」：' + sites.length + ' 个站点'
@@ -1583,6 +1613,16 @@ function onLibraryInput(target) {
   if (kind === 'site-note') {
     const site = arr(state.library.vod.sites).find((item) => item.id === id);
     if (site) { site.note = target.value.slice(0, 200); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'site-ext') {
+    const site = arr(state.library.vod.sites).find((item) => item.id === id);
+    if (site) { site.ext = target.value.slice(0, 1000); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'vod-source-jar') {
+    const src = arr(state.library.vod.sources).find((item) => item.id === id);
+    if (src) { src.jar = target.value.trim().slice(0, 1000); markLibraryDirty(); }
   }
 }
 
@@ -1898,6 +1938,14 @@ function sectionsForSave() {
     iptv.packages = arr(iptv.packages).filter((pkg) => !refIds.has(pkg.id));
     iptv.channels = [];
     iptv.groups = [];
+  }
+  // vod 同理：引用库时 sources/sites 是 GET 的展开产物，写回去等于把一份
+  // 快照固化成人工配置，库一改就和文档里的副本对不上。
+  // 只有锁定（lockLibrary）才保留，因为那时它确实是「不跟随库」的快照。
+  const vod = sections.vod;
+  if (isObj(vod) && vod.lockLibrary !== true && arr(vod.sourceIds).length) {
+    vod.sources = [];
+    vod.sites = [];
   }
   return sections;
 }
