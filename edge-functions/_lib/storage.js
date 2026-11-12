@@ -9,6 +9,7 @@
  *   device_<id>_snapshot_000000NN     该设备的快照
  *   device_<id>_revisions             该设备的快照索引
  *   devices_index                     设备注册表（别名 / 上线时间 / 版本 / revision）
+ *   library_current                   全局资源库（IPTV 源/套餐 + TVBox 源/站点）
  *
  * 「每设备完整独立」语义：不带 deviceId 的请求读写全局模板；带 deviceId 的请求读写
  * 该设备自己的完整文档。设备首次上线时自动以当前全局模板深拷贝一份（revision 0），
@@ -22,12 +23,16 @@
  *
  * 可通过 CONFIG_STORAGE=kv|blob 强制指定后端（默认 auto：有 KV 用 KV）。
  */
-import { buildDocument, ConfigError, nowIso, seedDocument } from './contract.js';
+import {
+  buildDocument, ConfigError, emptyLibrary, LIBRARY_SCHEMA_VERSION, nowIso, seedDocument,
+} from './contract.js';
 
 const KEY_CURRENT = 'config_current';
 const KEY_INDEX = 'config_revisions';
 const KEY_SNAPSHOT = (revision) => `config_snapshot_${String(revision).padStart(8, '0')}`;
 const KEY_DEVICES = 'devices_index';
+/** 全局资源库（IPTV 源/套餐 + TVBox 源/站点），与任何设备文档解耦。 */
+const KEY_LIBRARY = 'library_current';
 const MAX_HISTORY = 100;
 const MAX_DEVICES = 200;
 const DEFAULT_BLOB_NAMESPACE = 'pu_tv_cloud';
@@ -191,7 +196,16 @@ export async function read(env, deviceId = null) {
   return document;
 }
 
-export async function write(env, sections, expectedRevision, deviceId = null) {
+/**
+ * 写入新 revision。
+ *
+ * options.snapshot === false 用于「非人工编辑」的追平写入（例如库变更后设备懒触发
+ * 追平 libraryRevision）：只推进 current 里的 revision，不写快照也不动索引。
+ * 否则库每改一次、每台设备心跳一次就各留一条历史，几天就能把真正的人工编辑
+ * 快照（MAX_HISTORY=100）挤掉，回滚功能等于失效。
+ * 这种情况下的 revision 没有快照，回滚它会得到「找不到快照」的 400。
+ */
+export async function write(env, sections, expectedRevision, deviceId = null, options = {}) {
   const db = await backend(env);
   const keys = scopeKeys(deviceId);
   let current = await db.getJSON(keys.current);
@@ -208,17 +222,22 @@ export async function write(env, sections, expectedRevision, deviceId = null) {
 
   const document = buildDocument(sections, expectedRevision + 1, nowIso());
   const payload = JSON.stringify(document);
-  // 先写不可变快照，再切换 current，避免 current 指向不存在的历史。
-  await db.put(keys.snapshot(document.revision), payload);
+  const withSnapshot = options.snapshot !== false;
+  if (withSnapshot) {
+    // 先写不可变快照，再切换 current，避免 current 指向不存在的历史。
+    await db.put(keys.snapshot(document.revision), payload);
+  }
   await db.put(keys.current, payload);
 
-  const index = (await db.getJSON(keys.index)) || [];
-  index.unshift({
-    revision: document.revision,
-    updatedAt: document.updatedAt,
-    size: new TextEncoder().encode(payload).length,
-  });
-  await db.put(keys.index, JSON.stringify(index.slice(0, MAX_HISTORY)));
+  if (withSnapshot) {
+    const index = (await db.getJSON(keys.index)) || [];
+    index.unshift({
+      revision: document.revision,
+      updatedAt: document.updatedAt,
+      size: new TextEncoder().encode(payload).length,
+    });
+    await db.put(keys.index, JSON.stringify(index.slice(0, MAX_HISTORY)));
+  }
 
   if (deviceId) {
     const devices = (await db.getJSON(KEY_DEVICES)) || [];
@@ -249,6 +268,64 @@ export async function rollback(env, revision, deviceId = null) {
   if (!snapshot) throw new ConfigError(`找不到 revision ${revision} 的快照`);
   const current = await read(env, deviceId);
   return write(env, snapshot.sections, current.revision, deviceId);
+}
+
+/* ---------------- 全局资源库 ---------------- */
+
+/** 读资源库；从未写过时返回默认空库（revision 0），调用方无需判空。 */
+export async function readLibrary(env) {
+  const db = await backend(env);
+  const value = await db.getJSON(KEY_LIBRARY);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return emptyLibrary();
+  return value;
+}
+
+/**
+ * 写资源库：与配置文档同样的 If-Match 乐观锁语义（expectedRevision 不符抛 Conflict）。
+ * 库不保留快照历史：它只是「共享字典」，设备文档里才是真正下发的配置。
+ */
+export async function writeLibrary(env, library, expectedRevision) {
+  const db = await backend(env);
+  const current = (await db.getJSON(KEY_LIBRARY)) || emptyLibrary();
+  if (current.revision !== expectedRevision) throw new Conflict(current);
+  const next = {
+    ...library,
+    schemaVersion: LIBRARY_SCHEMA_VERSION,
+    revision: expectedRevision + 1,
+    updatedAt: nowIso(),
+  };
+  await db.put(KEY_LIBRARY, JSON.stringify(next));
+  return next;
+}
+
+/**
+ * 统计「引用了这些库 id 且未锁定」的设备台数。
+ * 只读不写：写库不应该顺带改设备文档，真正的生效发生在设备下次 GET。
+ */
+export async function countAffectedDevices(env, refs = {}) {
+  const packageIds = new Set(refs.packageIds || []);
+  const sourceIds = new Set(refs.sourceIds || []);
+  const siteIds = new Set(refs.siteIds || []);
+  if (!packageIds.size && !sourceIds.size && !siteIds.size) return 0;
+
+  const db = await backend(env);
+  const devices = (await db.getJSON(KEY_DEVICES)) || [];
+  const hits = await Promise.all(devices.map(async (entry) => {
+    if (!entry || !entry.id) return false;
+    const document = await db.getJSON(scopeKeys(entry.id).current);
+    const sections = document && document.sections;
+    if (!sections) return false;
+    const iptv = sections.iptv || {};
+    const vod = sections.vod || {};
+    const iptvHit = iptv.lockLibrary !== true
+      && Array.isArray(iptv.packageIds)
+      && iptv.packageIds.some((id) => packageIds.has(id));
+    const vodHit = vod.lockLibrary !== true
+      && ((Array.isArray(vod.sourceIds) && vod.sourceIds.some((id) => sourceIds.has(id)))
+        || (Array.isArray(vod.siteIds) && vod.siteIds.some((id) => siteIds.has(id))));
+    return iptvHit || vodHit;
+  }));
+  return hits.filter(Boolean).length;
 }
 
 /* ---------------- 设备注册表 ---------------- */

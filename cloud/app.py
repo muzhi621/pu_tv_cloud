@@ -11,9 +11,14 @@
   GET  /api/config/revisions     历史快照列表
   POST /api/config/rollback      回滚到指定快照（生成新 revision）
   GET  /  /app.js  /style.css    在线编辑器静态资源
+
+全局资源库（GET/PUT /api/library）**仅 EdgeOne 版提供**：FC 版是「单份全局文档」
+模型，没有 per-device 文档，也没有独立库键位；这里显式返回 404，编辑器会按
+「服务端未升级」降级（资源库页签提示先升级云端），不影响配置下发。
 """
 from __future__ import annotations
 
+import copy
 import gzip
 import hmac
 import json
@@ -28,6 +33,7 @@ from .schema import (
     CATALOG,
     SCHEMA_VERSION,
     ConfigError,
+    ensure_section_defaults,
     etag_for,
     expand_iptv_channels,
     normalize_sections,
@@ -63,6 +69,20 @@ _STATUS_TEXT = {
 
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _fc_library_warnings(sections: dict) -> list[str]:
+    """FC 版没有资源库：写入了库引用时明确提示，避免终端拿到空频道却无人察觉。"""
+    notes: list[str] = []
+    iptv = sections.get("iptv") or {}
+    vod = sections.get("vod") or {}
+    if iptv.get("packageIds"):
+        notes.append("iptv.packageIds: 阿里云 FC 版没有全局资源库，套餐引用不会展开；"
+                     "需要资源库请部署 EdgeOne 版")
+    if vod.get("sourceIds") or vod.get("siteIds"):
+        notes.append("vod.sourceIds/siteIds: 阿里云 FC 版没有全局资源库，这些引用会被"
+                     "终端忽略；需要 TVBox 资源库请部署 EdgeOne 版")
+    return notes
 
 
 def create_app(env: dict[str, str] | None = None, storage: Storage | None = None) -> Callable:
@@ -213,6 +233,12 @@ def create_app(env: dict[str, str] | None = None, storage: Storage | None = None
                 "rolledBackFrom": revision,
             }), environ=environ, headers=_headers_for_document(document))
 
+        if path == "/api/library":
+            # FC 版没有 library_current 与 per-device 文档，资源库语义无法落地；
+            # 返回 404 让编辑器走「服务端未升级」降级路径（不谎报空库）。
+            raise HttpError(404, "not_supported",
+                            "阿里云 FC 版暂未提供全局资源库接口，请部署 EdgeOne 版")
+
         if path != "/api/config":
             raise HttpError(404, "not_found", "未知接口: %s" % path)
 
@@ -228,8 +254,11 @@ def create_app(env: dict[str, str] | None = None, storage: Storage | None = None
                              headers=_headers_for_document(document), compress=False)
             # 与 Edge Functions 版一致：选中套餐时把频道展开成终端认识的 channels；
             # 终端不带 withPackages=1 时只返回套餐元数据，避免心跳重复传几百 KB。
+            # FC 版没有全局资源库，expand 不传 library，走旧逻辑（selectedPackageIds
+            # + 内联 packages），packageIds 引用在 FC 上无法展开（见 README 限制说明）。
             view = dict(document)
-            sections_view = expand_iptv_channels(document["sections"])
+            sections_view = ensure_section_defaults(copy.deepcopy(document["sections"]))
+            sections_view = expand_iptv_channels(sections_view)
             iptv = sections_view.get("iptv") or {}
             packages = iptv.get("packages")
             if isinstance(packages, list) and query.get("withPackages", [""])[0] != "1":
@@ -258,6 +287,7 @@ def create_app(env: dict[str, str] | None = None, storage: Storage | None = None
             if not if_match or not if_match.isdigit():
                 raise ConfigError("缺少 If-Match（或 expectedRevision），拒绝覆盖未知版本")
             sections, warnings = normalize_sections(sections_raw)
+            warnings = warnings + _fc_library_warnings(sections)
             document = store.write(sections, int(if_match))
             response: dict[str, Any] = {
                 "revision": document["revision"],

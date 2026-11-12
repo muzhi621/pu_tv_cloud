@@ -17,7 +17,7 @@
 > **仓库状态**：已按用户审核同意后提交到 GitHub，默认分支 `main`。
 > 云端库 → `https://github.com/muzhi621/pu_tv_cloud`，
 > 终端库 → `https://github.com/muzhi621/pu_tv_client`。
-> 本库 CI 在 push / PR 时运行 58 个 Python 单元测试、51 项 EdgeOne 接口冒烟、
+> 本库 CI 在 push / PR 时运行 86 个 Python 单元测试、75 项 EdgeOne 接口冒烟、
 > 内联资源一致性检查与语法检查（`.github/workflows/ci.yml`）。
 
 ## 目录
@@ -33,24 +33,27 @@ edge-functions/         ★ Edge Functions（ES2023+，唯一运行时依赖 @ed
   index.js              GET / 内联编辑器单页 + 从环境变量注入连接信息
   health.js             GET /health（含存储后端与 degraded 状态）
   api/config/           GET/PUT config、catalog、revisions、rollback（均支持 deviceId 隔离）
+  api/library/          GET/PUT 全局资源库（IPTV 源/套餐 + TVBox 源/站点，独立于设备文档）
   api/devices/          GET 注册表（在线/离线）；POST 改名 / 重置 / 软删 / 恢复 /
                         彻底删除并拉黑 / 解绑 / 显式下发，支持 deviceIds 批量
   api/iptv/fetch.js     POST 云端代抓订阅（SSRF 防护、UTF-8/GBK 自动识别）
-  _lib/                 contract.js（五节契约 + 套餐展开 + GET 轻量视图）/ storage.js
-                        （KV/Blob 双后端 + 全局模板 + 每设备独立文档 + 注册表 +
-                         在线状态 / 拉黑 / 乐观锁）/ http.js
+  _lib/                 contract.js（六节契约 + 套餐/库展开 + GET 轻量视图）/ storage.js
+                        （KV/Blob 双后端 + 全局模板 + 每设备独立文档 + 全局资源库 +
+                         注册表 + 在线状态 / 拉黑 / 乐观锁）/ http.js
                         + data.js、editor.js（由构建脚本生成，勿手改）
 edgeone.json            ★ 项目配置：无构建、npm install 装 Blob SDK、输出目录 public
 public/robots.txt       让静态输出目录非空（不放 index.html，避免覆盖函数首页）
 package.json            声明 ESM 与 @edgeone/pages-blob 依赖（Blob 兜底用）
 config/
   seed.json             内置兜底配置（五节全部 managed:false）—— 两个实现共用
+                        （缺少的 vod 节与资源库字段由运行时补默认值）
   site_catalog.json     35 个站点 id（含中文名、退役标记）+ 8 个导航 id（含 iptv）
 editor/                 在线配置编辑器源文件（零依赖静态页）
-  index.html / app.js / style.css —— 6 个页签 + 套餐管理 + 在线状态 + 单终端全设置
-                        面板 + 显式「配置下发」按钮
-tests/                  58 个 Python 单元测试 + test_edgeone.mjs（Node 51 项冒烟，含
-                        Blob 回退、驼峰 id、每设备隔离、套餐展开、SSRF、在线状态）
+  index.html / app.js / style.css —— 8 个页签（直播平台 / 导航栏 / 启动弹窗 / 在线更新 /
+                        IPTV 源 / TVBox 源 / IPTV 下发 / 终端管理）+ 在线状态 +
+                        单终端全设置面板 + 显式「配置下发」按钮
+tests/                  86 个 Python 单元测试 + test_edgeone.mjs（Node 75 项冒烟，含
+                        Blob 回退、驼峰 id、每设备隔离、套餐展开、资源库、SSRF、在线状态）
 docs/
   API.md                接口说明（两种实现共用同一契约）
   DEPLOY_GITHUB.md      ★ GitHub 直连部署方案（控制台逐项、验证、维护、排错）
@@ -71,8 +74,8 @@ requirements.txt        仅 OSS 后端需要 oss2
 
 ```bash
 cd G:/workbuddy/puretv/pure_live_tv_cloud
-python3 -m unittest discover -s tests -v     # 58 个 Python 测试（FC/自建服务器实现）
-node --test tests/test_edgeone.mjs            # 51 项 EdgeOne 冒烟（内存 KV/Blob，无需部署）
+python3 -m unittest discover -s tests -v     # 86 个 Python 测试（FC/自建服务器实现）
+node --test tests/test_edgeone.mjs            # 75 项 EdgeOne 冒烟（内存 KV/Blob，无需部署）
 python scripts/build_edgeone_assets.py --check  # 校验内联资源与源文件一致
 sh scripts/run_local.sh                       # Python 版，默认 http://127.0.0.1:8080/
 ```
@@ -108,7 +111,7 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
 域名，两个令牌由 Edge Function 从 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` 注入，
 **不写进公开仓库**。设 `CONFIG_EDITOR_PRELOAD=0` 可恢复手动填写；注意能访问该页面的人
 可在源码里看到写令牌，请勿公开传播编辑器域名。右上「配置对象」下拉可选**全局模板**或
-**任意已上线终端**；首次访问自动写入 `seed.json` 的副本（revision 0，五节全部
+**任意已上线终端**；首次访问自动写入 `seed.json` 的副本（revision 0，六节全部
 `managed:false`）。**生产环境务必配置两个 Token**；都为空时服务处于开发模式，接口不鉴权。
 
 **存储后端自动选择**：检测到 KV 绑定就用 KV，否则用 Blob（强一致读）。可用
@@ -127,10 +130,12 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 **OSS + oss2 用于生产**（WebIDE 执行 `pip3 install -r requirements.txt -t .`）、
 **NAS 挂载 + file 可零依赖持久化**。当前 `OSSStorage` 只支持 AK/SK 明文凭证，
 不支持函数 RAM 角色。FC 与 OSS/NAS 会持续产生按量费用，详见 [docs/DEPLOY_FC.md](docs/DEPLOY_FC.md)。
+FC 版**没有**全局资源库（`/api/library` 返回 404 `not_supported`）与设备维度：
+`sections` 兼容 `vod` / `packageIds` 等新字段，但库引用不会被展开。
 
 ## 配置契约（v1）
 
-单文档 `{schemaVersion, revision, updatedAt, sections}`，五个节各自带 `managed`：
+单文档 `{schemaVersion, revision, updatedAt, sections}`，六个节各自带 `managed`：
 
 | 节 | 接管内容 | 对应需求 |
 |---|---|---|
@@ -138,7 +143,8 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 | `navigation` | `railMenuIds` 二级菜单白名单与顺序、`groups`（IPTV / 影音 / 直播 / 设置四个一级块及其 children）、`defaultGroupId`（默认 `iptv`）、`sidebarExpanded`、`homeKeepAlive` | FR-05 / FR-08 |
 | `startup` | 协议 `requiredVersion`、开机公告、`exitDialog`（退出 App 弹窗：开关 / 频率 / 可取消 / 捐赠码 / 文案）、`showSplashPage` | FR-06 |
 | `update` | 自动检查、间隔、提示策略、最低版本、镜像列表、更新日志 | FR-07 |
-| `iptv` | `managed` + `sources` / `groups` / `epgUrl` / **套餐库 `packages`** / **每台设备勾选的 `selectedPackageIds`** / `channels`（选中套餐时由服务端展开，最多 3000 条） | 新增 |
+| `iptv` | `managed` + `sources` / `groups` / `epgUrl` / **套餐库 `packages`** / **每台设备勾选的 `selectedPackageIds`** / **库引用 `packageIds`** / **锁定开关 `lockLibrary`** / **`libraryRevision`（服务端维护）** / `channels`（展开后最多 3000 条） | 新增 |
+| `vod` | **TVBox 源/站点引用**：`sourceIds`（≤20）、`siteIds`（≤500）、`lockLibrary`、`libraryRevision`；设备只存引用，站点清单在全局资源库 | 新增 |
 
 服务端兜底规则：未知 / 退役 id 静默过滤；白名单过滤后为空则回退内置全量（防止终端
 `global_room_push.dart:79` 的 `.first` 崩溃）；未知节忽略并记 warning；类型错误返回 400；
@@ -146,6 +152,9 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 套餐库合计 5000 条、最多 12 个套餐、总文档上限 900 KB；`update.prompt=force`
 与不可关闭公告/不可取消退出弹窗会输出风险 warning。字段字典见需求文档 4.3。
 
+**全局资源库**（`library_current`，仅 EdgeOne）另有独立上限：IPTV 源 ≤30、套餐 ≤12、
+所有套餐频道合计 ≤5000、TVBox 源 ≤20、站点 ≤500（单源 ≤200）、整库 JSON ≤900 KB；
+库内 id 非法**直接 400**（id 是引用目标，静默失效比报错更难查），内容问题记 warning。
 ## 每设备独立配置与设备注册表
 
 终端首次启动自动生成 UUID v4 并持久化，之后每次 `GET /api/config` 都带
@@ -162,18 +171,46 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 编辑器「终端管理」页可逐台改名、编辑配置、重置为模板、移除；「配置对象」下拉切换后，
 所有 GET / PUT / revisions / rollback 都会自动带上 `?deviceId=...`。
 **注意：改全局模板不会影响已上线的设备**，要批量生效需逐台重置。
+资源库是例外：库改了，**未锁定**且引用了库的设备下次拉取自动生效（见下一节）。
 
 ## IPTV 源下发
 
 编辑器「IPTV 源」页支持三种输入：**网络 URL**、**本地文件（m3u/m3u8/txt）**、**直接粘贴文本**；
 在浏览器内解析 M3U / M3U Plus / TXT `分组,#genre#` 格式（含 `group-title`、`tvg-logo`、
-多线路同名合并），解析结果连同站点/导航等五节一起保存。
+多线路同名合并），解析结果连同站点/导航等六节一起保存（频道优先存进全局资源库的
+套餐，设备只勾选 `packageIds`）。
 
 云端**只存解析后的频道列表，不抓取订阅、不转发直播流**：网络 URL 也是浏览器直接 fetch，
 流量不经过 Edge Functions。终端拉取配置后把 `iptv.channels` 按分组还原成 TXT，
 复用 `IptvImportManager` 写入本地 Drift（固定 provider `cloud_iptv`），
 用 `deviceId:revision:频道数` 做导入幂等；`managed:false` 或频道为空时不动本地列表。
 接口细节见 [docs/API.md](docs/API.md)。
+
+## 全局资源库与设备解耦（仅 EdgeOne）
+
+库键 `library_current`，模型与接口见 [docs/API.md](docs/API.md) 的「全局资源库」章节：
+
+```
+iptv.sources[{id:'s_xxxxxxxx', name, url, type, channelCount, addedAt, note}]
+iptv.packages[{id:'pkg_xxxxxxxx', name, sources:[sourceId], channels:[{name,url,group,logo}]}]
+vod.sources[{id:'vs_xxxxxxxx', name, url, siteCount, addedAt, note}]
+vod.sites[{id:'<sourceId>:<key>', sourceId, key, name, api, type, searchable, quickSearch, note}]
+```
+
+- **一台设备都没连也能先建库**：源、套餐、TVBox 站点都存在库里，编辑器「IPTV 源」
+  「TVBox 源」页签可先导入、组包、预览；设备文档只写 id 引用（`iptv.packageIds` /
+  `vod.sourceIds` / `vod.siteIds`），不再重复存几百 KB 频道。
+- **改库即批量生效**：`GET /api/config?deviceId=X` 发现设备 `libraryRevision` 落后就
+  先追平 revision，**再做 304 判定**（否则旧 `since` 会命中 304，终端永远拿不到新频道）。
+  追平只改 revision 标记，不落盘展开后的频道，也不写快照（保护人工编辑历史）。
+- **锁定**：设备 `lockLibrary=true` 时完全忽略库，只用设备内联内容。PUT 时若
+  `lockLibrary=true`、`channels` 为空且 `packageIds` 非空，服务端会用库展开一次写进
+  `channels` / `groups`，让这台设备离线也自包含。锁定设备不计入「预计影响台数」。
+- **TVBox 本期只存不播**：库只负责维护站点清单与设备引用，终端侧播放链路未接，
+  下发内容终端会忽略（待真机验证）。
+- **FC 版不支持**：`cloud/app.py` 只有单份全局文档，没有 `library_current` 也没有
+  per-device 文档，`GET/PUT /api/library` 返回 `404 not_supported`，编辑器按
+  「服务端未升级」降级；`sections` 仍兼容 `vod` 与 `packageIds`，但引用不会被展开。
 
 ## 与需求文档的实现偏差（需知悉）
 
@@ -194,7 +231,8 @@ FC 侧注意：**file 裸跑仅供验证**（无状态、重启回 seed）、
 
 ## 安全
 
-- `PUT` / `rollback` / `POST /api/devices` 需要写 Token，其余 `GET /api/*` 需要读 Token；
+- `PUT` / `rollback` / `PUT /api/library` / `POST /api/devices` 需要写 Token，其余
+  `GET /api/*` 需要读 Token；
   Token 比较用常数时间算法；编辑器分别填「访问令牌（读）」「保存令牌（写）」。
 - `PUT` 必须携带 `If-Match`（或 `expectedRevision`），缺版本拒绝覆盖，冲突返回 409；
   每个设备的 revision 独立，改 A 设备不会让 B 设备的编辑失效。

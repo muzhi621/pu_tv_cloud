@@ -13,7 +13,7 @@ import { SEED, CATALOG, SCHEMA_VERSION } from './data.js';
 export { SCHEMA_VERSION };
 export { CATALOG };
 
-export const SECTION_KEYS = ['sites', 'navigation', 'startup', 'update', 'iptv'];
+export const SECTION_KEYS = ['sites', 'navigation', 'startup', 'update', 'iptv', 'vod'];
 const MAX_TEXT_LEN = 20000;
 const MAX_LIST_ITEMS = 200;
 /** 单份配置文档必须能塞进 Edge Functions 的请求体上限，频道列表要设硬上限。 */
@@ -26,6 +26,25 @@ const PACKAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const VERSION_RE = /^\d+(?:\.\d+){0,3}$/;
 const URL_RE = /^https?:\/\/[^\s]+$/i;
 const IPTV_URL_RE = /^(https?|rtmp|rtsp|udp|mms|p2p):\/\/[^\s]+$/i;
+
+/* ---------------- 全局资源库（与设备文档解耦） ----------------
+ * 库独立存在 library_current，设备只保存 id 引用：
+ *   iptv.packageIds → library.iptv.packages[].id
+ *   vod.sourceIds / vod.siteIds → library.vod.sources[].id / sites[].id
+ * 这样改库即可对「未锁定」的设备批量生效，设备文档也不会重复存几百 KB 频道。
+ */
+export const LIBRARY_SCHEMA_VERSION = 1;
+export const MAX_LIBRARY_SOURCES = 30;
+export const MAX_VOD_SOURCES = 20;
+export const MAX_VOD_SITES = 500;
+export const MAX_VOD_SITES_PER_SOURCE = 200;
+export const MAX_LIBRARY_BYTES = MAX_DOCUMENT_BYTES;
+/** 库内 id 由编辑器生成，格式固定，便于设备侧引用时做正则校验。 */
+const LIB_SOURCE_ID_RE = /^s_[0-9a-f]{8}$/;
+const LIB_PACKAGE_ID_RE = /^pkg_[0-9a-f]{8}$/;
+const LIB_VOD_SOURCE_ID_RE = /^vs_[0-9a-f]{8}$/;
+/** TVBox 站点 id = `${sourceId}:${key}`，会作为设备 vod.siteIds 的引用值。 */
+const VOD_SITE_ID_RE = /^[A-Za-z0-9_:-]{1,96}$/;
 
 const VALID_SITE_IDS = CATALOG.sites.filter((item) => !item.retired).map((item) => item.id);
 const RETIRED_SITE_IDS = new Set(CATALOG.sites.filter((item) => item.retired).map((item) => item.id));
@@ -64,7 +83,42 @@ export function nowIso() {
 }
 
 export function seedDocument() {
-  return clone(SEED);
+  const document = clone(SEED);
+  ensureSectionDefaults(document.sections);
+  return document;
+}
+
+/** vod（TVBox 源/站点）节默认值：老文档没有这一节，读出时按此补齐。 */
+export const DEFAULT_VOD = {
+  managed: false,
+  sourceIds: [],
+  siteIds: [],
+  lockLibrary: false,
+  libraryRevision: 0,
+};
+
+export function ensureVodSection(sections) {
+  if (!sections || typeof sections !== 'object') return sections;
+  if (!sections.vod || typeof sections.vod !== 'object' || Array.isArray(sections.vod)) {
+    sections.vod = clone(DEFAULT_VOD);
+  }
+  return sections;
+}
+
+/**
+ * data.js 由脚本从 config/ 生成，暂不包含资源库相关字段；
+ * 这里在运行时补齐，保证老文档/新种子读出来结构一致，客户端不必判空。
+ */
+export function ensureSectionDefaults(sections) {
+  ensureVodSection(sections);
+  const iptv = sections && sections.iptv;
+  if (iptv && typeof iptv === 'object' && !Array.isArray(iptv)) {
+    if (!Array.isArray(iptv.packageIds)) iptv.packageIds = [];
+    if (!Array.isArray(iptv.selectedPackageIds)) iptv.selectedPackageIds = [];
+    if (typeof iptv.lockLibrary !== 'boolean') iptv.lockLibrary = false;
+    if (!Number.isInteger(iptv.libraryRevision) || iptv.libraryRevision < 0) iptv.libraryRevision = 0;
+  }
+  return sections;
 }
 
 export function etagFor(revision) {
@@ -105,6 +159,26 @@ function strList(value, field) {
   return value.map((item) => item.trim()).filter(Boolean);
 }
 
+/** 定长上限的字符串数组（设备侧 siteIds 需要 500 项，超出 strList 的 200 上限）。 */
+function stringArray(value, field, limit) {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) throw new ConfigError(`${field} 必须是字符串数组`);
+  if (value.some((item) => typeof item !== 'string')) {
+    throw new ConfigError(`${field} 必须是字符串数组`);
+  }
+  return value.map((item) => item.trim()).filter(Boolean).slice(0, limit);
+}
+
+/** 库内 id：前缀 + 8 位十六进制，由服务端在缺省时补发。 */
+function randomLibraryId(prefix, taken) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const hex = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0').slice(-8);
+    const id = `${prefix}${hex}`;
+    if (!taken || !taken.has(id)) return id;
+  }
+  return `${prefix}${(Date.now() % 0xffffffff).toString(16).padStart(8, '0').slice(-8)}`;
+}
+
 function i18n(value, field) {
   if (value === undefined || value === null) return {};
   if (typeof value !== 'object' || Array.isArray(value)) {
@@ -115,6 +189,18 @@ function i18n(value, field) {
     if (typeof text === 'string') result[key.trim().slice(0, 16)] = text.slice(0, MAX_TEXT_LEN);
   }
   return result;
+}
+
+/**
+ * TVBox 配置里的开关字段五花八门：0/1、true/false、"1"/""。
+ * 库是「导入别人的配置」，这里做宽松归一，避免一个布尔值让整库保存失败。
+ */
+function lenientInt(value, fallback, low, high) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  const num = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isFinite(num) || !Number.isInteger(num)) return fallback;
+  return Math.min(high, Math.max(low, num));
 }
 
 function enumeration(value, fallback, allowed, field) {
@@ -381,6 +467,8 @@ function normalizeChannelList(raw, field, warnings) {
  */
 function normalizeIptv(part, warnings) {
   const base = clone(SEED.sections.iptv);
+  if (!Array.isArray(base.selectedPackageIds)) base.selectedPackageIds = [];
+  if (!Array.isArray(base.packageIds)) base.packageIds = [];
   base.managed = bool(part.managed, false, 'iptv.managed');
 
   const epg = str(part.epgUrl, '', 'iptv.epgUrl', 500);
@@ -452,6 +540,32 @@ function normalizeIptv(part, warnings) {
     base.selectedPackageIds = picked;
   }
 
+  // v1.1：设备只存「全局资源库」里的套餐 id 引用，库改了所有未锁定设备自动跟着变。
+  const rawPackageIds = part.packageIds;
+  if (rawPackageIds !== undefined && rawPackageIds !== null) {
+    if (!Array.isArray(rawPackageIds) || rawPackageIds.some((id) => typeof id !== 'string')) {
+      throw new ConfigError('iptv.packageIds 必须是字符串数组');
+    }
+    const picked = [];
+    for (const raw of rawPackageIds) {
+      const id = String(raw).trim();
+      if (!id) continue;
+      if (!PACKAGE_ID_RE.test(id)) {
+        warnings.push(`iptv.packageIds: 忽略格式非法的套餐 id ${id}`);
+        continue;
+      }
+      if (picked.includes(id)) continue;
+      if (picked.length >= MAX_IPTV_PACKAGES) {
+        warnings.push(`iptv.packageIds: 超过 ${MAX_IPTV_PACKAGES} 个上限，已截断`);
+        break;
+      }
+      picked.push(id);
+    }
+    base.packageIds = picked;
+  }
+  base.lockLibrary = bool(part.lockLibrary, false, 'iptv.lockLibrary');
+  base.libraryRevision = int(part.libraryRevision, 0, 0, 1e9, 'iptv.libraryRevision');
+
   if (part.channels !== undefined && part.channels !== null) {
     base.channels = normalizeChannelList(part.channels, 'iptv.channels', warnings);
   }
@@ -460,14 +574,32 @@ function normalizeIptv(part, warnings) {
   return base;
 }
 
-/** 把选中套餐的频道按 id 顺序合并去重，写进 iptv.channels（供终端读取）。 */
-export function expandIptvChannels(sections) {
+/**
+ * 把套餐频道按 id 顺序合并去重，写进 iptv.channels（供终端读取）。
+ *
+ * 展开优先级（引用库后设备文档只存 id，不存频道）：
+ *   1. iptv.lockLibrary === true：完全忽略 library，只用设备内联内容（锁定快照）
+ *   2. packageIds 非空且库可用：按顺序取 library.iptv.packages 的频道
+ *   3. 否则回退旧的 selectedPackageIds + 内联 packages
+ * 最后并入设备内联 channels（第 3 种情况除外，旧行为保持字节级兼容）。
+ *
+ * library 参数可选：不传时行为与旧版本完全一致。
+ */
+export function expandIptvChannels(sections, library = null) {
   const iptv = sections && sections.iptv;
   if (!iptv) return sections;
-  const ids = Array.isArray(iptv.selectedPackageIds) ? iptv.selectedPackageIds : [];
+  const locked = iptv.lockLibrary === true;
+  const inlinePackages = Array.isArray(iptv.packages) ? iptv.packages : [];
+  const libPackages = (library && library.iptv && Array.isArray(library.iptv.packages))
+    ? library.iptv.packages : [];
+  const refIds = (!locked && Array.isArray(iptv.packageIds)) ? iptv.packageIds : [];
+  const useLibrary = refIds.length > 0
+    && libPackages.some((pkg) => refIds.includes(pkg.id));
+  const ids = useLibrary
+    ? refIds
+    : (Array.isArray(iptv.selectedPackageIds) ? iptv.selectedPackageIds : []);
   if (!ids.length) return sections;
-  const byId = new Map((Array.isArray(iptv.packages) ? iptv.packages : [])
-    .map((pkg) => [pkg.id, pkg]));
+  const byId = new Map((useLibrary ? libPackages : inlinePackages).map((pkg) => [pkg.id, pkg]));
   const seen = new Set();
   const channels = [];
   for (const id of ids) {
@@ -482,6 +614,17 @@ export function expandIptvChannels(sections) {
     }
     if (channels.length >= MAX_IPTV_CHANNELS) break;
   }
+  // 引用库时再并入设备自有的内联频道（库频道优先，URL 去重）。
+  if (useLibrary && Array.isArray(iptv.channels)) {
+    for (const channel of iptv.channels) {
+      if (!channel || typeof channel !== 'object') continue;
+      const key = String(channel.url || '').toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      channels.push(channel);
+      if (channels.length >= MAX_IPTV_CHANNELS) break;
+    }
+  }
   const out = clone(sections);
   out.iptv.channels = channels;
   out.iptv.groups = [...new Set(channels.map((c) => c.group).filter(Boolean))]
@@ -492,20 +635,90 @@ export function expandIptvChannels(sections) {
 /**
  * GET 视图：终端只拿展开后的 channels，不带套餐库里的全量频道（否则 15 分钟
  * 一次的心跳会重复传几百 KB）。编辑器带 ?withPackages=1 才拿完整套餐库。
+ *
+ * 设备引用了全局资源库时，轻量视图里的 packages 摘要同时覆盖「引用的库套餐」
+ * 与「设备内联套餐」，终端据此展示套餐名而无需额外请求库。
  */
-export function viewDocument(document, withPackages = false) {
+export function viewDocument(document, withPackages = false, library = null) {
   const out = clone(document);
   if (!out.sections || !out.sections.iptv) return out;
-  out.sections = expandIptvChannels(out.sections);
-  if (!withPackages && Array.isArray(out.sections.iptv.packages)) {
-    out.sections.iptv.packages = out.sections.iptv.packages.map((pkg) => ({
-      id: pkg.id,
-      name: pkg.name,
-      sources: pkg.sources || [],
-      channelCount: Array.isArray(pkg.channels) ? pkg.channels.length : 0,
-    }));
+  ensureSectionDefaults(out.sections);
+  out.sections = expandIptvChannels(out.sections, library);
+
+  const iptv = out.sections.iptv;
+  const inline = Array.isArray(iptv.packages) ? iptv.packages : [];
+  const inlineIds = new Set(inline.map((pkg) => pkg.id));
+  const refIds = iptv.lockLibrary === true ? [] : (Array.isArray(iptv.packageIds) ? iptv.packageIds : []);
+  const referenced = [];
+  const seenRef = new Set();
+  for (const id of refIds) {
+    if (seenRef.has(id) || inlineIds.has(id)) continue;
+    seenRef.add(id);
+    const pkg = ((library && library.iptv && library.iptv.packages) || [])
+      .find((item) => item.id === id);
+    if (pkg) referenced.push(pkg);
   }
+  if (withPackages) {
+    iptv.packages = [...inline, ...referenced];
+    return out;
+  }
+  const summarize = (pkg) => ({
+    id: pkg.id,
+    name: pkg.name,
+    sources: pkg.sources || [],
+    channelCount: Array.isArray(pkg.channels) ? pkg.channels.length : 0,
+  });
+  iptv.packages = [...inline.map(summarize), ...referenced.map(summarize)];
   return out;
+}
+
+/**
+ * vod 节（TVBox 源 / 站点）：与 iptv 解耦，设备只保存库里的 id 引用。
+ * 源与站点都由「全局资源库」维护，设备侧只表达「我用哪几个源/哪几个站点」。
+ */
+function normalizeVod(part, warnings) {
+  const base = clone(DEFAULT_VOD);
+  base.managed = bool(part.managed, false, 'vod.managed');
+
+  const rawSourceIds = stringArray(part.sourceIds, 'vod.sourceIds', MAX_VOD_SOURCES);
+  if (rawSourceIds !== undefined) {
+    if ((part.sourceIds || []).length > MAX_VOD_SOURCES) {
+      warnings.push(`vod.sourceIds: 超过 ${MAX_VOD_SOURCES} 个上限，已截断`);
+    }
+    const picked = [];
+    for (const raw of rawSourceIds) {
+      if (!LIB_VOD_SOURCE_ID_RE.test(raw)) {
+        warnings.push(`vod.sourceIds: 忽略格式非法的源 id ${raw}`);
+        continue;
+      }
+      if (!picked.includes(raw)) picked.push(raw);
+    }
+    base.sourceIds = picked.slice(0, MAX_VOD_SOURCES);
+  }
+
+  const rawSiteIds = stringArray(part.siteIds, 'vod.siteIds', MAX_VOD_SITES);
+  if (rawSiteIds !== undefined) {
+    if ((part.siteIds || []).length > MAX_VOD_SITES) {
+      warnings.push(`vod.siteIds: 超过 ${MAX_VOD_SITES} 个上限，已截断`);
+    }
+    const picked = [];
+    const seen = new Set();
+    for (const raw of rawSiteIds) {
+      if (!VOD_SITE_ID_RE.test(raw)) {
+        warnings.push(`vod.siteIds: 忽略格式非法的站点 id ${raw}`);
+        continue;
+      }
+      if (seen.has(raw)) continue;
+      seen.add(raw);
+      picked.push(raw);
+      if (picked.length >= MAX_VOD_SITES) break;
+    }
+    base.siteIds = picked;
+  }
+
+  base.lockLibrary = bool(part.lockLibrary, false, 'vod.lockLibrary');
+  base.libraryRevision = int(part.libraryRevision, 0, 0, 1e9, 'vod.libraryRevision');
+  return base;
 }
 
 const NORMALIZERS = {
@@ -514,6 +727,7 @@ const NORMALIZERS = {
   startup: normalizeStartup,
   update: normalizeUpdate,
   iptv: normalizeIptv,
+  vod: normalizeVod,
 };
 
 export function normalizeSections(raw) {
@@ -522,6 +736,7 @@ export function normalizeSections(raw) {
   }
   const warnings = [];
   const sections = clone(SEED.sections);
+  ensureSectionDefaults(sections);
   const unknown = Object.keys(raw).filter((key) => !SECTION_KEYS.includes(key));
   if (unknown.length) warnings.push(`忽略未知节: ${unknown.sort().join(', ')}`);
   for (const key of SECTION_KEYS) {
@@ -557,4 +772,249 @@ export function normalizeDocument(raw) {
     throw new ConfigError('revision 必须是非负整数');
   }
   return [buildDocument(sections, revision, raw.updatedAt), warnings];
+}
+
+/* ================= 全局资源库 ================= */
+
+/** 空库：GET /api/library 在没有写过库时也返回结构完整的文档（revision 0）。 */
+export function emptyLibrary() {
+  return {
+    schemaVersion: LIBRARY_SCHEMA_VERSION,
+    revision: 0,
+    updatedAt: '',
+    iptv: { sources: [], packages: [], epgUrl: '' },
+    vod: { sources: [], sites: [] },
+  };
+}
+
+function libraryObject(part, field) {
+  if (part === undefined || part === null) return {};
+  if (typeof part !== 'object' || Array.isArray(part)) {
+    throw new ConfigError(`${field} 必须是对象`);
+  }
+  return part;
+}
+
+function libraryItem(item, field, warnings) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    warnings.push(`${field}: 忽略非对象条目`);
+    return null;
+  }
+  return item;
+}
+
+/** 库内 id 是引用目标，格式错了会静默失效，因此直接 400 而不是 warning。 */
+function libraryId(item, prefix, re, field) {
+  const raw = item.id === undefined || item.id === null ? '' : String(item.id).trim();
+  if (!raw) return '';
+  if (!re.test(raw)) {
+    throw new ConfigError(`${field}: 非法 id ${raw}（应为 ${prefix} 加 8 位十六进制）`);
+  }
+  return raw;
+}
+
+function normalizeLibraryIptv(part, warnings) {
+  const raw = libraryObject(part, 'library.iptv');
+  const out = { sources: [], packages: [], epgUrl: '' };
+
+  const epg = str(raw.epgUrl, '', 'library.iptv.epgUrl', 500);
+  out.epgUrl = epg && URL_RE.test(epg) ? epg : '';
+  if (epg && !out.epgUrl) warnings.push('library.iptv.epgUrl: 仅支持 http(s)，已忽略');
+
+  if (raw.sources !== undefined && raw.sources !== null) {
+    if (!Array.isArray(raw.sources)) throw new ConfigError('library.iptv.sources 必须是数组');
+    if (raw.sources.length > MAX_LIBRARY_SOURCES) {
+      warnings.push(`library.iptv.sources: 超过 ${MAX_LIBRARY_SOURCES} 个上限，已截断`);
+    }
+    const taken = new Set();
+    for (const entry of raw.sources.slice(0, MAX_LIBRARY_SOURCES)) {
+      const item = libraryItem(entry, 'library.iptv.sources', warnings);
+      if (!item) continue;
+      let id = libraryId(item, 's_', LIB_SOURCE_ID_RE, 'library.iptv.sources');
+      if (!id) id = randomLibraryId('s_', taken);
+      if (taken.has(id)) {
+        warnings.push(`library.iptv.sources: 忽略重复的源 id ${id}`);
+        continue;
+      }
+      const url = str(item.url, '', 'library.iptv.sources.url', 1000);
+      if (!url || !URL_RE.test(url)) {
+        warnings.push(`library.iptv.sources: 忽略非法订阅地址 ${url || '(空)'}（仅支持 http(s)）`);
+        continue;
+      }
+      taken.add(id);
+      out.sources.push({
+        id,
+        name: str(item.name, '', 'library.iptv.sources.name', 64) || url,
+        url,
+        type: (str(item.type, 'm3u', 'library.iptv.sources.type', 16) || 'm3u').toLowerCase(),
+        channelCount: lenientInt(item.channelCount, 0, 0, MAX_IPTV_CHANNELS),
+        addedAt: str(item.addedAt, nowIso(), 'library.iptv.sources.addedAt', 40),
+        note: str(item.note, '', 'library.iptv.sources.note', 200),
+      });
+    }
+  }
+
+  if (raw.packages !== undefined && raw.packages !== null) {
+    if (!Array.isArray(raw.packages)) throw new ConfigError('library.iptv.packages 必须是数组');
+    if (raw.packages.length > MAX_IPTV_PACKAGES) {
+      warnings.push(`library.iptv.packages: 超过 ${MAX_IPTV_PACKAGES} 个上限，已截断`);
+    }
+    const sourceIds = new Set(out.sources.map((item) => item.id));
+    const taken = new Set();
+    let total = 0;
+    for (const entry of raw.packages.slice(0, MAX_IPTV_PACKAGES)) {
+      const item = libraryItem(entry, 'library.iptv.packages', warnings);
+      if (!item) continue;
+      let id = libraryId(item, 'pkg_', LIB_PACKAGE_ID_RE, 'library.iptv.packages');
+      if (!id) id = randomLibraryId('pkg_', taken);
+      if (taken.has(id)) {
+        warnings.push(`library.iptv.packages: 忽略重复的套餐 id ${id}`);
+        continue;
+      }
+      const room = MAX_PACKAGE_CHANNELS_TOTAL - total;
+      if (room <= 0) {
+        warnings.push(`library.iptv.packages: 频道总数达到 ${MAX_PACKAGE_CHANNELS_TOTAL} 上限，已截断`);
+        break;
+      }
+      const channels = normalizeChannelList(item.channels === undefined || item.channels === null
+        ? [] : item.channels, `library.iptv.packages[${id}].channels`, warnings).slice(0, room);
+      const refs = stringArray(item.sources, `library.iptv.packages[${id}].sources`,
+        MAX_LIBRARY_SOURCES) || [];
+      const sources = [];
+      for (const ref of refs) {
+        // 编辑器历史版本存的是订阅 URL，这里兼容成 sourceId，避免来源信息丢失。
+        let sourceId = ref;
+        if (!sourceIds.has(sourceId) && URL_RE.test(ref)) {
+          const hit = out.sources.find((src) => src.url.toLowerCase() === ref.toLowerCase());
+          if (hit) sourceId = hit.id;
+        }
+        if (!sourceIds.has(sourceId)) {
+          warnings.push(`library.iptv.packages[${id}]: 忽略不存在的源 ${ref}`);
+          continue;
+        }
+        if (!sources.includes(sourceId)) sources.push(sourceId);
+      }
+      total += channels.length;
+      taken.add(id);
+      out.packages.push({
+        id,
+        name: str(item.name, '', `library.iptv.packages[${id}].name`, 64) || id,
+        sources,
+        channels,
+      });
+    }
+  }
+  return out;
+}
+
+function normalizeLibraryVod(part, warnings) {
+  const raw = libraryObject(part, 'library.vod');
+  const out = { sources: [], sites: [] };
+
+  if (raw.sources !== undefined && raw.sources !== null) {
+    if (!Array.isArray(raw.sources)) throw new ConfigError('library.vod.sources 必须是数组');
+    if (raw.sources.length > MAX_VOD_SOURCES) {
+      warnings.push(`library.vod.sources: 超过 ${MAX_VOD_SOURCES} 个上限，已截断`);
+    }
+    const taken = new Set();
+    for (const entry of raw.sources.slice(0, MAX_VOD_SOURCES)) {
+      const item = libraryItem(entry, 'library.vod.sources', warnings);
+      if (!item) continue;
+      let id = libraryId(item, 'vs_', LIB_VOD_SOURCE_ID_RE, 'library.vod.sources');
+      if (!id) id = randomLibraryId('vs_', taken);
+      if (taken.has(id)) {
+        warnings.push(`library.vod.sources: 忽略重复的源 id ${id}`);
+        continue;
+      }
+      const url = str(item.url, '', 'library.vod.sources.url', 1000);
+      if (!url || !URL_RE.test(url)) {
+        warnings.push(`library.vod.sources: 忽略非法接口地址 ${url || '(空)'}（仅支持 http(s)）`);
+        continue;
+      }
+      taken.add(id);
+      out.sources.push({
+        id,
+        name: str(item.name, '', 'library.vod.sources.name', 64) || url,
+        url,
+        siteCount: lenientInt(item.siteCount, 0, 0, MAX_VOD_SITES),
+        addedAt: str(item.addedAt, nowIso(), 'library.vod.sources.addedAt', 40),
+        note: str(item.note, '', 'library.vod.sources.note', 200),
+      });
+    }
+  }
+
+  if (raw.sites !== undefined && raw.sites !== null) {
+    if (!Array.isArray(raw.sites)) throw new ConfigError('library.vod.sites 必须是数组');
+    if (raw.sites.length > MAX_VOD_SITES) {
+      warnings.push(`library.vod.sites: 超过 ${MAX_VOD_SITES} 个上限，已截断`);
+    }
+    const sourceIds = new Set(out.sources.map((item) => item.id));
+    const perSource = new Map();
+    const seen = new Set();
+    for (const entry of raw.sites.slice(0, MAX_VOD_SITES)) {
+      const item = libraryItem(entry, 'library.vod.sites', warnings);
+      if (!item) continue;
+      const sourceId = str(item.sourceId, '', 'library.vod.sites.sourceId', 32);
+      if (!LIB_VOD_SOURCE_ID_RE.test(sourceId) || !sourceIds.has(sourceId)) {
+        warnings.push(`library.vod.sites: 忽略未知源 ${sourceId || '(空)'} 下的站点`);
+        continue;
+      }
+      const key = str(item.key, '', 'library.vod.sites.key', 96);
+      // 客户端传来的 id 可能是对 key 做过字符替换的版本，合法且属于同一源就沿用。
+      const providedId = str(item.id, '', 'library.vod.sites.id', 96);
+      const id = (VOD_SITE_ID_RE.test(providedId) && providedId.startsWith(`${sourceId}:`))
+        ? providedId
+        : `${sourceId}:${key}`;
+      if (!key || !VOD_SITE_ID_RE.test(id)) {
+        warnings.push(`library.vod.sites: 忽略非法站点 key ${key || '(空)'}`);
+        continue;
+      }
+      if (seen.has(id)) {
+        warnings.push(`library.vod.sites: 忽略重复站点 ${id}`);
+        continue;
+      }
+      const used = perSource.get(sourceId) || 0;
+      if (used >= MAX_VOD_SITES_PER_SOURCE) {
+        warnings.push(`library.vod.sites: 源 ${sourceId} 超过 ${MAX_VOD_SITES_PER_SOURCE} 个站点上限，已截断`);
+        continue;
+      }
+      const api = str(item.api, '', 'library.vod.sites.api', 500);
+      if (!api) {
+        warnings.push(`library.vod.sites[${id}]: 缺少 api，已忽略`);
+        continue;
+      }
+      perSource.set(sourceId, used + 1);
+      seen.add(id);
+      out.sites.push({
+        id,
+        sourceId,
+        key,
+        name: str(item.name, '', `library.vod.sites[${id}].name`, 64) || key,
+        api,
+        type: lenientInt(item.type, 0, 0, 4),
+        searchable: lenientInt(item.searchable, 0, 0, 2),
+        quickSearch: lenientInt(item.quickSearch, 0, 0, 2),
+        note: str(item.note, '', `library.vod.sites[${id}].note`, 200),
+      });
+    }
+  }
+  return out;
+}
+
+/** 校验并规范化整库（PUT /api/library 用）。返回 [library, warnings]。 */
+export function normalizeLibrary(raw) {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new ConfigError('资源库文档必须是对象');
+  }
+  const warnings = [];
+  return [
+    {
+      schemaVersion: LIBRARY_SCHEMA_VERSION,
+      revision: 0,
+      updatedAt: '',
+      iptv: normalizeLibraryIptv(raw.iptv, warnings),
+      vod: normalizeLibraryVod(raw.vod, warnings),
+    },
+    warnings,
+  ];
 }

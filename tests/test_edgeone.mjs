@@ -16,10 +16,14 @@ import { onRequestPost as rollbackPost } from '../edge-functions/api/config/roll
 import { onRequestGet as healthGet } from '../edge-functions/health.js';
 import { onRequestGet as devicesGet, onRequestPost as devicesPost } from '../edge-functions/api/devices/index.js';
 import {
+  onRequestGet as libraryGet, onRequestPut as libraryPut,
+} from '../edge-functions/api/library/index.js';
+import {
   onRequestGet as editorGet, preloadDefaults, injectDefaults,
 } from '../edge-functions/index.js';
 import {
-  normalizeDocument, normalizeSections, expandIptvChannels, viewDocument,
+  normalizeDocument, normalizeSections, expandIptvChannels, viewDocument, normalizeLibrary,
+  emptyLibrary,
 } from '../edge-functions/_lib/contract.js';
 import { optionsHandler } from '../edge-functions/_lib/http.js';
 import { listDevices as storageListDevices } from '../edge-functions/_lib/storage.js';
@@ -76,7 +80,7 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(doc.schemaVersion, 1);
     assert.equal(doc.revision, 0);
     assert.deepEqual(Object.keys(doc.sections).sort(),
-      ['iptv', 'navigation', 'sites', 'startup', 'update']);
+      ['iptv', 'navigation', 'sites', 'startup', 'update', 'vod']);
   });
 
   await t.test('since / If-None-Match 命中返回 304', async () => {
@@ -677,5 +681,526 @@ test('退出弹窗与一级导航分组契约', async (t) => {
     assert.deepEqual(custom.navigation.groups[0].children, ['iptv']);
     assert.equal(custom.navigation.defaultGroupId, 'iptv');
     assert.ok(warnings.some((w) => w.includes('非法或重复的一级块')));
+  });
+});
+
+/* ================= 全局资源库（设备只存引用） ================= */
+
+test('资源库文档模型：id 规则、上限与协议校验', async (t) => {
+  await t.test('空库结构完整', () => {
+    const library = emptyLibrary();
+    assert.equal(library.revision, 0);
+    assert.deepEqual(library.iptv.sources, []);
+    assert.deepEqual(library.iptv.packages, []);
+    assert.deepEqual(library.vod.sources, []);
+    assert.deepEqual(library.vod.sites, []);
+  });
+
+  await t.test('非法套餐 id 直接 400（id 是设备的引用目标，不能静默丢弃）', () => {
+    assert.throws(() => normalizeLibrary({ iptv: { packages: [{ id: 'pkg_zzz', channels: [] }] } }),
+      /非法 id/);
+    assert.throws(() => normalizeLibrary({ vod: { sources: [{ id: 's_12345678', url: 'http://a.b/c' }] } }),
+      /非法 id/);
+    assert.throws(() => normalizeLibrary({ iptv: { sources: 'oops' } }), /必须是数组/);
+    assert.throws(() => normalizeLibrary('oops'), /必须是对象/);
+  });
+
+  await t.test('缺 id 自动补发，非 http(s) 源被忽略并记 warning', () => {
+    const [library, warnings] = normalizeLibrary({
+      iptv: {
+        sources: [
+          { name: '自动 id', url: 'https://example.com/a.m3u' },
+          { name: '坏协议', url: 'ftp://example.com/a.m3u' },
+        ],
+        packages: [{ name: '自动 id 套餐', channels: [{ name: 'A', url: 'http://a.example.com/1.ts' }] }],
+      },
+    });
+    assert.equal(library.iptv.sources.length, 1);
+    assert.match(library.iptv.sources[0].id, /^s_[0-9a-f]{8}$/);
+    assert.match(library.iptv.packages[0].id, /^pkg_[0-9a-f]{8}$/);
+    assert.ok(warnings.some((line) => line.includes('非法订阅地址')));
+  });
+
+  await t.test('超上限截断：源 30 / 套餐 12 / 频道总量 5000 / vod 源 20 / 站点 500', () => {
+    const sources = Array.from({ length: 31 }, (_, i) => ({
+      id: `s_${String(i).padStart(8, '0')}`, url: `https://example.com/${i}.m3u`,
+    }));
+    const [truncated, warnings] = normalizeLibrary({ iptv: { sources } });
+    assert.equal(truncated.iptv.sources.length, 30);
+    assert.ok(warnings.some((line) => line.includes('超过 30 个上限')));
+
+    const packages = Array.from({ length: 13 }, (_, i) => ({
+      id: `pkg_${String(i).padStart(8, '0')}`,
+      channels: [{ name: `C${i}`, url: `http://a.example.com/${i}.ts` }],
+    }));
+    const [pkgs, pkgWarnings] = normalizeLibrary({ iptv: { packages } });
+    assert.equal(pkgs.iptv.packages.length, 12);
+    assert.ok(pkgWarnings.some((line) => line.includes('超过 12 个上限')));
+
+    const vodSources = Array.from({ length: 21 }, (_, i) => ({
+      id: `vs_${String(i).padStart(8, '0')}`, url: `http://api.example.com/${i}.xml`,
+    }));
+    const [vod, vodWarnings] = normalizeLibrary({ vod: { sources: vodSources } });
+    assert.equal(vod.vod.sources.length, 20);
+    assert.ok(vodWarnings.some((line) => line.includes('超过 20 个上限')));
+
+    const siteSources = ['vs_00000000', 'vs_00000001', 'vs_00000002'];
+    const sites = Array.from({ length: 501 }, (_, i) => ({
+      sourceId: siteSources[i % siteSources.length], key: `k${i}`, name: `站点${i}`, api: 'csp_TEST',
+    }));
+    const [siteLib, siteWarnings] = normalizeLibrary({
+      vod: { sources: siteSources.map((id) => ({ id, url: `http://api.example.com/${id}.xml` })), sites },
+    });
+    assert.equal(siteLib.vod.sites.length, 500);
+    assert.ok(siteWarnings.some((line) => line.includes('超过 500 个上限')));
+
+    // 单源 200 个站点上限
+    const perSource = Array.from({ length: 205 }, (_, i) => ({
+      sourceId: 'vs_00000001', key: `k${i}`, name: `站点${i}`, api: 'csp_TEST',
+    }));
+    const [capped, capWarnings] = normalizeLibrary({
+      vod: {
+        sources: [{ id: 'vs_00000001', url: 'http://api.example.com/a.xml' }],
+        sites: perSource,
+      },
+    });
+    assert.equal(capped.vod.sites.length, 200);
+    assert.ok(capWarnings.some((line) => line.includes('个站点上限')));
+  });
+
+  await t.test('非法站点 key / 未知源 / 缺 api 被忽略，站点 id 由 sourceId:key 派生', () => {
+    const [library, warnings] = normalizeLibrary({
+      vod: {
+        sources: [{ id: 'vs_abcdef01', url: 'http://api.example.com/a.xml' }],
+        sites: [
+          { sourceId: 'vs_abcdef01', key: 'ok', name: '正常', api: 'csp_OK' },
+          { sourceId: 'vs_abcdef01', key: 'bad key', name: '空格', api: 'csp_X' },
+          { sourceId: 'vs_ffffffff', key: 'ghost', name: '未知源', api: 'csp_X' },
+          { sourceId: 'vs_abcdef01', key: 'noapi', name: '缺 api' },
+        ],
+      },
+    });
+    assert.equal(library.vod.sites.length, 1);
+    assert.equal(library.vod.sites[0].id, 'vs_abcdef01:ok');
+    assert.ok(warnings.some((line) => line.includes('非法站点 key')));
+    assert.ok(warnings.some((line) => line.includes('未知源')));
+    assert.ok(warnings.some((line) => line.includes('缺少 api')));
+  });
+
+  await t.test('设备 vod 节：默认值、上限与类型校验', () => {
+    const [sections] = normalizeSections({});
+    assert.deepEqual(sections.vod, {
+      managed: false, sourceIds: [], siteIds: [], lockLibrary: false, libraryRevision: 0,
+    });
+
+    const sourceIds = Array.from({ length: 21 }, (_, i) => `vs_${String(i).padStart(8, '0')}`);
+    const [capped, warnings] = normalizeSections({ vod: { sourceIds } });
+    assert.equal(capped.vod.sourceIds.length, 20);
+    assert.ok(warnings.some((line) => line.includes('vod.sourceIds: 超过 20 个上限')));
+
+    const siteIds = Array.from({ length: 501 }, (_, i) => `vs_00000000:k${i}`);
+    const [sites] = normalizeSections({ vod: { siteIds } });
+    assert.equal(sites.vod.siteIds.length, 500);
+
+    const [filtered, filterWarnings] = normalizeSections({
+      vod: { siteIds: ['vs_00000000:ok', 'not a site id', 'vs_00000000:ok'] },
+    });
+    assert.deepEqual(filtered.vod.siteIds, ['vs_00000000:ok']);
+    assert.ok(filterWarnings.some((line) => line.includes('格式非法的站点 id')));
+
+    assert.throws(() => normalizeSections({ vod: { sourceIds: 'x' } }), /必须是字符串数组/);
+    assert.throws(() => normalizeSections({ vod: { lockLibrary: 'yes' } }), /必须是布尔值/);
+    assert.throws(() => normalizeSections({ vod: { libraryRevision: -1 } }), /必须在/);
+  });
+
+  await t.test('兼容编辑器导入的 TVBox 原始字段（布尔开关 / 字符串 type / 套餐按 URL 记来源）', () => {
+    const [library, warnings] = normalizeLibrary({
+      iptv: {
+        sources: [{ id: 's_0000beef', url: 'https://example.com/a.m3u', type: 'url', channelCount: '3' }],
+        packages: [{
+          id: 'pkg_0000beef',
+          name: '导入套餐',
+          sources: ['https://example.com/a.m3u'],
+          channels: [{ name: 'A', url: 'http://a.example.com/1.ts' }],
+        }],
+      },
+      vod: {
+        sources: [{ id: 'vs_0000beef', url: 'http://api.example.com/a.json', siteCount: '2' }],
+        sites: [{
+          id: 'vs_0000beef:cf', sourceId: 'vs_0000beef', key: 'cf', name: 'CF',
+          api: 'csp_CF', type: '', searchable: true, quickSearch: false,
+        }],
+      },
+    });
+    assert.deepEqual(library.iptv.packages[0].sources, ['s_0000beef']);
+    assert.equal(library.iptv.sources[0].channelCount, 3);
+    assert.equal(library.vod.sources[0].siteCount, 2);
+    assert.equal(library.vod.sites[0].type, 0);
+    assert.equal(library.vod.sites[0].searchable, 1);
+    assert.equal(library.vod.sites[0].quickSearch, 0);
+    assert.equal(warnings.length, 0);
+  });
+
+  await t.test('设备 iptv 新增字段：packageIds 去重截断、lockLibrary、libraryRevision', () => {
+    const ids = Array.from({ length: 14 }, (_, i) => `pkg_${String(i).padStart(8, '0')}`);
+    const [sections, warnings] = normalizeSections({
+      iptv: {
+        packageIds: ['bad id!', ...ids, 'pkg_00000000'],
+        lockLibrary: true,
+        libraryRevision: 3,
+      },
+    });
+    assert.equal(sections.iptv.packageIds.length, 12);
+    assert.equal(sections.iptv.lockLibrary, true);
+    assert.equal(sections.iptv.libraryRevision, 3);
+    assert.ok(warnings.some((line) => line.includes('超过 12 个上限')));
+    assert.ok(warnings.some((line) => line.includes('格式非法的套餐 id')));
+    assert.throws(() => normalizeSections({ iptv: { packageIds: [1] } }), /必须是字符串数组/);
+  });
+});
+
+test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔离', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  const fresh = new MemoryKV();
+  globalThis.PURETV_KV = fresh;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {};
+  const libGet = () => libraryGet(ctx('GET', '/api/library', { env }));
+  const libPut = (body, revision, headers) => libraryPut(ctx('PUT', '/api/library', {
+    env,
+    headers: { 'Content-Type': 'application/json', ...(revision === undefined ? {} : { 'If-Match': String(revision) }), ...headers },
+    body,
+  }));
+  const deviceGet = (id, since) => configGet(ctx('GET',
+    `/api/config?deviceId=${id}${since === undefined ? '' : `&since=${since}`}`, { env }));
+  const devicePut = (id, sections, revision) => configPut(ctx('PUT', `/api/config?deviceId=${id}`, {
+    env, headers: { 'If-Match': String(revision), 'Content-Type': 'application/json' },
+    body: { sections },
+  }));
+
+  const PACKAGE_ID = 'pkg_0000abcd';
+  const SOURCE_ID = 's_0000abcd';
+  const VOD_SOURCE_ID = 'vs_0000abcd';
+  const VOD_SITE_ID = 'vs_0000abcd:cf';
+  const baseLibrary = () => ({
+    iptv: {
+      epgUrl: 'https://epg.example.com/e.xml',
+      sources: [{
+        id: SOURCE_ID, name: '央视源', url: 'https://example.com/cctv.m3u', type: 'm3u', channelCount: 2,
+      }],
+      packages: [{
+        id: PACKAGE_ID,
+        name: '央视',
+        sources: [SOURCE_ID, 's_ffffffff'],
+        channels: [
+          { name: 'CCTV1', url: 'http://lib.example.com/1.ts', group: '央视' },
+          { name: 'CCTV2', url: 'http://lib.example.com/2.ts', group: '央视' },
+        ],
+      }],
+    },
+    vod: {
+      sources: [{ id: VOD_SOURCE_ID, name: '饭太硬', url: 'http://api.example.com/fan.json', siteCount: 1 }],
+      sites: [{
+        id: VOD_SITE_ID, sourceId: VOD_SOURCE_ID, key: 'cf', name: 'CF', api: 'csp_CF',
+        type: 0, searchable: 1, quickSearch: 1,
+      }],
+    },
+  });
+
+  await t.test('空库 GET 返回完整空结构与 ETag，且鉴权生效', async () => {
+    const res = await libGet();
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('ETag'), '"0"');
+    const data = await json(res);
+    assert.equal(data.revision, 0);
+    assert.deepEqual(data.iptv, { sources: [], packages: [], epgUrl: '' });
+    assert.deepEqual(data.vod, { sources: [], sites: [] });
+
+    const denied = await libraryGet(ctx('GET', '/api/library', {
+      env: { CONFIG_READ_TOKEN: 'read-secret' },
+    }));
+    assert.equal(denied.status, 401);
+  });
+
+  await t.test('PUT 缺 If-Match 400、非法 id 400，且不落库', async () => {
+    const noMatch = await libPut(baseLibrary());
+    assert.equal(noMatch.status, 400);
+    assert.equal((await json(noMatch)).error, 'invalid_config');
+
+    const badId = await libPut({
+      iptv: { packages: [{ id: 'pkg_bad', channels: [] }] },
+    }, 0);
+    assert.equal(badId.status, 400);
+    assert.match((await json(badId)).message, /非法 id/);
+    assert.equal((await json(await libGet())).revision, 0);
+  });
+
+  await t.test('建库：revision 递增、非法源引用被清理、affectedDevices=0', async () => {
+    const res = await libPut(baseLibrary(), 0);
+    assert.equal(res.status, 200);
+    const data = await json(res);
+    assert.equal(data.revision, 1);
+    assert.equal(data.affectedDevices, 0);
+    assert.ok(data.warnings.some((line) => line.includes('不存在的源 s_ffffffff')));
+    assert.ok(data.updatedAt);
+
+    const stored = await json(await libGet());
+    assert.equal(stored.revision, 1);
+    assert.equal(stored.iptv.sources[0].id, SOURCE_ID);
+    assert.deepEqual(stored.iptv.packages[0].sources, [SOURCE_ID]);
+    assert.equal(stored.iptv.packages[0].channels.length, 2);
+    assert.equal(stored.vod.sites[0].id, VOD_SITE_ID);
+  });
+
+  await t.test('If-Match 不匹配返回 409 并带回当前库', async () => {
+    const res = await libPut(baseLibrary(), 0);
+    assert.equal(res.status, 409);
+    const data = await json(res);
+    assert.equal(data.error, 'revision_conflict');
+    assert.equal(data.currentRevision, 1);
+  });
+
+  await t.test('设备引用库套餐：GET 展开 channels、套餐摘要来自库、libraryRevision 追平', async () => {
+    const put = await devicePut('tv-lib', {
+      iptv: { managed: true, packageIds: [PACKAGE_ID] },
+      vod: { managed: true, sourceIds: [VOD_SOURCE_ID], siteIds: [VOD_SITE_ID] },
+    }, 1);
+    assert.equal(put.status, 200);
+    assert.equal((await json(put)).revision, 2);
+
+    const res = await deviceGet('tv-lib');
+    assert.equal(res.status, 200);
+    const doc = await json(res);
+    // 懒触发 bump：2 → 3
+    assert.equal(doc.revision, 3);
+    assert.equal(doc.sections.iptv.libraryRevision, 1);
+    assert.equal(doc.sections.vod.libraryRevision, 1);
+    assert.equal(doc.sections.iptv.channels.length, 2);
+    assert.equal(doc.sections.iptv.channels[0].url, 'http://lib.example.com/1.ts');
+    assert.deepEqual(doc.sections.iptv.packages.map((pkg) => pkg.id), [PACKAGE_ID]);
+    assert.equal(doc.sections.iptv.packages[0].channelCount, 2);
+    assert.ok(!('channels' in doc.sections.iptv.packages[0]));
+    assert.deepEqual(doc.sections.vod.siteIds, [VOD_SITE_ID]);
+
+    // bump 之后 304 判定用新 revision
+    assert.equal((await deviceGet('tv-lib', 3)).status, 304);
+    assert.equal((await deviceGet('tv-lib', 2)).status, 200);
+  });
+
+  await t.test('编辑器 withPackages=1 拿到库套餐完整频道', async () => {
+    const doc = await json(await configGet(ctx('GET',
+      '/api/config?deviceId=tv-lib&withPackages=1', { env })));
+    assert.equal(doc.sections.iptv.packages[0].channels.length, 2);
+    assert.equal(doc.sections.iptv.packages[0].name, '央视');
+  });
+
+  await t.test('库变更后设备 GET 自动 bump，频道以库为准（不留旧频道）', async () => {
+    const next = baseLibrary();
+    next.iptv.packages[0].channels = [
+      { name: 'CCTV1', url: 'http://lib.example.com/1.ts', group: '央视' },
+      { name: 'CCTV2', url: 'http://lib.example.com/2.ts', group: '央视' },
+      { name: 'CCTV3', url: 'http://lib.example.com/3.ts', group: '央视' },
+    ];
+    const put = await libPut(next, 1);
+    assert.equal(put.status, 200);
+    const putData = await json(put);
+    assert.equal(putData.revision, 2);
+    assert.equal(putData.affectedDevices, 1);
+
+    const doc = await json(await deviceGet('tv-lib'));
+    assert.equal(doc.revision, 4);
+    assert.equal(doc.sections.iptv.libraryRevision, 2);
+    assert.equal(doc.sections.iptv.channels.length, 3);
+
+    // 频道被移除时不残留：这一次库只保留一条全新频道
+    const trimmed = baseLibrary();
+    trimmed.iptv.packages[0].channels = [
+      { name: 'CCTV9', url: 'http://lib.example.com/9.ts', group: '纪录' },
+    ];
+    assert.equal((await libPut(trimmed, 2)).status, 200);
+    const after = await json(await deviceGet('tv-lib'));
+    assert.equal(after.revision, 5);
+    assert.equal(after.sections.iptv.libraryRevision, 3);
+    assert.deepEqual(after.sections.iptv.channels.map((c) => c.url), ['http://lib.example.com/9.ts']);
+    assert.deepEqual(after.sections.iptv.groups, ['纪录']);
+  });
+
+  await t.test('未引用库的设备不会被无谓 bump', async () => {
+    const first = await json(await deviceGet('tv-plain'));
+    assert.equal(first.revision, 1);
+    assert.equal(first.sections.iptv.libraryRevision, 0);
+    const second = await json(await deviceGet('tv-plain'));
+    assert.equal(second.revision, 1);
+    assert.equal(second.sections.iptv.channels.length, 0);
+  });
+
+  await t.test('lockLibrary=true：PUT 时快照展开，之后库再变也不影响该设备', async () => {
+    await deviceGet('tv-lock');
+    const put = await devicePut('tv-lock', {
+      iptv: { managed: true, lockLibrary: true, packageIds: [PACKAGE_ID] },
+    }, 1);
+    assert.equal(put.status, 200);
+    assert.equal((await json(put)).revision, 2);
+
+    const locked = await json(await deviceGet('tv-lock'));
+    assert.equal(locked.revision, 2);
+    assert.equal(locked.sections.iptv.lockLibrary, true);
+    assert.deepEqual(locked.sections.iptv.channels.map((c) => c.url), ['http://lib.example.com/9.ts']);
+    assert.equal(locked.sections.iptv.libraryRevision, 3);
+
+    const next = baseLibrary();
+    next.iptv.packages[0].channels = [
+      { name: 'CCTV9', url: 'http://lib.example.com/9.ts', group: '纪录' },
+      { name: 'CCTV10', url: 'http://lib.example.com/10.ts', group: '纪录' },
+    ];
+    const putLib = await libPut(next, 3);
+    const putLibData = await json(putLib);
+    assert.equal(putLibData.revision, 4);
+    // 锁定设备不计入 affectedDevices
+    assert.equal(putLibData.affectedDevices, 1);
+
+    const stillLocked = await json(await deviceGet('tv-lock'));
+    assert.equal(stillLocked.revision, 2);
+    assert.deepEqual(stillLocked.sections.iptv.channels.map((c) => c.url),
+      ['http://lib.example.com/9.ts']);
+    assert.equal(stillLocked.sections.iptv.libraryRevision, 3);
+  });
+
+  await t.test('编辑器保存形态（剔除库套餐、清空派生 channels）后 GET 仍能展开', async () => {
+    await deviceGet('tv-editor');
+    const put = await devicePut('tv-editor', {
+      iptv: {
+        managed: true,
+        packageIds: [PACKAGE_ID],
+        lockLibrary: false,
+        // 编辑器勾选套餐时会把当时的库 revision 写进来，因此这次 GET 不该再 bump
+        libraryRevision: 4,
+        selectedPackageIds: [],
+        packages: [{
+          id: 'p1',
+          name: '本地旧套餐',
+          channels: [{ name: 'L', url: 'http://inline.example.com/1.ts' }],
+        }],
+        channels: [],
+        groups: [],
+      },
+    }, 1);
+    assert.equal(put.status, 200);
+    assert.equal((await json(put)).revision, 2);
+
+    const doc = await json(await deviceGet('tv-editor'));
+    assert.equal(doc.revision, 2);
+    assert.equal(doc.sections.iptv.libraryRevision, 4);
+    assert.equal(doc.sections.iptv.channels.length, 2);
+    assert.deepEqual(doc.sections.iptv.channels.map((c) => c.url).sort(),
+      ['http://lib.example.com/10.ts', 'http://lib.example.com/9.ts']);
+    // 轻量视图的套餐摘要同时覆盖库套餐与本地内联套餐
+    assert.deepEqual(doc.sections.iptv.packages.map((pkg) => pkg.id).sort(),
+      ['p1', PACKAGE_ID]);
+  });
+
+  await t.test('旧 selectedPackageIds + 内联 packages 路径不回归', async () => {
+    const [normalized] = normalizeSections({ iptv: {
+      packages: [
+        { id: 'p1', name: '央视', channels: [{ name: 'A', url: 'http://old.example.com/a.ts', group: '央视' }] },
+        { id: 'p2', name: '卫视', channels: [{ name: 'B', url: 'http://old.example.com/b.ts', group: '卫视' }] },
+      ],
+      selectedPackageIds: ['p2', 'p1'],
+    } });
+    assert.deepEqual(normalized.iptv.packageIds, []);
+    // 即使传了库，只要没有 packageIds 就仍走设备内联套餐
+    const expanded = expandIptvChannels(normalized, baseLibrary());
+    assert.deepEqual(expanded.iptv.channels.map((c) => c.url),
+      ['http://old.example.com/b.ts', 'http://old.example.com/a.ts']);
+    assert.deepEqual(expanded.iptv.groups, ['卫视', '央视']);
+
+    // 端到端：老客户端只传 selectedPackageIds 依然拿到展开后的 channels
+    await deviceGet('tv-legacy');
+    const put = await devicePut('tv-legacy', { iptv: {
+      managed: true,
+      packages: [{ id: 'p1', name: '央视', channels: [{ name: 'A', url: 'http://old.example.com/a.ts' }] }],
+      selectedPackageIds: ['p1'],
+    } }, 1);
+    assert.equal(put.status, 200);
+    const doc = await json(await deviceGet('tv-legacy'));
+    assert.equal(doc.revision, 2);
+    assert.equal(doc.sections.iptv.channels.length, 1);
+  });
+
+  await t.test('老设备文档（无 vod / 无 packageIds）读取兼容且不被 bump', async () => {
+    const [legacySections] = normalizeSections({});
+    delete legacySections.vod;
+    delete legacySections.iptv.packageIds;
+    delete legacySections.iptv.lockLibrary;
+    delete legacySections.iptv.libraryRevision;
+    fresh.map.set('device_tv-old_current', JSON.stringify({
+      schemaVersion: 1, revision: 5, updatedAt: '2026-01-01T00:00:00+08:00', sections: legacySections,
+    }));
+
+    const res = await deviceGet('tv-old');
+    assert.equal(res.status, 200);
+    const doc = await json(res);
+    // 没有库引用 → 不 bump，revision 原样
+    assert.equal(doc.revision, 5);
+    assert.deepEqual(doc.sections.vod, {
+      managed: false, sourceIds: [], siteIds: [], lockLibrary: false, libraryRevision: 0,
+    });
+    assert.deepEqual(doc.sections.iptv.packageIds, []);
+  });
+
+  await t.test('库变更触发 bump 不写快照：历史条目不增不减，current revision 仍递增', async () => {
+    await deviceGet('tv-hist');
+    // 两次真实编辑 → 留下 revision 2、3 两条快照
+    assert.equal((await devicePut('tv-hist', {
+      sites: { managed: true, enabledSiteIds: ['bilibili'] },
+    }, 1)).status, 200);
+    assert.equal((await devicePut('tv-hist', {
+      iptv: { managed: true, packageIds: [PACKAGE_ID], libraryRevision: 4 },
+      sites: { managed: true, enabledSiteIds: ['bilibili'] },
+    }, 2)).status, 200);
+
+    const before = await json(await revisionsGet(ctx('GET',
+      '/api/config/revisions?deviceId=tv-hist', { env })));
+    assert.deepEqual(before.revisions.map((item) => item.revision), [3, 2]);
+    assert.ok(fresh.map.has('device_tv-hist_snapshot_00000003'));
+
+    // 库再改一次 → 设备下次 GET 追平（revision 4），但不应留下快照/历史
+    const next = baseLibrary();
+    next.iptv.packages[0].channels = [
+      { name: 'CCTV9', url: 'http://lib.example.com/9.ts', group: '纪录' },
+      { name: 'CCTV10', url: 'http://lib.example.com/10.ts', group: '纪录' },
+      { name: 'CCTV11', url: 'http://lib.example.com/11.ts', group: '纪录' },
+    ];
+    assert.equal((await libPut(next, 4)).status, 200); // 库 → revision 5
+
+    const doc = await json(await deviceGet('tv-hist'));
+    assert.equal(doc.revision, 4);
+    assert.equal(doc.sections.iptv.libraryRevision, 5);
+    assert.equal(doc.sections.iptv.channels.length, 3);
+
+    const after = await json(await revisionsGet(ctx('GET',
+      '/api/config/revisions?deviceId=tv-hist', { env })));
+    assert.deepEqual(after.revisions.map((item) => item.revision), [3, 2]);
+    assert.equal(fresh.map.has('device_tv-hist_snapshot_00000004'), false);
+
+    // 终端管理页仍要看到最新 revision
+    const listed = await storageListDevices(env);
+    assert.equal(listed.find((item) => item.id === 'tv-hist').revision, 4);
+
+    // 回滚到「无快照」的 revision 给出可读 400，而不是 500
+    const rollbackRes = await rollbackPost(ctx('POST', '/api/config/rollback?deviceId=tv-hist', {
+      env, headers: { 'Content-Type': 'application/json' }, body: { revision: 4 },
+    }));
+    assert.equal(rollbackRes.status, 400);
+    assert.match((await json(rollbackRes)).message, /找不到 revision 4 的快照/);
+  });
+
+  await t.test('库写入的 KV 键名合法，且不影响配置文档键', () => {
+    assert.ok(fresh.map.has('library_current'));
+    for (const key of fresh.map.keys()) {
+      // 设备 id 允许连字符，键名只需落在 KV 支持的字符集内
+      assert.match(key, /^[A-Za-z0-9_-]+$/, `非法 KV key: ${key}`);
+    }
   });
 });

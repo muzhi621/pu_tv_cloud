@@ -141,6 +141,8 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 | 场景 | 操作 | 是否触发构建 |
 |---|---|---|
 | 改站点显隐 / 导航 / 启动弹窗 / 更新策略 | 打开编辑器保存 | 否，直接写 KV |
+| 建 / 改 IPTV 源与套餐、导入 TVBox 站点 | 编辑器「IPTV 源」「TVBox 源」页签 → 保存资源库 | 否，写 `library_current` |
+| 给终端换套餐 / 锁内容 | 「终端管理」勾选引用或拨「锁定资源库」 | 否 |
 | 改函数代码、契约、编辑器页面 | `git push origin main` | 是，自动部署 |
 | 改环境变量 | 控制台改完**重新部署** | 是（需手动一次） |
 | 配置改错想撤回 | `revisions` 查历史 → `rollback` | 否 |
@@ -149,10 +151,35 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 发布前本地自检（CI 也会跑同一套）：
 
 ```bash
-python -m unittest discover -s tests        # 58 个 Python 单测
-node --test tests/test_edgeone.mjs          # 51 项 EdgeOne 冒烟
+python -m unittest discover -s tests        # 86 个 Python 单测
+node --test tests/test_edgeone.mjs          # 75 项 EdgeOne 冒烟
 python scripts/build_edgeone_assets.py --check
 ```
+
+### 资源库操作（一台设备都没连也能先建）
+
+资源库是独立于设备的共享字典（KV 键 `library_current`），所以**不必等终端上线**：
+
+1. **导入源**：「IPTV 源」页签填 M3U / TXT 地址或用本地文件 / 粘贴文本，每导入一个
+   地址登记一条源（≤30 条，id 形如 `s_1a2b3c4d`，服务端补发）。
+2. **组套餐**：勾频道 →「存为新套餐」（≤12 个，所有套餐频道合计 ≤5000）→
+   「保存资源库」。保存提示里的 **预计影响 N 台终端** 只统计「未锁定且确实引用了这次
+   涉及 id」的设备，不是全部终端。
+3. **导 TVBox 站点**：「TVBox 源」页签导入 TVBox 配置（URL 或粘贴 JSON），登记源
+   （`vs_1a2b3c4d`）与站点（`源id:站点key`，≤500，单源 ≤200）。**本期只存不播**：
+   库只维护清单与设备引用，终端播放链路未接，下发内容终端会忽略（待真机验证）。
+4. **勾引用**：「终端管理」选中设备 →「IPTV 下发」勾选套餐、TVBox 区勾选源/站点 →
+   保存该终端配置。设备文档只多出 `packageIds` / `sourceIds` / `siteIds`。
+5. **锁定开关**：勾「锁定资源库」= 该设备冻结在当前频道表、不再跟随库变化，也不计入
+   「预计影响台数」；想让门店展示机内容固定就锁它，想统一更新就别锁。PUT 锁定设备时
+   服务端会用库展开一次写进 `channels`，保证离线也能播。
+6. **迁移旧内联套餐**：「IPTV 下发」页的「迁移到资源库」会把老 `packages` /
+   `selectedPackageIds` 搬进库（同名合并、其余新建）；迁移后**先保存资源库，再保存
+   该终端配置**。
+
+改库不会写任何设备文档，设备下次 `GET /api/config` 时先追平 `libraryRevision` 再判
+304，因此不会漏掉新频道；离线设备等下次上线。库没有快照历史，回滚请针对设备文档。
+接口与上限见 [API.md](API.md)。
 
 ## 6. 终端 APK 接入（不改客户端代码）
 
@@ -175,6 +202,10 @@ flutter build apk --release \
 | 构建报 `npm run build` 失败 | 平台覆盖了 `edgeone.json` | 构建命令改 `echo no-build`、输出目录 `public` |
 | 保存成功但 APK 未变 | KV 边缘缓存最长 60s；或客户端命中 304 | 等 60s 或换节点；确认客户端按 `X-Revision` 刷新 |
 | `revisions` 为空 | 还没写入过（seed revision 0 不生成快照） | 先 PUT 一次，属预期 |
+| `GET /api/library` 404 `not_supported` | 跑的是 FC / 本地 Python 版或旧版函数 | 资源库仅 EdgeOne 新版提供，重新部署最新代码 |
+| 保存资源库提示影响 0 台 | 没有设备引用这些 id，或引用它的都锁定了 | 正常：未勾引用的设备不跟随；锁定设备本就不跟随 |
+| 改库后终端内容不变 | 终端锁定了 / 未上线 / KV 边缘缓存（≤60s） | 取消锁定并保存该终端配置；等下次心跳或 60s |
+| 提交资源库 409 | `If-Match` 落后 | 编辑器「重新加载资源库」后重试 |
 
 ## 8. 方案边界
 
@@ -194,9 +225,14 @@ flutter build apk --release \
 | 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备被拒绝下发配置 |
 | 契约 | `navigation.groups` / `defaultGroupId` / `startup.exitDialog` | 四大类一级栏 + 右侧二级菜单、退出 App 弹窗云端下发 |
 | 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 3000 |
-| 视图 | `GET /api/config?withPackages=1` | 默认轻量视图剥离套餐频道为 `{id,name,sources,channelCount}`；FC 版同样实现 |
+| 接口 | `GET/PUT /api/library` | 全局资源库（IPTV 源/套餐 + TVBox 源/站点）；无库返回空库 revision 0；PUT 需 `If-Match`，返回 `affectedDevices` |
+| 契约 | `vod` 节、`iptv.packageIds` / `lockLibrary` / `libraryRevision` | 设备只存库 id 引用；锁定后冻结当前内容；revision 由服务端维护 |
+| 行为 | 懒触发追平 + 锁定快照 | 库变更后设备下次 GET 先追平再判 304；PUT 锁定设备时展开一次落盘 `channels` |
+| 视图 | `GET /api/config?withPackages=1` | 默认轻量视图剥离套餐频道为 `{id,name,sources,channelCount}`（含被引用的库套餐）；FC 版同样实现 |
 
-> **核心配置契约与 FC 版一致，但 EdgeOne 版额外提供 `/api/iptv/fetch` 与完整设备管理
-> 动作**。FC 版（`cloud/app.py`）没有这两个接口、没有设备维度、请求体上限 1 MiB、
-> 无 900 KB 文档校验。逐项对照见 [API.md](API.md) 的「与 FC 版的差异（API 视角）」。
+> **核心配置契约与 FC 版一致，但 EdgeOne 版额外提供 `/api/iptv/fetch`、完整设备管理
+> 动作与全局资源库**。FC 版（`cloud/app.py`）没有这些接口、没有设备维度、没有
+> `library_current`（`/api/library` 返回 404 `not_supported`）、请求体上限 1 MiB、
+> 无 900 KB 文档校验；`vod` / `packageIds` 字段照常校验但引用不会被展开。逐项对照见
+> [API.md](API.md) 的「与 FC 版的差异（API 视角）」。
 > 云端代抓是带鉴权的受限代理，DNS rebinding 无法先验解析，请只填可信订阅地址。

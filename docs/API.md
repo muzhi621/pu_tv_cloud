@@ -5,18 +5,19 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 
 > **两个实现路径的关系（务必区分）**：EdgeOne（JavaScript Edge Functions）与 FC
 > （Python WSGI / 本地 Python 版）共享**同一套配置契约**——`schemaVersion`、`sections`
-> 五节结构、字段校验规则、`ETag` / `X-Revision` 头、`304` / `409` 语义、核心错误码一致，
+> 六节结构、字段校验规则、`ETag` / `X-Revision` 头、`304` / `409` 语义、核心错误码一致，
 > 终端 APK 只需更换 Base URL。但**不是所有接口两端都有**：EdgeOne 版额外提供
 > `POST /api/iptv/fetch`、完整的 `GET/POST /api/devices` 设备管理、按 `deviceId` 的
-> 设备维度隔离与在线判定、编辑器令牌预填；FC 版（`cloud/app.py`）只有 `/health`、
-> `/api/config`、`/api/config/catalog`、`/api/config/revisions`、
-> `/api/config/rollback` 与静态编辑器，**没有** `/api/devices`、**没有**
-> `/api/iptv/fetch`、不登记设备、不返回 `403 device_blocked`。逐项对照见文末
-> 「与 FC 版的差异（API 视角）」。两端的 `GET /api/config` 轻量视图（套餐展开 +
-> `withPackages=1` 剥离）则**都实现**。
+> 设备维度隔离与在线判定、**全局资源库 `GET/PUT /api/library`**、编辑器令牌预填；FC 版
+> （`cloud/app.py`）只有 `/health`、`/api/config`、`/api/config/catalog`、
+> `/api/config/revisions`、`/api/config/rollback` 与静态编辑器，**没有** `/api/devices`、
+> **没有** `/api/iptv/fetch`、**没有** `/api/library`，不登记设备、不返回
+> `403 device_blocked`。逐项对照见文末「与 FC 版的差异（API 视角）」。两端的
+> `GET /api/config` 轻量视图（套餐展开 + `withPackages=1` 剥离）则**都实现**。
 
 除 `/health` 与静态编辑器外，所有 `/api/*` 请求需要 `Authorization: Bearer <read-token>`。
-写入类接口（PUT、rollback、`POST /api/devices`、`POST /api/iptv/fetch`）需要 `<write-token>`。
+写入类接口（PUT、rollback、`PUT /api/library`、`POST /api/devices`、`POST /api/iptv/fetch`）
+需要 `<write-token>`。
 
 > **设备维度（仅 EdgeOne 实现）**：`/api/config`、`/api/config/revisions`、
 > `/api/config/rollback` 都接受 `?deviceId=<id>`（或 `X-Device-Id` 头）。带上表示读写
@@ -36,6 +37,8 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 | GET | `/api/config/catalog` | read | 两端 | 站点/导航 id 目录（编辑器选项来源） |
 | GET | `/api/config/revisions?limit=20` | read | 两端 | 历史快照列表（倒序；EdgeOne 按设备隔离） |
 | POST | `/api/config/rollback` | write | 两端 | 回滚到指定快照，生成新 revision（EdgeOne 按设备隔离） |
+| GET | `/api/library` | read | **仅 EdgeOne** | 全局资源库（IPTV 源/套餐 + TVBox 源/站点）；无库时返回空库 revision 0 |
+| PUT | `/api/library` | write | **仅 EdgeOne** | 覆盖整库；需 `If-Match`，返回 `{revision, updatedAt, warnings, affectedDevices}` |
 | GET | `/api/devices` | read | **仅 EdgeOne** | 设备注册表（在线/离线、别名、最近下发、拉黑列表、在线判定窗口） |
 | POST | `/api/devices` | write | **仅 EdgeOne** | 8 种管理动作，支持单台 / 批量 |
 | POST | `/api/iptv/fetch` | write | **仅 EdgeOne** | 云端代抓 M3U/M3U8/TXT 订阅（受限代理，一次最多 10 个地址） |
@@ -79,7 +82,13 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
              "epgUrl": "",
              "packages": [{"id": "pkg_cctv", "name": "央视+卫视",
                           "sources": ["https://.../list.m3u"], "channelCount": 2}],
-             "selectedPackageIds": ["pkg_cctv"]}
+             "selectedPackageIds": ["pkg_cctv"],
+             "packageIds": ["pkg_1a2b3c4d"],
+             "lockLibrary": false,
+             "libraryRevision": 7},
+    "vod": {"managed": true, "sourceIds": ["vs_1a2b3c4d"],
+            "siteIds": ["vs_1a2b3c4d:csp_X"],
+            "lockLibrary": false, "libraryRevision": 7}
   }
 }
 ```
@@ -90,9 +99,37 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
 > `{id, name, sources, channelCount}`，不含完整频道列表。带 `?withPackages=1` 才返回
 > 完整套餐库（编辑器编辑套餐时使用）。PUT 时选中套餐会把顶层 `channels` 置空，频道
 > 只在 `packages` 里存一份，避免同一份频道存两遍撑大文档。
+>
+> **EdgeOne 版另有「引用全局资源库」路径**：设备只存 `iptv.packageIds`，
+> 频道在库里存一份，GET 时按下面的四档优先级展开，`packages` 摘要同时包含
+> 「设备内联套餐」与「被引用的库套餐」。客户端拿到的仍是同一个 `channels` 字段，
+> 无需感知区别。上面的示例同时列了 `selectedPackageIds` 与 `packageIds` 以便对照，
+> 实际一台设备通常只用其中一种。
+
+`GET /api/config` 展开 `iptv.channels` 的四档优先级（仅 EdgeOne 有库；FC 版没有库，
+恒走第 3 档）：
+
+1. `iptv.lockLibrary === true`：设备已锁定，**完全忽略资源库**，只用设备内联的
+   `packages` / `selectedPackageIds` / `channels`（即 PUT 时落下的自包含快照）；
+2. 否则 `iptv.packageIds` 非空且库里存在对应套餐：按 `packageIds` 顺序合并库套餐的
+   `channels`，URL 小写去重，上限 3000 条；
+3. 否则回退旧逻辑：`selectedPackageIds` + 内联 `packages`；
+4. 引用库时最后并入设备内联 `channels`（库频道优先去重），让设备能在库之外再挂自己的
+   几个频道。
+
+**懒触发追平（仅 EdgeOne）**：`GET /api/config?deviceId=X` 时，若该设备未锁定
+（`iptv.lockLibrary` 不为 `true`）且确实引用了库（`packageIds` / `vod.sourceIds` /
+`vod.siteIds` 任一非空），而 `iptv.libraryRevision` 与库当前 `revision` 不一致，服务端
+先把这台设备的 `libraryRevision` 追平到库 revision（**只改 revision 标记**，不落盘展开
+后的频道），**然后再做 304 判定**——顺序很关键：先追平再判 304，终端才不会因为
+`since` 命中旧 revision 而漏掉新频道；如果反过来先判 304，库改了设备却永远拿不到更新。
+追平写入**不写快照、不动 revisions 索引**，避免把 100 条人工编辑历史挤掉；写失败
+（并发 409 / 存储抖动）会被吞掉，GET 不会因此失败。
 
 `GET /api/config?since=42` 或 `If-None-Match: "42"` → `304 Not Modified`（空响应体，
-仍带 ETag / X-Revision）。revision 由服务端维护，客户端只能读取。
+仍带 ETag / X-Revision）。revision 由服务端维护，客户端只能读取；`iptv.libraryRevision`
+与 `vod.libraryRevision` 同样由**服务端维护**（客户端提交的值会被接受，但追平逻辑以
+服务端为准）。
 
 **新设备首次拉取（仅 EdgeOne）**：服务端以当前全局模板深拷贝一份独立文档，revision 从
 `max(1, 模板 revision+1)` 起，避免终端带 `since=0` 时被判成 304 而拿不到首包。
@@ -139,6 +176,18 @@ curl -X PUT "$BASE/api/config" \
   `mode` 取 `always` / `once_per_revision` / `never`；`enabled=false` 表示不接管，
   终端沿用本地原弹窗，保证升级平滑。
 - `iptv.packages` / `iptv.selectedPackageIds`：见下方「IPTV 节」。
+- `iptv.packageIds`（string[]，≤ 12、去重）：设备引用的**全局资源库**套餐 id
+  （见「全局资源库」）。格式非法记 warning 并丢弃（类型错误 400）。与
+  `selectedPackageIds` 的区别：后者指向设备内联 `packages`，用于旧编辑器与锁定快照；
+  两者可以并存，展开时 `packageIds` 优先。
+- `iptv.lockLibrary`（bool，默认 `false`）：锁定开关。`true` 表示这台设备冻结在当前
+  内容，忽略资源库后续变化。
+- `iptv.libraryRevision`（int ≥ 0，默认 0）：设备文档已追平到库的哪个 revision，
+  **由服务端维护**（懒触发时 bump），客户端不要自行加一或伪造。
+- `vod`：TVBox 源/站点节，`{managed:false, sourceIds:[], siteIds:[], lockLibrary:false,
+  libraryRevision:0}`。`sourceIds` ≤ 20，元素形如 `vs_1a2b3c4d`；`siteIds` ≤ 500，
+  元素形如 `vs_1a2b3c4d:csp_X`（`^[A-Za-z0-9_:-]{1,96}$`）。设备只存引用，站点清单
+  在库里存一份。老文档没有这一节时读出来自动补默认值。
 
 **IPTV 节（两端一致）**：`channels` 每项为 `{name, url, group?, logo?}`；服务端按
 URL 小写去重，只接受 `http(s)/rtmp(s)/rtsp/udp/mms/p2p` 协议，最多 3000 条。
@@ -151,6 +200,12 @@ URL 小写去重，只接受 `http(s)/rtmp(s)/rtsp/udp/mms/p2p` 协议，最多 
 单份配置文档 `sections` 目标上限 900 KB：EdgeOne 的 PUT 会实际校验并在超限时返回
 `400 invalid_config`，FC 版目前不校验。请求体上限：EdgeOne 2 MiB、FC 1 MiB。
 
+**锁定快照（仅 EdgeOne）**：PUT 时若 `iptv.lockLibrary === true` 且 `iptv.channels`
+为空、`iptv.packageIds` 非空，服务端会用当前资源库**展开一次**，把频道写入
+`channels` / `groups` 并回填 `libraryRevision`（`vod.libraryRevision` 同步回填）。
+这样锁定设备是**自包含**的：离线也能播，库以后怎么改都不影响它。已经带了非空
+`channels` 的请求不会被改写（尊重人工填写的频道）。
+
 **订阅导入分工**：编辑器负责解析 M3U / M3U Plus / TXT genre，云端**只保存解析结果**、
 不定时抓取、不转发直播流。但 EdgeOne 新增 `POST /api/iptv/fetch` 作为**受限云端代理**，
 替编辑器绕过浏览器 CORS 取回订阅文本；FC 版没有该接口，编辑器在云端代抓失败时会
@@ -159,6 +214,112 @@ URL 小写去重，只接受 `http(s)/rtmp(s)/rtsp/udp/mms/p2p` 协议，最多 
 **字段语义补充**：`update.mirrorUrls` 是**完整的 `version.json` URL 列表**（不是镜像域名前缀），
 终端 `VersionUtil._versionUrls` 会直接把它当作下载地址；留空则沿用内置
 GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
+
+## 全局资源库（GET/PUT /api/library，仅 EdgeOne）
+
+> FC 版（`cloud/app.py`）**没有**这两个接口，请求返回 `404 not_supported`。原因：FC 是
+> 「单份全局文档」模型，既没有 per-device 文档，也没有独立的 `library_current` 键位，
+> 懒触发追平无处落地。编辑器连 FC 时会按「服务端未升级」降级（资源库页签提示先升级
+> 云端），配置下发不受影响。FC 的 `sections` 仍完整支持新字段（`vod` 节、
+> `packageIds` / `lockLibrary` / `libraryRevision`），只是引用不会被展开。
+
+资源库与设备文档**解耦**：源、套餐、TVBox 站点在库里存一份，设备只存 id 引用。
+这样「一台设备都没连」时也能先把源和套餐建好，之后新建设备勾选即可。
+
+存储键 `library_current`（KV 或 Blob，与配置文档同一后端），模型：
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": 7,
+  "updatedAt": "2026-11-12T21:00:00+08:00",
+  "iptv": {
+    "sources": [{"id": "s_1a2b3c4d", "name": "央视源",
+                 "url": "https://.../list.m3u", "type": "m3u",
+                 "channelCount": 128, "addedAt": "2026-11-10T09:00:00+08:00", "note": ""}],
+    "packages": [{"id": "pkg_1a2b3c4d", "name": "央视+卫视",
+                  "sources": ["s_1a2b3c4d"],
+                  "channels": [{"name": "CCTV-1", "url": "http://.../1.m3u8",
+                                "group": "央视", "logo": ""}]}],
+    "epgUrl": ""
+  },
+  "vod": {
+    "sources": [{"id": "vs_1a2b3c4d", "name": "某 TVBox 接口",
+                 "url": "https://.../api.php/provide/vod/", "siteCount": 1,
+                 "addedAt": "2026-11-10T09:00:00+08:00", "note": ""}],
+    "sites": [{"id": "vs_1a2b3c4d:csp_X", "sourceId": "vs_1a2b3c4d", "key": "csp_X",
+               "name": "测试站点", "api": "csp_X", "type": 1,
+               "searchable": 1, "quickSearch": 0, "note": ""}]
+  }
+}
+```
+
+### id 规则
+
+| 对象 | 格式 | 说明 |
+|---|---|---|
+| IPTV 源 | `s_` + 8 位十六进制 | 编辑器缺省时由服务端补发 |
+| IPTV 套餐 | `pkg_` + 8 位十六进制 | 同上 |
+| TVBox 源 | `vs_` + 8 位十六进制 | 同上 |
+| TVBox 站点 | `${sourceId}:${key}`，须匹配 `^[A-Za-z0-9_:-]{1,96}$` | 由 `sourceId` + 站点 key 派生；传入的 id 合法且属于同一源时沿用 |
+
+id 是引用目标，格式错了会静默失效，因此**非法 id 直接 400**（内容问题才走 warnings）。
+
+### 上限
+
+| 项 | 上限 | 超限行为 |
+|---|---|---|
+| `iptv.sources` | 30 | warning + 截断 |
+| `iptv.packages` | 12 | warning + 截断 |
+| 所有套餐频道数之和 | 5000 | warning + 按剩余额度截断 |
+| 单个套餐展开后的频道 | 3000 | 展开时截断 |
+| `vod.sources` | 20 | warning + 截断 |
+| `vod.sites` | 500 | warning + 截断 |
+| 单个源下站点 | 200 | warning + 跳过 |
+| 整库 JSON | 900 KB | **400**（提示精简频道或拆套餐） |
+
+### GET /api/library
+
+读令牌。库未写过时返回**空库**（`revision: 0`、`updatedAt: ""`、`iptv/vod` 均为空数组），
+而不是 404，编辑器据此可直接进入编辑态。
+
+```bash
+curl "$BASE/api/library" -H "Authorization: Bearer $READ_TOKEN"
+```
+
+### PUT /api/library
+
+写令牌 + `If-Match: "<revision>"`（或请求体 `expectedRevision`）。缺版本号返回 400，
+版本不匹配返回 409（响应带 `currentRevision` 与当前库文档）。
+
+请求体只传 `{iptv, vod}` 即可，`schemaVersion` / `revision` / `updatedAt` 由服务端维护：
+
+```bash
+curl -X PUT "$BASE/api/library" \
+  -H "Authorization: Bearer $WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H 'If-Match: "7"' \
+  -d '{"iptv":{"sources":[...],"packages":[...],"epgUrl":""},
+       "vod":{"sources":[...],"sites":[...]}}'
+```
+
+成功 `200`：
+
+```json
+{"revision": 8, "updatedAt": "2026-11-12T21:05:00+08:00",
+ "warnings": [], "affectedDevices": 3}
+```
+
+`affectedDevices` 语义：**本次保存前后所有可能受影响的设备台数**——库里的旧 id 与新 id
+都算（被删掉的套餐/站点同样会让引用它的设备下一跳内容变化），统计时**排除已锁定**
+（`iptv.lockLibrary` / `vod.lockLibrary` 为 `true`）以及没有引用这些 id 的设备。它只读
+不写：写库**不会**修改任何设备文档，真正生效发生在设备下次 `GET /api/config`
+（见上文「懒触发追平」）。这个数字用于编辑器提示「预计影响 N 台终端」，不是立即生效
+的保证——离线设备要等下次上线才会追平。
+
+库**不保留快照历史**：它只是共享字典，设备文档里才是真正下发的配置；回滚请针对设备
+文档操作。删除库里的套餐/站点不会级联清理设备上的 id 引用，设备下次展开时取不到内容，
+表现为该部分频道/站点消失（这也是为什么改库前先看 `affectedDevices`）。
 
 ## GET /api/config/revisions 与 POST /api/config/rollback
 
@@ -294,7 +455,7 @@ curl -X POST "$BASE/api/devices" -H "Authorization: Bearer $WRITE_TOKEN" \
 | 400 | `invalid_config` | 请求体/字段不合法、缺少 If-Match、快照不存在、设备动作非法 |
 | 401 | `unauthorized` | Token 缺失或无效 |
 | 403 | `device_blocked` | **仅 EdgeOne**：设备被 `purge` 拉黑后请求 `/api/config` 被拒 |
-| 404 | `not_found` | 未知接口或静态资源；FC 版请求 `/api/devices`、`/api/iptv/fetch` 也返回此码 |
+| 404 | `not_found` / `not_supported` | 未知接口或静态资源；FC 版请求 `/api/devices`、`/api/iptv/fetch`、`/api/library` 也返回此码（`/api/library` 带 `not_supported` 说明） |
 | 405 | `method_not_allowed` | 方法不支持 |
 | 409 | `revision_conflict` | 乐观锁冲突 |
 | 413 | `payload_too_large` | 请求体超限：EdgeOne 2 MiB、FC 1 MiB |
@@ -307,8 +468,11 @@ curl -X POST "$BASE/api/devices" -H "Authorization: Bearer $WRITE_TOKEN" \
 
 | 能力 | EdgeOne | FC / 本地 Python |
 |---|---|---|
-| 配置契约（五节、`seed`、`normalize_sections`） | 一致 | 一致（`cloud/schema.py`） |
+| 配置契约（六节、`seed`、`normalize_sections`） | 一致 | 一致（`cloud/schema.py`） |
 | `GET /api/config` 轻量视图（套餐展开 + `withPackages=1` 剥离） | 有 | 有（`app.py` 调 `expand_iptv_channels`） |
+| `vod` 节、`iptv.packageIds` / `lockLibrary` / `libraryRevision` 字段校验 | 有 | 有（结构兼容，老文档自动补默认值） |
+| `GET/PUT /api/library` 全局资源库 | 有 | **无此接口**（404 `not_supported`） |
+| `packageIds` / `vod.sourceIds` 展开、懒触发追平、锁定快照 | 有 | **无**（没有库可展开；PUT 时给 warning 提示） |
 | `GET/PUT /api/config`、`catalog`、`revisions`、`rollback`、`/health` | 有 | 有 |
 | `ETag` / `X-Revision` / `X-Schema-Version` / 304 / 409 | 有 | 有 |
 | 读写令牌、CORS、`invalid_config` / 401 / 404 / 405 / 409 / 413 / 500 | 有 | 有 |
@@ -322,6 +486,8 @@ curl -X POST "$BASE/api/devices" -H "Authorization: Bearer $WRITE_TOKEN" \
 | `403 device_blocked` / `503 storage_unavailable` | 有 | 无 |
 | `/health` 存储后端探测 / `degraded` | 有 | 无（固定 `ok`、`backend=file`） |
 
-结论：**核心配置契约一致，EdgeOne 版额外提供 `/api/iptv/fetch` 与完整设备管理动作**；
-依赖设备维度、在线状态或云端代抓的功能只在 EdgeOne 部署形态下可用，切回 FC 时这些
-能力不可用，但 `sections` 结构与终端配置读取逻辑不变。
+结论：**核心配置契约一致，EdgeOne 版额外提供 `/api/iptv/fetch`、完整设备管理与
+全局资源库**；依赖设备维度、在线状态、云端代抓或资源库的功能只在 EdgeOne 部署形态下
+可用，切回 FC 时这些能力不可用，但 `sections` 结构与终端配置读取逻辑不变。FC 上
+`packageIds` / `vod.sourceIds` 这类库引用不会被展开（终端拿到空内容），跨形态迁移时
+请先把引用展开成内联频道，或改回 `selectedPackageIds`。

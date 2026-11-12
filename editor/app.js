@@ -12,9 +12,20 @@ const state = {
   showHiddenDevices: false,
   checkedDevices: new Set(),
   drawerDeviceId: '', // 单终端全设置面板当前设备
-  iptvText: '',       // IPTV 导入框里粘贴的文本
-  iptvSummary: '',    // 最近一次解析结果摘要
-  parsedChannels: [], // 最近一次解析出的频道（用于「存为套餐」）
+  // ---- 资源库（与设备无关，GET/PUT /api/library） ----
+  library: null,          // 资源库文档；null = 尚未加载
+  libraryState: 'idle',   // idle | loading | ready | unsupported | error
+  libraryError: '',
+  libraryDirty: false,
+  libUrlText: '',         // 导入区：订阅地址（一行一个）
+  libPasteText: '',       // 导入区：粘贴/文件内容
+  libSummary: '',         // 最近一次解析摘要
+  libParsed: [],          // 最近一次解析出的频道（待入库）
+  libSourcesUsed: [],     // 本次解析涉及的 URL 源 [{name,url,channelCount}]
+  libPreviewId: '',       // 展开预览的套餐 id
+  libAppendTo: '',        // 「追加到已有套餐」当前选择
+  tvboxUrl: '',           // TVBox 配置地址输入
+  tvboxSummary: '',       // TVBox 最近一次导入摘要
   doc: null,
   original: null,
   catalog: null,
@@ -376,20 +387,18 @@ function iptvSection() {
   if (!sections.iptv) {
     sections.iptv = {
       managed: false, sources: [], groups: [], channels: [], epgUrl: '',
-      packages: [], selectedPackageIds: [],
+      packages: [], selectedPackageIds: [], packageIds: [], lockLibrary: false,
     };
   }
   const iptv = sections.iptv;
   if (!Array.isArray(iptv.packages)) iptv.packages = [];
   if (!Array.isArray(iptv.selectedPackageIds)) iptv.selectedPackageIds = [];
+  // packageIds 指向资源库套餐；老文档只有 selectedPackageIds + 内联 packages。
+  if (!Array.isArray(iptv.packageIds)) iptv.packageIds = [];
   if (!Array.isArray(iptv.channels)) iptv.channels = [];
   if (!Array.isArray(iptv.groups)) iptv.groups = [];
   if (!Array.isArray(iptv.sources)) iptv.sources = [];
   return iptv;
-}
-
-function newPackageId() {
-  return 'pkg_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
 }
 
 function mergeChannels(existing, incoming) {
@@ -405,86 +414,400 @@ function mergeChannels(existing, incoming) {
   return out;
 }
 
-/** 解析结果先放在内存里，由用户决定「存为套餐」还是「直接写入当前配置」。 */
-function applyPlaylist(text, source) {
-  const result = parsePlaylist(text);
-  const iptv = iptvSection();
-  state.parsedChannels = result.channels;
-  if (source) {
-    const sources = iptv.sources || [];
-    const list = Array.isArray(source) ? source : [source];
-    for (const url of list) if (url && !sources.includes(url)) sources.push(url);
-    iptv.sources = sources.slice(0, 20);
+/* ---------------- 资源库公共（与设备无关） ---------------- */
+
+const LIBRARY_UNSUPPORTED_HINT = '当前服务端不支持资源库（GET /api/library 未实现），请先升级云端。'
+  + '其它页签不受影响，升级后点「重新加载资源库」即可。';
+
+function arr(value) { return Array.isArray(value) ? value : []; }
+function isObj(value) { return !!value && typeof value === 'object' && !Array.isArray(value); }
+function nowIso() { return new Date().toISOString(); }
+
+/** 服务端要求库 id 形如 pkg_1a2b3c4d / s_… / vs_…（8 位十六进制）。 */
+function hexId(prefix) {
+  const bytes = new Uint8Array(4);
+  if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 4; i += 1) bytes[i] = Math.floor(Math.random() * 256);
   }
-  state.iptvSummary = '解析完成：' + result.channels.length + ' 个频道、'
-    + result.groups.length + ' 个分组'
-    + (result.truncated ? '（已达 3000 条上限，多余的被丢弃）' : '')
-    + '。可存为套餐、追加到已有套餐，或直接写入当前配置。';
-  render();
-  message(state.iptvSummary, 'ok');
+  return prefix + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-function renderIptv() {
+function newLibraryId(kind) {
+  const prefix = kind === 'src' ? 's_' : (kind === 'vod' ? 'vs_' : 'pkg_');
+  const lib = state.library;
+  const taken = new Set();
+  if (lib) {
+    if (kind === 'pkg') for (const pkg of arr(lib.iptv.packages)) taken.add(pkg.id);
+    if (kind === 'src') for (const src of arr(lib.iptv.sources)) taken.add(src.id);
+    if (kind === 'vod') for (const src of arr(lib.vod.sources)) taken.add(src.id);
+  }
+  let id = hexId(prefix);
+  // 8 位十六进制空间够大，正常一两次就够；加个上限防止 RNG 异常时死循环。
+  for (let i = 0; i < 20 && taken.has(id); i += 1) id = hexId(prefix);
+  return id;
+}
+
+/** 连接参数以输入框为准：单独刷新资源库时也要先同步，否则会用到旧令牌。 */
+function syncConnection() {
+  state.base = $('apiBase').value.trim();
+  state.token = $('apiToken').value.trim();
+  state.writeToken = $('apiWriteToken').value.trim();
+}
+
+/** 兼容老服务端/半成品数据：缺失的数组一律补空，避免渲染时到处判空。 */
+function ensureLibrary(raw) {
+  const doc = isObj(raw) ? raw : {};
+  doc.schemaVersion = Number(doc.schemaVersion) || 1;
+  doc.revision = Number(doc.revision) || 0;
+  doc.updatedAt = typeof doc.updatedAt === 'string' ? doc.updatedAt : '';
+  if (!isObj(doc.iptv)) doc.iptv = { sources: [], packages: [], epgUrl: '' };
+  if (!isObj(doc.vod)) doc.vod = { sources: [], sites: [] };
+  if (typeof doc.iptv.epgUrl !== 'string') doc.iptv.epgUrl = '';
+  if (!Array.isArray(doc.iptv.sources)) doc.iptv.sources = [];
+  if (!Array.isArray(doc.iptv.packages)) doc.iptv.packages = [];
+  if (!Array.isArray(doc.vod.sources)) doc.vod.sources = [];
+  if (!Array.isArray(doc.vod.sites)) doc.vod.sites = [];
+  for (const pkg of doc.iptv.packages) {
+    if (!isObj(pkg)) continue;
+    if (!Array.isArray(pkg.channels)) pkg.channels = [];
+    if (!Array.isArray(pkg.sources)) pkg.sources = [];
+  }
+  return doc;
+}
+
+/** 可用时返回套餐数组；返回 null 表示服务端不支持资源库（区分「空库」与「不支持」）。 */
+function libraryPackages() {
+  if (state.libraryState !== 'ready' || !state.library || !isObj(state.library.iptv)) return null;
+  return arr(state.library.iptv.packages);
+}
+function libraryVodSources() {
+  if (state.libraryState !== 'ready' || !state.library || !isObj(state.library.vod)) return null;
+  return arr(state.library.vod.sources);
+}
+function libraryVodSites() {
+  if (state.libraryState !== 'ready' || !state.library || !isObj(state.library.vod)) return null;
+  return arr(state.library.vod.sites);
+}
+
+function formatWhen(value) {
+  if (!value) return '—';
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return String(value);
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+/** 文本输入只改模型、不重绘面板（重绘会打断输入焦点），只点亮「未保存」角标。 */
+function markLibraryDirty() {
+  if (!state.library) return;
+  state.libraryDirty = true;
+  const badge = $('libDirtyBadge');
+  if (badge) badge.hidden = false;
+}
+
+function libraryUnsupportedHtml() {
+  return '<div class="lib-notice">' + esc(LIBRARY_UNSUPPORTED_HINT) + '</div>'
+    + '<div class="toolbar"><button class="ghost" data-lib="reload-library">重新加载资源库</button></div>';
+}
+
+function libraryLoadFailedHtml() {
+  if (state.libraryState !== 'error' || !state.libraryError) return '';
+  return '<div class="lib-notice">加载资源库失败：' + esc(state.libraryError) + '</div>';
+}
+
+/** 套餐 sources 存的是源 id（服务端统一）；兼容旧数据里的 URL。 */
+function findLibrarySource(ref) {
+  const value = String(ref == null ? '' : ref);
+  if (!value) return null;
+  return arr(state.library && state.library.iptv && state.library.iptv.sources)
+    .find((item) => item.id === value || String(item.url || '') === value) || null;
+}
+
+function sourceLabel(ref) {
+  const value = String(ref == null ? '' : ref);
+  if (!value) return '';
+  const src = findLibrarySource(ref);
+  if (src) return src.name || src.url || '';
+  // 源被删掉后残留的 id：显式标注，不要露出一串 s_xxxxxxxx。
+  return /^s_[0-9a-f]{8}$/i.test(value) ? '未知来源(' + value + ')' : value;
+}
+
+function sourceUrlOf(ref) {
+  const src = findLibrarySource(ref);
+  return src ? (src.url || '') : String(ref == null ? '' : ref);
+}
+
+function channelPreviewHtml(channels, limit) {
+  const size = limit || 20;
+  const list = arr(channels);
+  if (!list.length) return '<p class="muted">这个套餐还没有频道。</p>';
+  return '<div class="preview-list">' + list.slice(0, size).map((c) =>
+    '<div>' + esc(c.group || '未分组') + ' · <strong>' + esc(c.name) + '</strong>'
+    + ' <code>' + esc(c.url) + '</code></div>').join('') + '</div>'
+    + (list.length > size ? '<p class="meta">仅显示前 ' + size + ' 条，共 ' + list.length + ' 条。</p>' : '');
+}
+
+/**
+ * 本地（旧）套餐 = 既不在资源库里、也不在 packageIds 引用里的内联套餐。
+ * GET ?withPackages=1 会把「被引用的库套餐」也塞进 iptv.packages，不能用它判断。
+ */
+function legacyInlinePackages(iptv) {
+  const libIds = new Set(arr(libraryPackages()).map((pkg) => pkg.id));
+  const refIds = new Set(arr(iptv.packageIds));
+  return arr(iptv.packages).filter((pkg) => pkg && !libIds.has(pkg.id) && !refIds.has(pkg.id));
+}
+
+function packageChannelCount(pkg) {
+  const list = arr(pkg && pkg.channels).length;
+  if (list) return list;
+  return Number(pkg && pkg.channelCount) || 0;
+}
+
+/** 旧模型残留：设备里内联的 packages / selectedPackageIds，展示 + 一键迁移。 */
+function legacyIptvHtml(iptv) {
+  const inline = legacyInlinePackages(iptv);
+  if (!inline.length) return '';
+  const selected = new Set(arr(iptv.selectedPackageIds));
+  return '<h3>本地（旧）套餐</h3>'
+    + '<p class="hint">这些套餐还保存在本配置的 <code>iptv.packages</code> 里（旧模型）。'
+    + '可以继续用；迁移到资源库后即可按套餐统一维护、多终端复用。</p>'
+    + '<div class="lib-list">' + inline.map((pkg) =>
+      '<div class="lib-row"><strong>' + esc(pkg.name || pkg.id) + '</strong>'
+      + '<span class="meta">' + packageChannelCount(pkg) + ' 个频道</span>'
+      + (selected.has(pkg.id) ? '<span class="badge">当前勾选</span>' : '')
+      + '</div>').join('') + '</div>'
+    + '<div class="toolbar"><button class="ghost" data-lib="migrate-inline">迁移到资源库</button></div>';
+}
+
+/** 「IPTV 下发」页签：只给当前选中的终端勾选资源库套餐 + 锁定开关。 */
+function renderIptvDispatch() {
+  if (!state.doc) return '<p class="muted">请先点击右上角「连接并加载」。</p>';
+  const head = '<h2>IPTV 套餐下发</h2>';
+  if (!state.deviceId) {
+    return head
+      + '<p class="hint">请先在终端管理里选择一台终端（或在顶部「配置对象」里选中它），再勾选套餐。</p>'
+      + '<div class="lib-notice">未选择终端：这里只负责勾选，不会改动资源库本身。</div>'
+      + '<div class="toolbar"><button class="ghost" data-action="goto-devices">去终端管理</button></div>';
+  }
   const iptv = iptvSection();
-  const packages = iptv.packages || [];
-  const selected = iptv.selectedPackageIds || [];
-  const list = iptv.channels || [];
-  const preview = list.slice(0, 25).map((c) =>
-    '<div>' + esc(c.group || '未分组') + ' · <strong>' + esc(c.name) + '</strong> '
-    + '<code>' + esc(c.url) + '</code></div>').join('');
-  const packageRows = packages.map((pkg) => {
-    const count = (pkg.channels || []).length;
-    const groups = [...new Set((pkg.channels || []).map((c) => c.group).filter(Boolean))];
-    return '<div class="pkg-row">'
-      + '<label class="pkg-check"><input type="checkbox" data-pkg="' + esc(pkg.id) + '"'
-      + (selected.includes(pkg.id) ? ' checked' : '') + '> <strong>' + esc(pkg.name) + '</strong></label>'
-      + '<span class="meta">' + count + ' 个频道 · ' + groups.length + ' 个分组'
-      + (groups.length ? '（' + esc(groups.slice(0, 3).join('、')) + '…）' : '') + '</span>'
-      + '<span class="meta">' + esc((pkg.sources || []).join('、') || '本地/粘贴导入') + '</span>'
-      + '<span class="pkg-actions">'
-      + '<button class="tiny" data-iptv="append-package" data-id="' + esc(pkg.id)
-      + '">追加解析结果</button> '
-      + '<button class="tiny" data-iptv="delete-package" data-id="' + esc(pkg.id)
-      + '">删除</button></span></div>';
+  const pkgs = libraryPackages();
+  const picked = new Set(arr(iptv.packageIds));
+  const picker = pkgs === null
+    ? libraryUnsupportedHtml()
+    : (pkgs.length
+      ? '<div class="df-multi">' + pkgs.map((pkg) => {
+        const count = arr(pkg.channels).length;
+        return '<label><input type="checkbox" data-pkg="' + esc(pkg.id) + '"'
+          + (picked.has(pkg.id) ? ' checked' : '') + '> ' + esc(pkg.name)
+          + '（' + count + ' 个频道）</label>';
+      }).join('') + '</div>'
+      : '<p class="meta">资源库里还没有套餐，请先到「IPTV 源」页导入源并创建套餐。</p>');
+
+  return head
+    + '<p class="hint">当前对象：<strong>' + esc(deviceLabel()) + '</strong>。'
+    + '这里只勾选这台终端要下发的资源库套餐，套餐内容统一在「IPTV 源」页维护。</p>'
+    + managedHtml('iptv', ' IPTV 频道')
+    + '<h3>资源库套餐</h3>' + picker
+    + (pkgs === null ? '' :
+      '<div class="checkline"><input class="switch" type="checkbox" data-path="iptv.lockLibrary"'
+      + (iptv.lockLibrary ? ' checked' : '') + '><span>锁定资源库</span>'
+      + '<small>锁定后该终端不再跟随资源库变化，保持当前频道表</small></div>')
+    + legacyIptvHtml(iptv)
+    + '<p class="hint">勾选变化会记下当时的资源库 revision；保存仍走顶部「保存到云端」，只影响这台终端。</p>';
+}
+
+/* ---------------- IPTV 源页（库层） ---------------- */
+
+const LIBRARY_HEAD = '<h2>IPTV 源 · 频道套餐库</h2>'
+  + '<p class="hint">资源库与终端无关：先导入 M3U / TXT 源、组成套餐，'
+  + '再到「IPTV 下发」或「终端管理」里给终端勾选套餐。终端没连也能编辑资源库。</p>';
+
+function libraryToolbar(doc) {
+  return '<div class="toolbar">'
+    + '<button class="primary" data-lib="save-library">保存资源库</button>'
+    + '<button class="ghost" data-lib="reload-library">重新加载</button>'
+    + '<span class="badge">资源库 revision ' + esc(doc.revision) + '</span>'
+    + (doc.updatedAt ? '<span class="meta">更新于 ' + esc(formatWhen(doc.updatedAt)) + '</span>' : '')
+    + '<span class="badge warn" id="libDirtyBadge"' + (state.libraryDirty ? '' : ' hidden')
+    + '>有未保存改动</span>'
+    + '</div>';
+}
+
+function renderIptvLibrary() {
+  if (state.libraryState === 'unsupported') return LIBRARY_HEAD + libraryUnsupportedHtml();
+  if (!state.library) {
+    return LIBRARY_HEAD + libraryLoadFailedHtml()
+      + '<p class="muted">资源库尚未加载。请先点击右上角「连接并加载」，或单独加载资源库。</p>'
+      + '<div class="toolbar"><button class="ghost" data-lib="reload-library">加载资源库</button></div>';
+  }
+  const doc = state.library;
+  const iptv = doc.iptv;
+  const sources = arr(iptv.sources);
+  const packages = arr(iptv.packages);
+
+  const sourceRows = sources.map((src) =>
+    '<tr>'
+    + '<td><input class="lib-input" data-lib-input="source-name" data-id="' + esc(src.id)
+    + '" value="' + esc(src.name || '') + '"></td>'
+    + '<td><code title="' + esc(src.url || '') + '">' + esc(src.url || '—') + '</code></td>'
+    + '<td>' + esc(src.channelCount || 0) + '</td>'
+    + '<td><span class="meta">' + esc(formatWhen(src.addedAt)) + '</span></td>'
+    + '<td><input class="lib-input" data-lib-input="source-note" data-id="' + esc(src.id)
+    + '" value="' + esc(src.note || '') + '" placeholder="备注"></td>'
+    + '<td><button class="tiny danger" data-lib="delete-source" data-id="' + esc(src.id)
+    + '">删除</button></td></tr>').join('');
+
+  const parsedBlock = state.libSummary
+    ? '<p class="hint">' + esc(state.libSummary) + '</p>'
+      + (state.libParsed.length ? channelPreviewHtml(state.libParsed, 20) : '')
+    : '';
+
+  const pkgRows = packages.map((pkg) => {
+    const count = arr(pkg.channels).length;
+    const open = state.libPreviewId === pkg.id;
+    const srcs = arr(pkg.sources).map(sourceLabel).filter(Boolean);
+    return '<div class="lib-row">'
+      + '<input class="lib-input lib-name" data-lib-input="pkg-name" data-id="' + esc(pkg.id)
+      + '" value="' + esc(pkg.name || '') + '">'
+      + '<span class="meta">' + count + ' 个频道</span>'
+      + '<span class="meta lib-src" title="' + esc(arr(pkg.sources).map(sourceUrlOf).join('、')) + '">'
+      + esc(srcs.length ? srcs.join('、') : '本地/粘贴导入') + '</span>'
+      + '<span class="lib-row-ops">'
+      + '<button class="tiny" data-lib="preview-package" data-id="' + esc(pkg.id) + '">'
+      + (open ? '收起' : '预览') + '</button>'
+      + '<button class="tiny danger" data-lib="delete-package" data-id="' + esc(pkg.id)
+      + '">删除</button></span></div>'
+      + (open ? channelPreviewHtml(pkg.channels, 20) : '');
   }).join('');
 
-  return managedHtml('iptv', 'IPTV 频道与套餐')
+  return LIBRARY_HEAD
+    + libraryToolbar(doc)
+
+    + '<h3>订阅源（' + sources.length + '）</h3>'
+    + '<p class="hint">每导入一个 URL 就会登记一条源（最多 30 条），频道数是最近一次解析的数量，'
+    + '可在备注里写来源说明。</p>'
+    + (sources.length
+      ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>URL</th><th>频道数</th>'
+        + '<th>添加时间</th><th>备注</th><th></th></tr></thead><tbody>' + sourceRows + '</tbody></table>'
+      : '<p class="muted">还没有源，先在下面导入。</p>')
+
+    + '<h3>导入源</h3>'
     + '<div class="iptv-tools">'
-    + '<div class="grow"><span>订阅地址（http/https，一行一个，云端代抓不受 CORS 限制）</span>'
-    + '<textarea data-iptv="urls" placeholder="https://example.com/list.m3u">'
-    + esc((iptv.sources || []).join('\n')) + '</textarea></div>'
+    + '<div class="grow"><span>订阅地址（一行一个，云端代抓不受 CORS 限制）</span>'
+    + '<textarea data-lib-input="import-urls" placeholder="https://example.com/list.m3u">'
+    + esc(state.libUrlText) + '</textarea></div>'
     + '<div class="grow"><span>或粘贴 M3U / M3U8 / TXT 内容</span>'
-    + '<textarea data-iptv="text" placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;央视&quot;,CCTV1&#10;http://...">'
-    + esc(state.iptvText) + '</textarea></div>'
+    + '<textarea data-lib-input="import-text" placeholder="#EXTM3U&#10;#EXTINF:-1 group-title=&quot;央视&quot;,CCTV1&#10;http://...">'
+    + esc(state.libPasteText) + '</textarea></div>'
     + '<div><span>本地文件（txt / m3u，自动识别 GBK）</span><br>'
-    + '<input type="file" data-iptv="file" accept=".m3u,.m3u8,.txt"></div>'
+    + '<input type="file" data-lib-input="import-file" accept=".m3u,.m3u8,.txt"></div>'
     + '</div>'
     + '<div class="toolbar">'
-    + '<button class="primary" data-iptv="fetch">云端抓取 URL 并解析</button>'
-    + '<button class="ghost" data-iptv="parse">解析粘贴内容</button>'
-    + '<button class="ghost" data-iptv="direct">直接写入当前配置（不走套餐）</button>'
-    + '<button class="ghost" data-iptv="clear">清空频道</button>'
+    + '<button class="primary" data-lib="fetch-urls">云端抓取并解析</button>'
+    + '<button class="ghost" data-lib="parse-text">解析粘贴内容</button>'
+    + '<button class="ghost" data-lib="clear-parse">清空解析结果</button>'
     + '</div>'
     + '<p class="hint">支持标准 M3U / M3U Plus（group-title、tvg-logo）与 TXT genre'
     + '（分组,#genre# + 名称,url，多线路用 # 分隔）。按地址去重，仅保留'
-    + ' http/https/rtmp/rtsp/udp/mms/p2p，单个套餐最多 3000 条、套餐库合计 5000 条。'
-    + '网络链接由云端代理抓取并自动识别 UTF-8 / GBK；云端只搬运文本，不抓定时订阅、不转流。</p>'
-    + (state.iptvSummary ? '<p class="hint">' + esc(state.iptvSummary) + '</p>' : '')
+    + ' http/https/rtmp/rtsp/udp/mms/p2p，单个套餐最多 3000 条。云端只搬运文本，不转流。</p>'
+    + parsedBlock
 
     + '<h3>组成套餐</h3>'
     + '<div class="toolbar">'
-    + '<input class="pkg-name" data-iptv="pkg-name" placeholder="套餐名称，例如：央视+卫视">'
-    + '<button class="primary" data-iptv="save-package">存为新套餐</button>'
+    + '<input class="pkg-name" data-lib-input="new-package-name" placeholder="套餐名称，例如：央视+卫视">'
+    + '<button class="primary" data-lib="create-package">存为新套餐</button>'
     + '</div>'
-    + '<p class="hint">套餐是频道库。勾中套餐后，当前配置对象（'
-    + esc(state.deviceId ? deviceLabel() : '全局模板') + '）只会把勾中套餐的频道下发给终端；'
-    + '不同终端可以选不同套餐。最多 12 个套餐。</p>'
-    + '<div class="pkg-list">' + (packageRows || '<p class="muted">还没有套餐，先导入源再「存为新套餐」。</p>') + '</div>'
+    + (packages.length
+      ? '<div class="toolbar">'
+        + '<select class="pkg-name" data-lib-input="append-target">'
+        + packages.map((pkg) => '<option value="' + esc(pkg.id) + '"'
+          + (state.libAppendTo === pkg.id ? ' selected' : '') + '>' + esc(pkg.name || pkg.id)
+          + '（' + arr(pkg.channels).length + ' 个频道）</option>').join('')
+        + '</select>'
+        + '<button class="ghost" data-lib="append-package">追加到已有套餐（合并去重）</button>'
+        + '</div>'
+      : '')
+    + '<p class="hint">「存为新套餐」把本次解析出的频道写成新套餐，并把本次用到的 URL 记入上面的订阅源列表。'
+    + '套餐名和订阅源名称都可以直接在上面/下面的输入框里改（改完记得保存资源库）。</p>'
 
-    + textField('iptv.epgUrl', 'EPG 地址（可选，http/https）', 'text')
-    + '<p><strong>当前下发 ' + list.length + ' 个频道 / ' + (iptv.groups || []).length
-    + ' 个分组</strong>（选中套餐时由云端展开，保存后生效）</p>'
-    + '<div class="preview-list">' + (preview || '<p class="muted">暂无频道</p>') + '</div>';
+    + '<h3>频道套餐（' + packages.length + '）</h3>'
+    + (packages.length
+      ? '<div class="lib-list">' + pkgRows + '</div>'
+      : '<p class="muted">还没有套餐，先导入源再「存为新套餐」。</p>')
+
+    + '<div class="field" style="margin-top:18px"><span>EPG 地址（可选，http/https）</span>'
+    + '<input type="text" data-lib-input="epg-url" value="' + esc(iptv.epgUrl || '') + '"></div>';
+}
+
+/* ---------------- TVBox 源页（库层） ---------------- */
+
+const VOD_HEAD = '<h2>TVBox 源 · 站点库</h2>'
+  + '<p class="hint">资源库与终端无关：先添加 TVBox 配置源，站点会按源分组入库，'
+  + '再到「终端管理」里给终端勾选整源或单个站点。</p>';
+
+function renderVodLibrary() {
+  if (state.libraryState === 'unsupported') return VOD_HEAD + libraryUnsupportedHtml();
+  if (!state.library) {
+    return VOD_HEAD + libraryLoadFailedHtml()
+      + '<p class="muted">资源库尚未加载。请先点击右上角「连接并加载」，或单独加载资源库。</p>'
+      + '<div class="toolbar"><button class="ghost" data-lib="reload-library">加载资源库</button></div>';
+  }
+  const doc = state.library;
+  const sources = arr(doc.vod.sources);
+  const sites = arr(doc.vod.sites);
+  const countOf = (sourceId) => sites.filter((site) => site.sourceId === sourceId).length;
+
+  const sourceRows = sources.map((src) =>
+    '<tr>'
+    + '<td><strong>' + esc(src.name || src.id) + '</strong></td>'
+    + '<td><code title="' + esc(src.url || '') + '">' + esc(src.url || '—') + '</code></td>'
+    + '<td>' + countOf(src.id) + '</td>'
+    + '<td><span class="meta">' + esc(formatWhen(src.addedAt)) + '</span></td>'
+    + '<td><button class="tiny danger" data-lib="delete-vod-source" data-id="' + esc(src.id)
+    + '">删除</button></td></tr>').join('');
+
+  const groups = sources.map((src) => {
+    const own = sites.filter((site) => site.sourceId === src.id);
+    if (!own.length) return '';
+    const rows = own.map((site) =>
+      '<div class="lib-site-row"><code>' + esc(site.key) + '</code>'
+      + '<span class="lib-site-name">' + esc(site.name || site.key) + '</span>'
+      + '<code class="lib-site-api" title="' + esc(site.api || '') + '">' + esc(site.api || '') + '</code>'
+      + '<input class="lib-input" data-lib-input="site-note" data-id="' + esc(site.id)
+      + '" value="' + esc(site.note || '') + '" placeholder="备注"></div>').join('');
+    return '<div class="lib-source-block">'
+      + '<div class="lib-source-head"><strong>' + esc(src.name || src.id) + '</strong>'
+      + '<span class="meta">' + own.length + ' 个站点</span>'
+      + '<code class="lib-site-api">' + esc(src.url || '') + '</code></div>'
+      + '<div class="lib-scroll">' + rows + '</div></div>';
+  }).join('');
+
+  return VOD_HEAD
+    + libraryToolbar(doc)
+
+    + '<h3>添加源</h3>'
+    + '<div class="toolbar">'
+    + '<input class="pkg-name" data-lib-input="tvbox-url" placeholder="https://example.com/tvbox.json"'
+    + ' value="' + esc(state.tvboxUrl) + '">'
+    + '<button class="primary" data-lib="add-vod-source">云端抓取并解析</button>'
+    + '</div>'
+    + '<p class="hint">从配置里取 <code>sites</code>，映射成库站点；'
+    + '<code>api</code> 不是 http(s):// 或 csp_ 开头、<code>key</code> 缺失或重复的站点会被跳过并统计。'
+    + '同时兼容顶层数组，以及 <code>urls</code> 里指向多份子配置的写法（最多取 5 个子配置）。</p>'
+    + (state.tvboxSummary ? '<p class="hint">' + esc(state.tvboxSummary) + '</p>' : '')
+
+    + '<h3>源列表（' + sources.length + '）</h3>'
+    + (sources.length
+      ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>URL</th><th>站点数</th>'
+        + '<th>添加时间</th><th></th></tr></thead><tbody>' + sourceRows + '</tbody></table>'
+      : '<p class="muted">还没有 TVBox 源，先在上面添加。</p>')
+
+    + '<h3>站点（' + sites.length + '）</h3>'
+    + (groups || '<p class="muted">还没有站点。</p>');
 }
 
 function agoText(seconds) {
@@ -632,129 +955,622 @@ function onBatchAction(kind) {
   else if (kind === 'restore') deviceAction('restore', ids);
 }
 
-/** 云端代抓订阅：绕过浏览器 CORS，一次可抓多个地址并自动识别 UTF-8 / GBK。 */
-async function fetchIptvUrl() {
-  const box = document.querySelector('[data-iptv="urls"]');
-  const urls = (box ? box.value : '').split('\n').map((x) => x.trim())
-    .filter((x) => /^https?:\/\//i.test(x)).slice(0, 10);
-  if (!urls.length) { message('请先在「订阅地址」里填至少一个 http(s) 地址', 'err'); return; }
-  statusText('正在云端抓取订阅…');
+/* ---------------- 资源库读写 ---------------- */
+
+/** 加载资源库。force=false 时若本地有未保存改动，跳过重载以免丢失编辑。 */
+async function loadLibrary(force) {
+  if (!force && state.libraryDirty && state.library) { state.libraryState = 'ready'; return; }
+  syncConnection();
+  state.libraryState = 'loading';
   try {
-    const data = await request('/api/iptv/fetch', {
-      write: true, method: 'POST', body: JSON.stringify({ urls }),
-    });
-    const failed = (data.results || []).filter((item) => !item.ok);
-    if (!data.text) {
-      statusText('抓取失败');
-      message('抓取失败：' + failed.map((item) => item.url + ' → ' + item.error).join('；'), 'err');
+    const raw = await request('/api/library');
+    // 老服务端的 catch-all 可能把 index.html 当 200 返回，这里一并视为「未升级」。
+    if (!isObj(raw) || !isObj(raw.iptv)) {
+      state.library = null;
+      state.libraryError = '';
+      state.libraryState = 'unsupported';
       return;
     }
-    state.iptvText = data.text;
-    const textBox = document.querySelector('[data-iptv="text"]');
-    if (textBox) textBox.value = data.text;
-    applyPlaylist(data.text, urls);
-    statusText('已连接（' + deviceLabel() + '）');
-    message('云端抓取完成：' + data.succeeded + '/' + data.total + ' 个源'
-      + (failed.length ? '；失败：' + failed.map((item) => item.url + ' → ' + item.error).join('；') : ''),
-    failed.length ? 'err' : 'ok');
+    state.library = ensureLibrary(clone(raw));
+    state.libraryDirty = false;
+    state.libraryState = 'ready';
+    state.libraryError = '';
+    state.libParsed = [];
+    state.libSourcesUsed = [];
+    state.libSummary = '';
+    state.libPreviewId = '';
   } catch (error) {
-    // 兼容尚未部署 /api/iptv/fetch 的自建服务：退回浏览器直连（仍受 CORS 限制）。
-    try {
-      const response = await fetch(urls[0], { headers: { Accept: '*/*' } });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      const text = await response.text();
-      state.iptvText = text;
-      applyPlaylist(text, urls.slice(0, 1));
-      message('已用浏览器直连抓取（云端代理不可用）。源站未开放 CORS 时请改用本地文件。', 'ok');
-    } catch (fallback) {
-      statusText('抓取失败');
-      message('抓取失败：' + error.message + '；浏览器直连也失败：' + fallback.message
-        + '。请下载后用「本地文件」导入，或直接粘贴内容。', 'err');
+    state.library = null;
+    if (error.status === 404 || error.status === 405) {
+      state.libraryError = '';
+      state.libraryState = 'unsupported';
+    } else {
+      state.libraryError = error.message
+        + (error.status === 401 ? '（请检查「访问令牌（读）」）' : '');
+      state.libraryState = 'error';
     }
   }
 }
 
-function parsedChannelsOrWarn() {
-  if (!state.parsedChannels.length) {
-    message('请先「云端抓取 URL」「解析粘贴内容」或选择本地文件，再执行这一步。', 'err');
-    return false;
+async function saveLibrary() {
+  if (!state.library) { message('资源库尚未加载。', 'err'); return; }
+  if (!state.libraryDirty) { toast('资源库没有改动'); return; }
+  clearMessage();
+  try {
+    const result = await request('/api/library', {
+      write: true,
+      method: 'PUT',
+      headers: { 'If-Match': '"' + state.library.revision + '"' },
+      body: JSON.stringify({
+        iptv: state.library.iptv,
+        vod: state.library.vod,
+        expectedRevision: state.library.revision,
+      }),
+    });
+    state.library.revision = Number(result && result.revision) || state.library.revision;
+    if (result && result.updatedAt) state.library.updatedAt = result.updatedAt;
+    state.libraryDirty = false;
+    state.libraryState = 'ready';
+    const affected = Number(result && result.affectedDevices) || 0;
+    const warnings = arr(result && result.warnings);
+    message('资源库已保存，revision ' + state.library.revision + '。'
+      + '预计影响 ' + affected + ' 台终端，它们会在下次同步时自动更新。'
+      + (warnings.length ? '\n服务端提示：\n' + warnings.join('\n') : ''), 'ok');
+    render();
+  } catch (error) {
+    if (error.status === 409) {
+      const current = error.data && error.data.currentRevision;
+      message('保存失败：资源库已被其他人修改'
+        + (current != null ? '（当前 revision ' + current + '）' : '')
+        + '。请点「重新加载」拿到最新版本后再改。', 'err');
+    } else {
+      const guide = error.status === 401
+        ? '\n\n「保存令牌（写）」请填 CONFIG_WRITE_TOKEN。读令牌只能用于加载，保存会 401。'
+        : '';
+      message('保存资源库失败：' + error.message + hintOf(error) + guide, 'err');
+    }
+    render();
   }
-  return true;
 }
 
-function onIptvAction(button) {
-  const kind = button.dataset.iptv;
-  const iptv = iptvSection();
-  if (kind === 'parse') {
-    const box = document.querySelector('[data-iptv="text"]');
-    const text = box ? box.value : '';
-    state.iptvText = text;
-    if (!text.trim()) { message('请先粘贴内容或选择本地文件', 'err'); return; }
-    applyPlaylist(text, '');
-  } else if (kind === 'fetch') {
-    fetchIptvUrl();
-  } else if (kind === 'direct') {
-    if (!parsedChannelsOrWarn()) return;
-    iptv.channels = state.parsedChannels.slice(0, 3000);
-    iptv.groups = [...new Set(iptv.channels.map((c) => c.group).filter(Boolean))];
-    iptv.selectedPackageIds = [];
-    iptv.managed = true;
-    markDirty();
-    render();
-    message('已把 ' + iptv.channels.length + ' 个频道直接写入当前配置（不使用套餐）。保存后下发。', 'ok');
-  } else if (kind === 'save-package') {
-    if (!parsedChannelsOrWarn()) return;
-    const nameBox = document.querySelector('[data-iptv="pkg-name"]');
-    const name = (nameBox ? nameBox.value : '').trim().slice(0, 64) || ('套餐 ' + (iptv.packages.length + 1));
-    if (iptv.packages.length >= 12) { message('最多 12 个套餐，请先删除不用的套餐。', 'err'); return; }
-    const sources = (iptv.sources || []).slice(-5);
-    iptv.packages.push({
-      id: newPackageId(), name, sources,
-      channels: state.parsedChannels.slice(0, 3000),
+/** 云端代抓单个地址；失败时退回浏览器直连（仍受 CORS 限制）。 */
+async function fetchRemoteText(url) {
+  let cloudError = '';
+  try {
+    const data = await request('/api/iptv/fetch', {
+      write: true, method: 'POST', body: JSON.stringify({ urls: [url] }),
     });
-    iptv.managed = true;
-    markDirty();
+    if (data && typeof data.text === 'string' && data.text) return data.text;
+    const failed = arr(data && data.results).filter((item) => !item.ok);
+    cloudError = (failed[0] && failed[0].error) || '云端未返回内容';
+  } catch (error) {
+    cloudError = error.message;
+  }
+  const response = await fetch(url, { headers: { Accept: '*/*' } });
+  if (!response.ok) throw new Error(cloudError + '；浏览器直连 HTTP ' + response.status);
+  return response.text();
+}
+
+function sourceNameFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const raw = parsed.pathname.split('/').filter(Boolean).pop() || '';
+    let name = raw;
+    try { name = decodeURIComponent(raw); } catch (_) { /* 保留原样 */ }
+    return (name || parsed.hostname).slice(0, 64);
+  } catch (_) {
+    return String(url || '').slice(0, 64);
+  }
+}
+
+function readLibInput(kind) {
+  const node = document.querySelector('[data-lib-input="' + kind + '"]');
+  if (!node) return '';
+  return String(node.value == null ? '' : node.value);
+}
+
+/** 统一收口解析结果：写入待入库频道 + 摘要，并刷新页面。 */
+function setLibraryParseResult(text, sourcesUsed, note) {
+  const result = parsePlaylist(text);
+  state.libParsed = result.channels;
+  state.libSourcesUsed = arr(sourcesUsed);
+  state.libSummary = '解析完成：' + result.channels.length + ' 个频道'
+    + (state.libSourcesUsed.length ? '，来自 ' + state.libSourcesUsed.length + ' 个源' : '')
+    + (result.groups.length ? '，' + result.groups.length + ' 个分组' : '')
+    + (result.truncated ? '（已达 3000 条上限，多余的被丢弃）' : '')
+    + (note ? '。' + note : '');
+  render();
+  message(state.libSummary, result.channels.length ? 'ok' : 'err');
+}
+
+function parseLibraryText() {
+  const box = document.querySelector('[data-lib-input="import-text"]');
+  const text = box ? box.value : state.libPasteText;
+  state.libPasteText = text;
+  if (!text.trim()) { message('请先粘贴 M3U / TXT 内容，或选择本地文件。', 'err'); return; }
+  setLibraryParseResult(text, [], '');
+}
+
+async function fetchLibraryUrls() {
+  const box = document.querySelector('[data-lib-input="import-urls"]');
+  const text = box ? box.value : state.libUrlText;
+  state.libUrlText = text;
+  const urls = text.split('\n').map((line) => line.trim())
+    .filter((line) => /^https?:\/\//i.test(line)).slice(0, 10);
+  if (!urls.length) { message('请先在「订阅地址」里填至少一个 http(s) 地址。', 'err'); return; }
+  statusText('正在云端抓取订阅…');
+  const texts = [];
+  const used = [];
+  const failed = [];
+  for (const url of urls) {
+    try {
+      const body = await fetchRemoteText(url);
+      const parsed = parsePlaylist(body);
+      used.push({ name: sourceNameFromUrl(url), url, channelCount: parsed.channels.length, type: 'url' });
+      texts.push(body);
+    } catch (error) {
+      failed.push(url + ' → ' + error.message);
+    }
+  }
+  statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
+  if (!texts.length) {
+    message('抓取失败：' + failed.join('；')
+      + '。可下载后用「本地文件」导入，或直接粘贴内容。', 'err');
+    return;
+  }
+  state.libPasteText = texts.join('\n');
+  setLibraryParseResult(texts.join('\n'), used,
+    failed.length ? '部分源失败：' + failed.join('；') : '');
+}
+
+/** 把本次解析用到的 URL 记进订阅源列表（同 URL 只更新频道数），返回 url → 源 id 映射。 */
+function registerLibrarySources() {
+  const list = arr(state.library && state.library.iptv && state.library.iptv.sources);
+  const byUrl = new Map();
+  for (const item of state.libSourcesUsed) {
+    if (!item.url) continue;
+    const hit = list.find((src) => String(src.url || '').toLowerCase() === item.url.toLowerCase());
+    if (hit) {
+      hit.channelCount = item.channelCount;
+      if (!hit.name) hit.name = item.name;
+      byUrl.set(item.url, hit.id);
+      continue;
+    }
+    if (list.length >= 30) continue; // 与 contract.js 的 MAX_LIBRARY_SOURCES 对齐
+    const id = newLibraryId('src');
+    list.push({
+      id,
+      name: item.name,
+      url: item.url,
+      type: item.type || 'url',
+      channelCount: item.channelCount,
+      addedAt: nowIso(),
+      note: '',
+    });
+    byUrl.set(item.url, id);
+  }
+  if (state.library && state.library.iptv) state.library.iptv.sources = list;
+  return byUrl;
+}
+
+function createPackageFromParse(nameInput) {
+  if (!state.library) { message('资源库尚未加载。', 'err'); return; }
+  if (!state.libParsed.length) { message('请先抓取或解析出频道，再存为套餐。', 'err'); return; }
+  const packages = arr(state.library.iptv.packages);
+  if (packages.length >= MAX_IPTV_PACKAGES) {
+    message('资源库最多 ' + MAX_IPTV_PACKAGES + ' 个套餐，请先删除不用的套餐。', 'err');
+    return;
+  }
+  const name = String(nameInput || '').trim().slice(0, 64) || ('套餐 ' + (packages.length + 1));
+  const pkg = {
+    id: newLibraryId('pkg'),
+    name,
+    sources: [],
+    channels: clone(state.libParsed),
+  };
+  packages.push(pkg);
+  // 服务端 packages[].sources 统一存源 id，这里先换算好，避免本地/云端两种形态来回跳。
+  const byUrl = registerLibrarySources();
+  pkg.sources = [...new Set(state.libSourcesUsed.map((item) => byUrl.get(item.url)).filter(Boolean))];
+  state.library.iptv.packages = packages;
+  const summary = '已创建套餐「' + name + '」（' + state.libParsed.length
+    + ' 个频道）。记得点「保存资源库」。';
+  state.libParsed = [];
+  state.libSourcesUsed = [];
+  state.libSummary = summary;
+  markLibraryDirty();
+  render();
+  message(summary, 'ok');
+}
+
+function appendToPackage() {
+  if (!state.library) { message('资源库尚未加载。', 'err'); return; }
+  if (!state.libParsed.length) { message('请先抓取或解析出频道，再追加到套餐。', 'err'); return; }
+  const id = state.libAppendTo || readLibInput('append-target');
+  const pkg = arr(state.library.iptv.packages).find((item) => item.id === id);
+  if (!pkg) { message('请选择要追加的套餐。', 'err'); return; }
+  const before = arr(pkg.channels).length;
+  pkg.channels = mergeChannels(pkg.channels, state.libParsed);
+  const byUrl = registerLibrarySources();
+  const newIds = state.libSourcesUsed.map((item) => byUrl.get(item.url)).filter(Boolean);
+  pkg.sources = [...new Set(arr(pkg.sources).concat(newIds))].slice(0, 20);
+  const summary = '已向「' + pkg.name + '」追加 ' + (pkg.channels.length - before)
+    + ' 个频道（现有 ' + pkg.channels.length + ' 个）。记得点「保存资源库」。';
+  state.libSummary = summary;
+  markLibraryDirty();
+  render();
+  message(summary, 'ok');
+}
+
+function clearParseResult() {
+  state.libParsed = [];
+  state.libSourcesUsed = [];
+  state.libSummary = '';
+  render();
+  toast('已清空解析结果');
+}
+
+function readLibraryFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const bytes = new Uint8Array(reader.result || new ArrayBuffer(0));
+    let text = new TextDecoder('utf-8').decode(bytes);
+    const badUtf8 = (text.match(/\uFFFD/g) || []).length;
+    if (badUtf8 > 0) {
+      try {
+        const gbk = new TextDecoder('gbk').decode(bytes);
+        if ((gbk.match(/\uFFFD/g) || []).length < badUtf8) text = gbk;
+      } catch (_) { /* 浏览器不支持 GBK 时保留 UTF-8 结果 */ }
+    }
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    state.libPasteText = text;
+    const box = document.querySelector('[data-lib-input="import-text"]');
+    if (box) box.value = text;
+    setLibraryParseResult(text, [], '本地文件：' + file.name);
+  };
+  reader.onerror = () => message('文件读取失败', 'err');
+  reader.readAsArrayBuffer(file);
+}
+
+async function reloadLibrary() {
+  if (state.libraryDirty && !window.confirm('资源库有未保存的改动，重新加载会丢弃，继续？')) return;
+  state.libraryDirty = false;
+  statusText('正在加载资源库…');
+  await loadLibrary(true);
+  render();
+  if (state.libraryState === 'unsupported') message(LIBRARY_UNSUPPORTED_HINT, 'err');
+  else if (state.libraryState === 'error') message('加载资源库失败：' + state.libraryError, 'err');
+  else {
+    statusText(state.doc ? '已连接（' + deviceLabel() + '）' : '资源库已加载');
+    toast('资源库已加载');
+  }
+}
+
+/* ---------------- 资源库交互 ---------------- */
+
+function deleteLibraryPackage(id) {
+  const packages = arr(state.library && state.library.iptv && state.library.iptv.packages);
+  const pkg = packages.find((item) => item.id === id);
+  if (!pkg) return;
+  if (!window.confirm('从资源库删除套餐「' + (pkg.name || id) + '」？'
+    + '引用它的终端会在下次同步时由云端自动剔除。')) return;
+  state.library.iptv.packages = packages.filter((item) => item.id !== id);
+  if (state.libPreviewId === id) state.libPreviewId = '';
+  if (state.libAppendTo === id) state.libAppendTo = '';
+  markLibraryDirty();
+  render();
+  message('已删除套餐「' + (pkg.name || id) + '」。记得点「保存资源库」。', 'ok');
+}
+
+function deleteLibrarySource(id) {
+  const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
+  const src = sources.find((item) => item.id === id);
+  if (!src) return;
+  const refs = arr(state.library.iptv.packages).filter((pkg) => arr(pkg.sources).includes(id));
+  const tail = refs.length
+    ? '仍有 ' + refs.length + ' 个套餐引用该来源，删除后会同时从这些套餐的「来源」里移除（频道不受影响）。'
+    : '';
+  if (!window.confirm('删除源「' + (src.name || src.url) + '」？套餐里的频道不会被删除。'
+    + (tail ? '\n' + tail : ''))) return;
+  state.library.iptv.sources = sources.filter((item) => item.id !== id);
+  // 顺手清掉引用，避免留下悬空 id。
+  for (const pkg of arr(state.library.iptv.packages)) {
+    if (arr(pkg.sources).includes(id)) pkg.sources = arr(pkg.sources).filter((ref) => ref !== id);
+  }
+  markLibraryDirty();
+  render();
+  message('已删除源「' + (src.name || src.url) + '」'
+    + (refs.length ? '，并从 ' + refs.length + ' 个套餐的「来源」里移除（频道未变）' : '')
+    + '。记得点「保存资源库」。', 'ok');
+}
+
+function deleteVodSource(id) {
+  const sources = arr(state.library && state.library.vod && state.library.vod.sources);
+  const src = sources.find((item) => item.id === id);
+  if (!src) return;
+  if (!window.confirm('删除源「' + (src.name || src.url) + '」？它下面的站点会一并删除。')) return;
+  state.library.vod.sources = sources.filter((item) => item.id !== id);
+  state.library.vod.sites = arr(state.library.vod.sites).filter((site) => site.sourceId !== id);
+  markLibraryDirty();
+  render();
+  message('已删除源「' + (src.name || src.url) + '」及其站点。记得点「保存资源库」。', 'ok');
+}
+
+/* ---- TVBox 配置解析 ---- */
+
+const TVBOX_API_RE = /^(https?:\/\/|csp_)/i;
+
+/** 把任意形态的 TVBox 配置拍平成 [{name, sites, urls}]：对象 / 顶层数组 / 配置数组。 */
+function collectTvboxConfigs(json) {
+  const configs = [];
+  const walk = (node) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      if (node.some((item) => isObj(item) && typeof item.api === 'string')) {
+        configs.push({ name: '', sites: node, urls: [] });
+        return;
+      }
+      for (const item of node) walk(item);
+      return;
+    }
+    if (!isObj(node)) return;
+    configs.push({
+      name: typeof node.name === 'string' ? node.name : '',
+      sites: arr(node.sites),
+      urls: arr(node.urls).filter((item) => typeof item === 'string' && /^https?:\/\//i.test(item)),
+    });
+  };
+  walk(json);
+  return configs;
+}
+
+/** sites → 库站点；api 非 http(s)/csp_、key 缺失或重复都跳过并计数。 */
+const VOD_SITE_ID_RE = /^[A-Za-z0-9_:-]{1,96}$/;
+const MAX_VOD_SITES_PER_SOURCE = 200;
+const MAX_VOD_SITES = 500;
+const MAX_VOD_SOURCES = 20;
+const MAX_IPTV_PACKAGES = 12;
+
+/** 站点 id 必须满足 [A-Za-z0-9_:-]，key 里的点号/斜杠等统一换成下划线。 */
+function tvboxSiteId(sourceId, key) {
+  const raw = sourceId + ':' + key;
+  if (VOD_SITE_ID_RE.test(raw)) return raw;
+  return sourceId + ':' + key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+}
+
+function tvboxSitesFrom(list, sourceId, seen, seenIds) {
+  const sites = [];
+  const ids = seenIds || new Set();
+  let skipped = 0;
+  for (const raw of arr(list)) {
+    if (sites.length >= MAX_VOD_SITES_PER_SOURCE) { skipped += 1; continue; }
+    if (!isObj(raw)) { skipped += 1; continue; }
+    const key = String(raw.key == null ? '' : raw.key).trim();
+    const api = String(raw.api == null ? '' : raw.api).trim();
+    if (!key || seen.has(key) || !TVBOX_API_RE.test(api)) { skipped += 1; continue; }
+    const id = tvboxSiteId(sourceId, key);
+    if (ids.has(id)) { skipped += 1; continue; }
+    seen.add(key);
+    ids.add(id);
+    sites.push({
+      id,
+      sourceId,
+      key: key.slice(0, 64),
+      name: (String(raw.name == null ? key : raw.name).trim() || key).slice(0, 64),
+      api: api.slice(0, 1000),
+      type: String(raw.type == null ? '' : raw.type).trim().slice(0, 16),
+      searchable: raw.searchable == null ? true : !!raw.searchable,
+      quickSearch: !!raw.quickSearch,
+      note: '',
+    });
+  }
+  return { sites, skipped };
+}
+
+async function addVodSource() {
+  if (!state.library) { message('资源库尚未加载。', 'err'); return; }
+  const box = document.querySelector('[data-lib-input="tvbox-url"]');
+  const url = (box ? box.value : state.tvboxUrl).trim();
+  state.tvboxUrl = url;
+  if (!/^https?:\/\//i.test(url)) { message('请填写 http(s) 开头的 TVBox 配置地址。', 'err'); return; }
+  statusText('正在抓取 TVBox 配置…');
+  try {
+    const text = await fetchRemoteText(url);
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) {
+      throw new Error('返回内容不是合法 JSON，可能不是 TVBox 配置');
+    }
+    const sourceId = newLibraryId('vod');
+    const seen = new Set();
+    const seenIds = new Set();
+    const names = [];
+    let sites = [];
+    let skipped = 0;
+    const configs = collectTvboxConfigs(json);
+    for (const cfg of configs) {
+      if (cfg.name) names.push(cfg.name);
+      const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
+      sites = sites.concat(part.sites);
+      skipped += part.skipped;
+    }
+    const subSet = new Set();
+    for (const cfg of configs) for (const sub of cfg.urls) subSet.add(sub);
+    const subUrls = [...subSet].slice(0, 5);
+    let subFailed = 0;
+    for (const sub of subUrls) {
+      try {
+        const subJson = JSON.parse(await fetchRemoteText(sub));
+        for (const cfg of collectTvboxConfigs(subJson)) {
+          if (cfg.name) names.push(cfg.name);
+          const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
+          sites = sites.concat(part.sites);
+          skipped += part.skipped;
+        }
+      } catch (_) { subFailed += 1; }
+    }
+    statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
+    if (!sites.length) {
+      message('没有解析出可用站点（跳过 ' + skipped + ' 条）。'
+        + '请确认这是 TVBox 配置，且 sites 里 api 以 http(s):// 或 csp_ 开头。', 'err');
+      return;
+    }
+    const existing = arr(state.library.vod.sources).find((src) => String(src.url || '') === url);
+    if (existing) {
+      if (!window.confirm('该地址已在资源库中，重新导入会替换它下面的所有站点，继续？')) return;
+      state.library.vod.sources = arr(state.library.vod.sources)
+        .filter((src) => src.id !== existing.id);
+      state.library.vod.sites = arr(state.library.vod.sites)
+        .filter((site) => site.sourceId !== existing.id);
+    } else if (arr(state.library.vod.sources).length >= MAX_VOD_SOURCES) {
+      message('资源库最多 ' + MAX_VOD_SOURCES + ' 个 TVBox 源，请先删除不用的源。', 'err');
+      return;
+    }
+    const room = MAX_VOD_SITES - arr(state.library.vod.sites).length;
+    if (room <= 0) { message('资源库站点已达 ' + MAX_VOD_SITES + ' 条上限，请先删除不用的源。', 'err'); return; }
+    let dropped = 0;
+    if (sites.length > room) { dropped = sites.length - room; sites = sites.slice(0, room); }
+    const name = (names[0] || sourceNameFromUrl(url)).slice(0, 64);
+    state.library.vod.sources.push({
+      id: sourceId, name, url, siteCount: sites.length, addedAt: nowIso(), note: '',
+    });
+    state.library.vod.sites.push(...sites);
+    state.tvboxSummary = '已导入「' + name + '」：' + sites.length + ' 个站点'
+      + (skipped ? '，跳过 ' + skipped + ' 条（api 非法 / key 缺失或重复 / 超出单源 '
+        + MAX_VOD_SITES_PER_SOURCE + ' 条上限）' : '')
+      + (dropped ? '，超出资源库 ' + MAX_VOD_SITES + ' 条上限丢弃 ' + dropped + ' 条' : '')
+      + (subFailed ? '，子配置抓取失败 ' + subFailed + ' 个' : '')
+      + '。记得点「保存资源库」。';
+    markLibraryDirty();
     render();
-    message('套餐「' + name + '」已创建（' + state.parsedChannels.length + ' 个频道）。'
-      + '勾选它并保存，即可下发给当前配置对象。', 'ok');
-  } else if (kind === 'append-package') {
-    if (!parsedChannelsOrWarn()) return;
-    const pkg = iptv.packages.find((item) => item.id === button.dataset.id);
-    if (!pkg) return;
-    const before = (pkg.channels || []).length;
-    pkg.channels = mergeChannels(pkg.channels, state.parsedChannels);
-    markDirty();
-    render();
-    message('已向「' + pkg.name + '」追加 ' + (pkg.channels.length - before) + ' 个频道。', 'ok');
-  } else if (kind === 'delete-package') {
-    const id = button.dataset.id;
-    const pkg = iptv.packages.find((item) => item.id === id);
-    if (pkg && !window.confirm('删除套餐「' + pkg.name + '」？')) return;
-    iptv.packages = iptv.packages.filter((item) => item.id !== id);
-    iptv.selectedPackageIds = (iptv.selectedPackageIds || []).filter((x) => x !== id);
-    markDirty();
-    render();
-  } else if (kind === 'clear') {
-    iptv.channels = [];
-    iptv.groups = [];
-    iptv.sources = [];
-    iptv.selectedPackageIds = [];
-    state.parsedChannels = [];
-    state.iptvSummary = '已清空频道与套餐选择（套餐库保留），保存后终端将不再收到云端 IPTV 配置。';
-    markDirty();
-    render();
+    message(state.tvboxSummary, 'ok');
+  } catch (error) {
+    statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
+    message('添加 TVBox 源失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
+/** 把当前终端里的旧内联套餐搬进资源库（同名去重），再把 packageIds 指向库套餐。 */
+function migrateInlinePackages() {
+  if (!state.doc) { message('请先连接云端。', 'err'); return; }
+  if (state.libraryState !== 'ready' || !state.library) {
+    message('资源库不可用，暂时不能迁移。请先升级云端并「重新加载资源库」。', 'err');
+    return;
+  }
+  const iptv = iptvSection();
+  const inline = legacyInlinePackages(iptv);
+  if (!inline.length) { message('当前配置里没有本地（旧）套餐。', 'err'); return; }
+  const totalChannels = inline.reduce((sum, pkg) => sum + arr(pkg.channels).length, 0);
+  if (!totalChannels) {
+    message('读不到本地套餐的频道内容（服务端只返回了摘要）。请确认已「连接并加载」，或先升级云端再迁移。', 'err');
+    return;
+  }
+  const map = new Map();
+  let created = 0;
+  let merged = 0;
+  for (const pkg of inline) {
+    const name = (String(pkg.name == null ? '' : pkg.name).trim() || '未命名套餐').slice(0, 64);
+    const hit = arr(state.library.iptv.packages)
+      .find((item) => String(item.name || '').trim() === name);
+    if (hit) {
+      const before = arr(hit.channels).length;
+      hit.channels = mergeChannels(hit.channels, pkg.channels);
+      if (hit.channels.length !== before) merged += 1;
+      map.set(pkg.id, hit.id);
+    } else {
+      const id = newLibraryId('pkg');
+      state.library.iptv.packages.push({
+        id,
+        name,
+        sources: arr(pkg.sources).filter(Boolean),
+        channels: clone(arr(pkg.channels)),
+      });
+      map.set(pkg.id, id);
+      created += 1;
+    }
+  }
+  const picked = arr(iptv.selectedPackageIds).map((id) => map.get(id)).filter(Boolean);
+  if (!picked.length) for (const id of map.values()) picked.push(id);
+  iptv.packageIds = [...new Set(picked)];
+  const migratedIds = new Set(inline.map((pkg) => pkg.id));
+  iptv.packages = arr(iptv.packages).filter((pkg) => !migratedIds.has(pkg.id));
+  iptv.selectedPackageIds = [];
+  markLibraryDirty();
+  markDirty();
+  render();
+  message('已迁移 ' + inline.length + ' 个本地套餐到资源库（新建 ' + created
+    + ' 个、合并 ' + merged + ' 个）。请先点「保存资源库」，再保存本终端配置。', 'ok');
+}
+
+function onLibraryAction(button) {
+  const kind = button.dataset.lib;
+  if (kind === 'save-library') { saveLibrary(); return; }
+  if (kind === 'reload-library') { reloadLibrary(); return; }
+  if (kind === 'fetch-urls') { fetchLibraryUrls(); return; }
+  if (kind === 'parse-text') { parseLibraryText(); return; }
+  if (kind === 'clear-parse') { clearParseResult(); return; }
+  if (kind === 'create-package') { createPackageFromParse(readLibInput('new-package-name')); return; }
+  if (kind === 'append-package') { appendToPackage(); return; }
+  if (kind === 'preview-package') {
+    state.libPreviewId = state.libPreviewId === button.dataset.id ? '' : button.dataset.id;
+    renderPanel();
+    return;
+  }
+  if (kind === 'delete-package') { deleteLibraryPackage(button.dataset.id); return; }
+  if (kind === 'delete-source') { deleteLibrarySource(button.dataset.id); return; }
+  if (kind === 'add-vod-source') { addVodSource(); return; }
+  if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
+  if (kind === 'migrate-inline') { migrateInlinePackages(); return; }
+}
+
+/** 资源库输入：只写模型 + 点亮「未保存」，不重绘（重绘会抢走输入焦点）。 */
+function onLibraryInput(target) {
+  const kind = target.dataset.libInput;
+  if (!kind) return;
+  if (kind === 'import-urls') { state.libUrlText = target.value; return; }
+  if (kind === 'import-text') { state.libPasteText = target.value; return; }
+  if (kind === 'import-file') { readLibraryFile(target); return; }
+  if (kind === 'tvbox-url') { state.tvboxUrl = target.value; return; }
+  if (kind === 'new-package-name') return;
+  if (!state.library) return;
+  if (kind === 'append-target') { state.libAppendTo = target.value; return; }
+  if (kind === 'epg-url') { state.library.iptv.epgUrl = target.value.trim().slice(0, 500); markLibraryDirty(); return; }
+  const id = target.dataset.id;
+  if (kind === 'pkg-name') {
+    const pkg = arr(state.library.iptv.packages).find((item) => item.id === id);
+    if (pkg) { pkg.name = target.value.slice(0, 64); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'source-name') {
+    const src = arr(state.library.iptv.sources).find((item) => item.id === id);
+    if (src) { src.name = target.value.slice(0, 64); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'source-note') {
+    const src = arr(state.library.iptv.sources).find((item) => item.id === id);
+    if (src) { src.note = target.value.slice(0, 200); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'site-note') {
+    const site = arr(state.library.vod.sites).find((item) => item.id === id);
+    if (site) { site.note = target.value.slice(0, 200); markLibraryDirty(); }
   }
 }
 
 function renderPanel() {
-  if (!state.doc) {
+  // 资源库页签与设备无关，未连接配置服务时也能打开（只提示先加载资源库）。
+  const libraryTab = state.activeTab === 'iptv-lib' || state.activeTab === 'vod-lib';
+  if (!state.doc && !libraryTab) {
     $('panel').innerHTML = '<p class="muted">请先点击右上角「连接并加载」。</p>';
     return;
   }
   const renderers = { sites: renderSites, navigation: renderNavigation,
     startup: renderStartup, update: renderUpdate,
-    iptv: renderIptv, devices: renderDevices };
-  $('panel').innerHTML = renderers[state.activeTab]();
+    iptv: renderIptvDispatch, 'iptv-lib': renderIptvLibrary,
+    'vod-lib': renderVodLibrary, devices: renderDevices };
+  const renderer = renderers[state.activeTab] || renderSites;
+  $('panel').innerHTML = renderer();
 }
 
 function diffLines() {
@@ -812,6 +1628,66 @@ function dfMulti(path, items, labelFn) {
     + esc(labelFn(item)) + '</label>').join('') + '</div>';
 }
 
+/** 单终端 IPTV 区：勾选资源库套餐 + 锁定开关；旧内联套餐仍展示并支持迁移。 */
+function deviceIptvBlock() {
+  const libPackages = libraryPackages();
+  const iptv = (state.doc.sections.iptv && isObj(state.doc.sections.iptv))
+    ? state.doc.sections.iptv : { packages: [], selectedPackageIds: [], packageIds: [] };
+  let html = dfCheck('iptv.managed', '云端接管本节');
+  if (libPackages === null) {
+    html += '<p class="meta">当前服务端不支持资源库，请先升级云端；下方本地旧套餐仍可用。</p>';
+  } else {
+    html += libPackages.length
+      ? '<div class="df-multi">' + libPackages.map((pkg) =>
+        '<label><input type="checkbox" data-df-multi="iptv.packageIds" data-value="' + esc(pkg.id) + '"'
+        + (arr(iptv.packageIds).includes(pkg.id) ? ' checked' : '') + '> '
+        + esc(pkg.name) + '（' + arr(pkg.channels).length + ' 个频道）</label>').join('')
+        + '</div>'
+      : '<p class="meta">资源库里还没有套餐，请先到「IPTV 源」页导入并创建套餐。</p>';
+    html += '<label class="df-check"><input type="checkbox" data-df="iptv.lockLibrary"'
+      + (iptv.lockLibrary ? ' checked' : '') + '> 锁定资源库</label>'
+      + '<p class="meta">锁定后该终端不再跟随资源库变化，保持当前频道表。</p>';
+  }
+  return html + legacyIptvHtml(iptv);
+}
+
+/** 单终端 TVBox 区：勾选库源（整源）与具体站点 + 锁定开关。 */
+function deviceVodBlock() {
+  const sources = libraryVodSources();
+  const sites = libraryVodSites();
+  const vod = isObj(state.doc.sections.vod) ? state.doc.sections.vod : {};
+  let html = dfCheck('vod.managed', '云端接管本节');
+  if (sources === null) {
+    return html + '<p class="meta">当前服务端不支持资源库，请先升级云端。</p>';
+  }
+  if (!sources.length) {
+    return html + '<p class="meta">资源库里还没有 TVBox 源，请先到「TVBox 源」页添加。</p>';
+  }
+  const pickedSources = arr(vod.sourceIds);
+  const pickedSites = arr(vod.siteIds);
+  const allSites = arr(sites);
+  html += '<p class="meta">整源下发：勾选后该源下所有站点都会下发。</p>'
+    + '<div class="df-multi">' + sources.map((src) =>
+      '<label><input type="checkbox" data-df-multi="vod.sourceIds" data-value="' + esc(src.id) + '"'
+      + (pickedSources.includes(src.id) ? ' checked' : '') + '> '
+      + esc(src.name || src.url) + '（'
+      + allSites.filter((site) => site.sourceId === src.id).length + ' 个站点）</label>').join('')
+    + '</div>'
+    + '<p class="meta">再单独勾选具体站点（可选，最多列出 300 条）：</p>'
+    + '<div class="lib-scroll lib-site-checks">'
+    + (allSites.slice(0, 300).map((site) =>
+      '<label><input type="checkbox" data-df-multi="vod.siteIds" data-value="' + esc(site.id) + '"'
+      + (pickedSites.includes(site.id) ? ' checked' : '') + '> '
+      + '<code>' + esc(site.key) + '</code> ' + esc(site.name || '')
+      + (site.note ? ' <span class="meta">' + esc(site.note) + '</span>' : '')
+      + '</label>').join('') || '<p class="muted">还没有站点。</p>')
+    + '</div>'
+    + '<label class="df-check"><input type="checkbox" data-df="vod.lockLibrary"'
+    + (vod.lockLibrary ? ' checked' : '') + '> 锁定资源库</label>'
+    + '<p class="meta">锁定后该终端不再跟随资源库变化，保持当前站点表。</p>';
+  return html;
+}
+
 function renderDeviceEditor() {
   if (!state.doc) return '<p class="muted">请先连接云端。</p>';
   const id = state.drawerDeviceId;
@@ -821,7 +1697,6 @@ function renderDeviceEditor() {
   const sites = (catalog.sites || []).filter((item) => !item.retired);
   const menus = catalog.menus || [];
   const groups = (sections.navigation && sections.navigation.groups) || [];
-  const packages = (sections.iptv && sections.iptv.packages) || [];
   const noticeModes = [
     { value: 'once_per_revision', label: '每个新版本弹一次' },
     { value: 'always', label: '每次都弹' },
@@ -875,13 +1750,9 @@ function renderDeviceEditor() {
     + dfSelect('update.prompt', '提示方式', prompts)
     + '</div>'
 
-    + '<div class="df-block"><h3>IPTV 套餐下发</h3>'
-    + dfCheck('iptv.managed', '云端接管本节')
-    + (packages.length
-      ? dfMulti('iptv.selectedPackageIds', packages.map((p) => ({ id: p.id, name: p.name })),
-        (item) => item.name + '（' + ((packages.find((p) => p.id === item.id) || {}).channels || []).length + ' 个频道）')
-      : '<p class="meta">还没有套餐，请先到「IPTV 源」页导入并创建套餐。</p>')
-    + '</div>'
+    + '<div class="df-block"><h3>IPTV 套餐下发</h3>' + deviceIptvBlock() + '</div>'
+
+    + '<div class="df-block"><h3>TVBox 站点下发</h3>' + deviceVodBlock() + '</div>'
 
     + '</div>'
     + '<div class="toolbar" style="margin-top:16px">'
@@ -948,9 +1819,7 @@ function render() {
 
 async function load() {
   clearMessage();
-  state.base = $('apiBase').value.trim();
-  state.token = $('apiToken').value.trim();
-  state.writeToken = $('apiWriteToken').value.trim();
+  syncConnection();
   localStorage.setItem('purelive_config_base', state.base);
   localStorage.setItem('purelive_config_token', state.token);
   localStorage.setItem('purelive_config_write_token', state.writeToken);
@@ -975,6 +1844,9 @@ async function load() {
     state.extraMode = null;
     statusText('已连接（' + deviceLabel() + '，schemaVersion ' + doc.schemaVersion + '）');
     render();
+    // 资源库与设备无关，单独加载；加载失败不影响配置编辑。
+    await loadLibrary(false);
+    render();
     toast('配置加载成功');
   } catch (error) {
     statusText('连接失败');
@@ -983,6 +1855,23 @@ async function load() {
       : '';
     message('加载失败：' + error.message + hintOf(error) + guide, 'err');
   }
+}
+
+/**
+ * 保存前清掉「由资源库派生」的数据。
+ * GET ?withPackages=1 会把被引用的库套餐和展开后的频道塞进文档，
+ * 原样 PUT 等于把它们再存一份，会把设备文档撑大；服务端下次 GET 会重新展开。
+ */
+function sectionsForSave() {
+  const sections = clone(state.doc.sections);
+  const iptv = sections.iptv;
+  if (isObj(iptv) && iptv.lockLibrary !== true && arr(iptv.packageIds).length) {
+    const refIds = new Set(arr(iptv.packageIds));
+    iptv.packages = arr(iptv.packages).filter((pkg) => !refIds.has(pkg.id));
+    iptv.channels = [];
+    iptv.groups = [];
+  }
+  return sections;
 }
 
 async function save() {
@@ -994,7 +1883,7 @@ async function save() {
       write: true,
       method: 'PUT',
       headers: { 'If-Match': String(state.revision) },
-      body: JSON.stringify({ sections: state.doc.sections, expectedRevision: state.revision }),
+      body: JSON.stringify({ sections: sectionsForSave(), expectedRevision: state.revision }),
     });
     state.revision = result.revision;
     state.original = clone(state.doc);
@@ -1093,6 +1982,7 @@ function onFieldChange(target) {
 
 function onAction(button) {
   const action = button.dataset.action;
+  if (action === 'goto-devices') { state.activeTab = 'devices'; render(); return; }
   const sites = state.doc.sections.sites;
   const allIds = state.catalog.sites.filter((item) => !item.retired).map((item) => item.id);
   if (action === 'sites-all') sites.enabledSiteIds = allIds.slice();
@@ -1181,12 +2071,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $('panel').addEventListener('change', (event) => {
     const target = event.target;
+    if (target.dataset.libInput) { onLibraryInput(target); return; }
     if (target.dataset.site) onSiteToggle(target);
     else if (target.dataset.menu) onMenuToggle(target);
     else onFieldChange(target);
   });
   $('panel').addEventListener('input', (event) => {
     const target = event.target;
+    if (target.dataset.libInput) {
+      // 文件选择走 change，避免 input + change 重复读取同一份文件。
+      if (target.type !== 'file') onLibraryInput(target);
+      return;
+    }
     if (target.tagName === 'TEXTAREA' || target.type === 'text' || target.type === 'number') onFieldChange(target);
   });
   $('panel').addEventListener('click', (event) => {
@@ -1195,6 +2091,8 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   $('extra').addEventListener('click', (event) => {
+    const libButton = event.target.closest('button[data-lib]');
+    if (libButton) { onLibraryAction(libButton); return; }
     const button = event.target.closest('button[data-extra]');
     if (!button) return;
     const kind = button.dataset.extra;
@@ -1237,14 +2135,13 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     state.deviceId = next;
-    state.iptvSummary = '';
     if (state.doc) await load();
     else renderDeviceSelect();
   });
 
   $('panel').addEventListener('click', (event) => {
-    const iptvButton = event.target.closest('button[data-iptv]');
-    if (iptvButton) { if (!state.doc) return; onIptvAction(iptvButton); return; }
+    const libButton = event.target.closest('button[data-lib]');
+    if (libButton) { onLibraryAction(libButton); return; }
     const batchButton = event.target.closest('button[data-batch]');
     if (batchButton) { onBatchAction(batchButton.dataset.batch); return; }
     const deviceButton = event.target.closest('button[data-device]');
@@ -1260,43 +2157,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('panel').addEventListener('change', (event) => {
     const target = event.target;
     if (!state.doc) return;
-    if (target.dataset.iptv === 'file') {
-      const file = target.files && target.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const bytes = new Uint8Array(reader.result || new ArrayBuffer(0));
-        let text = new TextDecoder('utf-8').decode(bytes);
-        const badUtf8 = (text.match(/\uFFFD/g) || []).length;
-        if (badUtf8 > 0) {
-          try {
-            const gbk = new TextDecoder('gbk').decode(bytes);
-            if ((gbk.match(/\uFFFD/g) || []).length < badUtf8) text = gbk;
-          } catch (_) { /* 浏览器不支持 GBK 时保留 UTF-8 结果 */ }
-        }
-        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-        state.iptvText = text;
-        const box = document.querySelector('[data-iptv="text"]');
-        if (box) box.value = text;
-        applyPlaylist(text, '');
-      };
-      reader.onerror = () => message('文件读取失败', 'err');
-      reader.readAsArrayBuffer(file);
-      return;
-    }
-    if (target.dataset.iptv === 'urls') {
-      const urls = target.value.split('\n').map((x) => x.trim())
-        .filter((x) => /^https?:\/\//i.test(x)).slice(0, 20);
-      iptvSection().sources = urls;
-      markDirty();
-      return;
-    }
     if (target.dataset.pkg) {
+      // 勾选的是资源库套餐 id，写入 iptv.packageIds 并记录当时的资源库 revision。
       const iptv = iptvSection();
-      const picked = new Set(iptv.selectedPackageIds || []);
+      const picked = new Set(arr(iptv.packageIds));
       if (target.checked) picked.add(target.dataset.pkg);
       else picked.delete(target.dataset.pkg);
-      iptv.selectedPackageIds = [...picked];
+      iptv.packageIds = [...picked];
       iptv.managed = true;
       markDirty();
       return;
