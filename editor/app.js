@@ -1033,22 +1033,49 @@ async function saveLibrary() {
   }
 }
 
-/** 云端代抓单个地址；失败时退回浏览器直连（仍受 CORS 限制）。 */
-async function fetchRemoteText(url) {
+/** 统一规范化订阅地址：去空白 + percent-encode。
+ *  中文路径若不编码，部分源站（如 live.hacks.tools）会直接返回 400，
+ *  所以两端都统一用 new URL().href 处理后再请求。 */
+function normalizeHttpUrl(raw) {
+  // 从网页复制地址时常混入零宽字符/行分隔符，URL 解析不会报错但源站会 400，先清掉。
+  const text = String(raw == null ? '' : raw)
+    .replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, '')
+    .trim();
+  if (!text) throw new Error('地址为空');
+  let parsed;
+  try { parsed = new URL(text); } catch (_) {
+    throw new Error('不是合法的 URL（含空格、中文未编码或不可见字符时容易失败）');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('仅支持 http(s) 地址');
+  }
+  return parsed.href;
+}
+
+/** 云端代抓单个地址；失败时退回浏览器直连（仍受 CORS 限制），并把两端原因都带出来。 */
+async function fetchRemoteText(rawUrl) {
+  const url = normalizeHttpUrl(rawUrl);
   let cloudError = '';
   try {
     const data = await request('/api/iptv/fetch', {
       write: true, method: 'POST', body: JSON.stringify({ urls: [url] }),
     });
-    if (data && typeof data.text === 'string' && data.text) return data.text;
-    const failed = arr(data && data.results).filter((item) => !item.ok);
-    cloudError = (failed[0] && failed[0].error) || '云端未返回内容';
+    if (data && typeof data.text === 'string' && data.text.trim()) return data.text;
+    const results = arr(data && data.results);
+    const failed = results.filter((item) => !item.ok);
+    cloudError = (failed[0] && failed[0].error) || (results.length ? '云端抓取成功但内容为空' : '云端无响应');
   } catch (error) {
-    cloudError = error.message;
+    cloudError = '云端接口' + (error.status ? ' HTTP ' + error.status : '') + '：' + error.message;
   }
-  const response = await fetch(url, { headers: { Accept: '*/*' } });
-  if (!response.ok) throw new Error(cloudError + '；浏览器直连 HTTP ' + response.status);
-  return response.text();
+  let directError = '';
+  try {
+    const response = await fetch(url, { headers: { Accept: '*/*' } });
+    if (response.ok) return await response.text();
+    directError = 'HTTP ' + response.status;
+  } catch (_) {
+    directError = '被浏览器拦截（多为 CORS 或证书问题）';
+  }
+  throw new Error('云端：' + cloudError + '；浏览器直连：' + directError);
 }
 
 function sourceNameFromUrl(url) {
@@ -1115,7 +1142,8 @@ async function fetchLibraryUrls() {
   statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
   if (!texts.length) {
     message('抓取失败：' + failed.join('；')
-      + '。可下载后用「本地文件」导入，或直接粘贴内容。', 'err');
+      + '\n提示：地址含中文时已自动 percent-encode；若两边都失败，一般是源站限制了服务器访问，'
+      + '可下载文件后用「本地文件」导入，或直接粘贴内容。', 'err');
     return;
   }
   state.libPasteText = texts.join('\n');

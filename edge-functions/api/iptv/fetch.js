@@ -103,6 +103,13 @@ export function decodeSubscription(bytes) {
 async function readLimited(response) {
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared > MAX_BYTES) throw new Error(`内容超过 ${MAX_BYTES / 1024 / 1024} MiB`);
+  // 部分边缘运行时不提供可读流（response.body 为 null 或没有 getReader），
+  // 直接读 arrayBuffer 兜底；大文件已在上面按 content-length 拦掉，这里再截一次。
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    const truncated = buffer.length > MAX_BYTES;
+    return { bytes: truncated ? buffer.slice(0, MAX_BYTES) : buffer, truncated };
+  }
   const reader = response.body.getReader();
   const chunks = [];
   let total = 0;
