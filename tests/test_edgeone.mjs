@@ -179,8 +179,9 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(res.status, 200);
     const data = await json(res);
     assert.equal(data.sites.length, 35);
-    assert.equal(data.menus.length, 8);
+    assert.equal(data.menus.length, 9);
     assert.ok(data.menus.some((item) => item.id === 'iptv'));
+    assert.ok(data.menus.some((item) => item.id === 'vodBrowse'));
     assert.deepEqual(data.updatePrompts, ['silent', 'dialog', 'force']);
   });
 

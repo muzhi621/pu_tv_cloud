@@ -56,6 +56,7 @@ export const SEED = {
         "hot",
         "areas",
         "favoriteAreas",
+        "vodBrowse",
         "moviePlayback",
         "search",
         "history",
@@ -75,6 +76,7 @@ export const SEED = {
           "label": "影音",
           "icon": "movie",
           "children": [
+            "vodBrowse",
             "moviePlayback"
           ]
         },
@@ -351,6 +353,10 @@ export const CATALOG = {
     {
       "id": "favoriteAreas",
       "name": "关注分区"
+    },
+    {
+      "id": "vodBrowse",
+      "name": "影视点播"
     },
     {
       "id": "moviePlayback",
