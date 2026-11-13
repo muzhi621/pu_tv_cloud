@@ -206,11 +206,14 @@ vod.sites[{id:'<sourceId>:<key>', sourceId, key, name, api, ext, type, searchabl
 - **锁定**：设备 `lockLibrary=true` 时完全忽略库，只用设备内联内容。PUT 时若
   `lockLibrary=true`、`channels` 为空且 `packageIds` 非空，服务端会用库展开一次写进
   `channels` / `groups`，让这台设备离线也自包含。锁定设备不计入「预计影响台数」。
-- **TVBox 源的两个关键字段**：`vod.sources[].jar` 是爬虫包地址（TVBox 配置里的
+- **TVBox 源的关键字段**：`vod.sources[].jar` 是爬虫包地址（TVBox 配置里的
   `spider`），`vod.sites[].ext` 是站点透传给 spider 的扩展参数。`api` 以 `csp_` 开头的
   站点**没有 `jar` 就完全无法运行**——它不是一个 http 接口，而是一段要现场加载的代码。
-  编辑器导入 TVBox 配置时会自动提取顶层 `spider` 记成源 jar，并在源列表里对缺 jar
-  的源标红。
+  配置里 `spider` 常写成 `"./fty.jar;md5;<hash>"`：编辑器会剥离整行 `//` 注释、
+  拆出 `jar` 与 `spiderMd5`、把 `./` 相对路径按配置地址解析成绝对 URL（多仓子配置
+  按子仓自己的地址解析），并在源列表里对缺 jar 的源标红。
+  另有 `spiderFlavor`（`fongmi` / `tvboxos`）：两套 Spider 基类互不兼容，
+  缺省按 `fongmi`，宿主加载前必须据此分流，详见 `docs/API.md`。
 - **按源展开**：`GET /api/config` 会把设备的 `vod.sourceIds` 展开成扁平的
   `sources` + `sites`（`siteIds` 非空时收窄成白名单），终端拿到就能直接用，
   不必再请求库。`lockLibrary=true` 时不读库，只用设备内联的 `sources` / `sites`。

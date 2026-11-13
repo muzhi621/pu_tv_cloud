@@ -254,6 +254,8 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
     "sources": [{"id": "vs_1a2b3c4d", "name": "某 TVBox 配置",
                  "url": "https://.../tvbox.json",
                  "jar": "https://.../spider.jar",
+                 "spiderMd5": "3d161697458ecbcd2651a749db761ba1",
+                 "spiderFlavor": "fongmi",
                  "siteCount": 2,
                  "addedAt": "2026-11-10T09:00:00+08:00", "note": ""}],
     "sites": [{"id": "vs_1a2b3c4d:csp_X", "sourceId": "vs_1a2b3c4d", "key": "csp_X",
@@ -273,6 +275,29 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
 | TVBox 站点 | `${sourceId}:${key}`，须匹配 `^[A-Za-z0-9_:-]{1,96}$` | 由 `sourceId` + 站点 key 派生；传入的 id 合法且属于同一源时沿用 |
 
 id 是引用目标，格式错了会静默失效，因此**非法 id 直接 400**（内容问题才走 warnings）。
+
+### TVBox spider 字段约定
+
+TVBox 配置顶层的 `spider` 常见写法是 `"./fty.jar;md5;<hash>"`（FongMi 用
+`BaseLoader.parseJar(spider, true)` 按 `url;md5;hash` 拆分并校验）。编辑器导入时负责：
+
+- 剥离配置里整行 `//` 注释后再 `JSON.parse`；
+- 把 `spider` 拆成 `jar`（绝对 http(s) 地址）与 `spiderMd5`；
+- 把 `./xxx`、`/xxx` 形式的 `jar` / `ext` / `api` / 子仓 `urls` 按**该配置自己的地址**解析成绝对 URL（中文路径自动 percent-encode）；
+- 多仓 `urls` 同时兼容字符串与 `{url, name}` 对象。
+
+服务端 `parseSpiderField()` 会再做一次防御性兼容，老数据或手工填写带后缀的
+`jar` 不会被判非法清空。
+
+| 字段 | 说明 |
+|---|---|
+| `vod.sources[].jar` | 爬虫包绝对地址；`csp_` 站点缺它完全无法运行 |
+| `vod.sources[].spiderMd5` | 配置附带的 md5 校验和，可为空；宿主下载 jar 后应比对 |
+| `vod.sources[].spiderFlavor` | `fongmi`（默认）或 `tvboxos`。两套 Spider 基类互不兼容，**不能混用宿主**；未知值回退 `fongmi` |
+| `vod.sites[].ext` | 透传给 spider 的扩展参数；绝对地址原样保留，`./` 开头按源配置地址解析 |
+
+设备 `vod.sources` / `vod.sites` 的内联快照与 `expandVodSites()` 展开产物都带
+`spiderMd5` / `spiderFlavor`，锁定快照也一样，终端不需要再访问资源库。
 
 ### 上限
 

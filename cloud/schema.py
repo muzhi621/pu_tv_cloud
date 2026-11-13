@@ -20,6 +20,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 SCHEMA_VERSION = 1
 SECTION_KEYS = ("sites", "navigation", "startup", "update", "iptv", "vod")
@@ -81,6 +82,67 @@ MAX_DOCUMENT_BYTES = 900 * 1024
 # 所有套餐频道数之和的硬上限，用于稳在 MAX_DOCUMENT_BYTES=900KB 内。
 MAX_IPTV_PACKAGES = 12
 MAX_PACKAGE_CHANNELS_TOTAL = 5000
+
+# spider 契约流派：FongMi :catvod 与 TVBoxOS 的 Spider 基类互不兼容，
+# 两套 jar 不能混用宿主。缺省按 fongmi（现有 catvod-api.jar 的契约）。
+_VOD_FLAVORS = ("fongmi", "tvboxos")
+_MD5_RE = re.compile(r"^[0-9a-f]{16,64}$", re.IGNORECASE)
+
+
+def _percent_encode_url(url: str) -> str:
+    """对 path/query 里未编码的非 ASCII 字符做 percent-encode（中文路径 400 的同类问题）。"""
+    try:
+        parts = urlsplit(url)
+        path = quote(parts.path, safe="/%:@&=+$,;~!*'()#")
+        query = quote(parts.query, safe="/%:@&=+$,;?~!*'()")
+        return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+    except Exception:
+        return url
+
+
+def resolve_vod_asset(ref: Any, base_url: str = "") -> str:
+    """把 TVBox 配置里的 ./xxx、/xxx 按配置地址解析成绝对 URL。
+
+    csp_Xxx、普通 ext 文本、已是 http(s) 的地址原样返回，避免被 urljoin
+    改写成 "https://host/box/csp_Xxx"。
+    """
+    value = ref.strip() if isinstance(ref, str) else ""
+    if not value or _URL_RE.match(value):
+        return value
+    if not (value.startswith("./") or value.startswith("/")):
+        return value
+    if not _URL_RE.match(base_url or ""):
+        return value
+    try:
+        resolved = urljoin(base_url, value[2:] if value.startswith("./") else value)
+        return _percent_encode_url(resolved)
+    except Exception:
+        return value
+
+
+def parse_spider_field(raw: Any, base_url: str = "") -> tuple[str, str]:
+    """拆 TVBox 的 spider 字段 "url;md5;hash"，返回 (jar, md5)。
+
+    FongMi 的 BaseLoader.parseJar(spider, true) 就是这个格式。编辑器已经拆过，
+    这里做防御性兼容：老数据 / 手工填写的带后缀字符串不该被整条丢掉。
+    """
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text:
+        return "", ""
+    parts = [item.strip() for item in text.split(";") if item.strip()]
+    jar = resolve_vod_asset(parts[0] if parts else "", base_url)
+    md5 = ""
+    for item in parts[1:]:
+        if item.lower() == "md5":
+            continue
+        if _MD5_RE.match(item):
+            md5 = item
+            break
+    return (jar if jar and _URL_RE.match(jar) else "", md5)
+
+
+def _vod_flavor(value: Any) -> str:
+    return value if isinstance(value, str) and value in _VOD_FLAVORS else "fongmi"
 MAX_PACKAGE_SOURCES = 20
 MAX_PACKAGE_ID_LEN = 64
 MAX_PACKAGE_NAME_LEN = 64
@@ -734,12 +796,14 @@ def _inline_vod_sources(raw: Any, warnings: list[str]) -> list[dict]:
         source_id = _str(entry.get("id"), "", "vod.sources.id", 32)
         if not source_id:
             continue
-        jar = _str(entry.get("jar"), "", "vod.sources.jar", 1000)
+        jar, parsed_md5 = parse_spider_field(entry.get("jar"), "")
         name = _str(entry.get("name"), "", "vod.sources.name", 64)
         out.append({
             "id": source_id,
             "name": name or source_id,
-            "jar": jar if jar and _URL_RE.match(jar) else "",
+            "jar": jar,
+            "spiderMd5": _str(entry.get("spiderMd5"), parsed_md5, "vod.sources.spiderMd5", 64),
+            "spiderFlavor": _vod_flavor(entry.get("spiderFlavor")),
         })
     if len(raw) > MAX_VOD_SOURCES:
         warnings.append("vod.sources: 超过 %d 个上限，已截断" % MAX_VOD_SOURCES)

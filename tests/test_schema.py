@@ -16,6 +16,8 @@ from cloud.schema import (
     normalize_library,
     normalize_sections,
     seed_document,
+    parse_spider_field,
+    resolve_vod_asset,
 )
 
 
@@ -870,6 +872,50 @@ class ExpandLibraryPriorityTests(unittest.TestCase):
         self.assertEqual(sections["iptv"]["channels"], [])
         out["iptv"]["channels"].append({"name": "z", "url": "http://z/1"})
         self.assertEqual(len(library["iptv"]["packages"][0]["channels"]), 1)
+
+
+class SpiderFieldTests(unittest.TestCase):
+    """TVBox spider 字段与相对资源解析（与 contract.js 同语义）。"""
+
+    BASE = "https://raw.liucn.cc/box/m.json"
+
+    def test_md5_suffix_is_split(self):
+        jar, md5 = parse_spider_field(
+            "./fty.jar;md5;3d161697458ecbcd2651a749db761ba1", self.BASE)
+        self.assertEqual(jar, "https://raw.liucn.cc/box/fty.jar")
+        self.assertEqual(md5, "3d161697458ecbcd2651a749db761ba1")
+
+    def test_plain_urls_and_empty(self):
+        self.assertEqual(
+            parse_spider_field("https://cdn.example.com/spider.jar", self.BASE),
+            ("https://cdn.example.com/spider.jar", ""))
+        self.assertEqual(parse_spider_field("./fty.jar;md5", self.BASE)[1], "")
+        self.assertEqual(parse_spider_field("", self.BASE), ("", ""))
+
+    def test_relative_assets(self):
+        self.assertEqual(resolve_vod_asset("csp_DouDou", self.BASE), "csp_DouDou")
+        self.assertEqual(
+            resolve_vod_asset("./libs/market.json", self.BASE),
+            "https://raw.liucn.cc/box/libs/market.json")
+        self.assertEqual(
+            resolve_vod_asset("/libs/tv/tvlive.txt", self.BASE),
+            "https://raw.liucn.cc/libs/tv/tvlive.txt")
+
+    def test_chinese_path_is_percent_encoded(self):
+        url = resolve_vod_asset(
+            "./央视频道.m3u", "https://live.hacks.tools/tv/ipv4/categories/base.json")
+        self.assertNotIn("央视频道", url)
+        self.assertIn("%", url)
+
+    def test_inline_sources_keep_md5_and_flavor(self):
+        sections, _ = normalize_sections({"vod": {"sources": [
+            {"id": "vs_aaaaaaaa", "name": "快照",
+             "jar": "https://x/spider.jar;md5;aabbccdd11223344"},
+        ]}})
+        source = sections["vod"]["sources"][0]
+        self.assertEqual(source["jar"], "https://x/spider.jar")
+        self.assertEqual(source["spiderMd5"], "aabbccdd11223344")
+        self.assertEqual(source["spiderFlavor"], "fongmi")
 
 
 if __name__ == "__main__":

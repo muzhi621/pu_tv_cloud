@@ -23,7 +23,7 @@ import {
 } from '../edge-functions/index.js';
 import {
   normalizeDocument, normalizeSections, expandIptvChannels, expandVodSites, viewDocument,
-  normalizeLibrary, emptyLibrary,
+  normalizeLibrary, emptyLibrary, parseSpiderField, resolveVodAsset,
 } from '../edge-functions/_lib/contract.js';
 import { optionsHandler } from '../edge-functions/_lib/http.js';
 import { listDevices as storageListDevices } from '../edge-functions/_lib/storage.js';
@@ -1331,5 +1331,106 @@ test('TVBox 源与站点：库字段、按源展开、白名单与锁定隔离',
     assert.equal(view.sections.vod.sites.length, 2);
     // 原始文档不能被视图函数改写
     assert.deepEqual(document.sections.vod.sites, []);
+  });
+});
+
+test('TVBox spider 字段：md5 拆分、相对资源解析、流派标记', async (t) => {
+  const BASE = 'https://raw.liucn.cc/box/m.json';
+  const SOURCE = 'vs_bbbbbbbb';
+
+  await t.test('"./fty.jar;md5;<hash>" 拆成绝对地址 + md5', () => {
+    const parsed = parseSpiderField('./fty.jar;md5;3d161697458ecbcd2651a749db761ba1', BASE);
+    assert.equal(parsed.jar, 'https://raw.liucn.cc/box/fty.jar');
+    assert.equal(parsed.md5, '3d161697458ecbcd2651a749db761ba1');
+  });
+
+  await t.test('绝对地址原样返回；只有 ";md5" 不带 hash 时 md5 为空', () => {
+    assert.deepEqual(
+      parseSpiderField('https://cdn.example.com/spider.jar', BASE),
+      { jar: 'https://cdn.example.com/spider.jar', md5: '' },
+    );
+    assert.deepEqual(parseSpiderField('./fty.jar;md5', BASE).md5, '');
+    assert.deepEqual(parseSpiderField('', BASE), { jar: '', md5: '' });
+  });
+
+  await t.test('csp_ / 普通文本不被 URL 构造器改写', () => {
+    assert.equal(resolveVodAsset('csp_DouDou', BASE), 'csp_DouDou');
+    assert.equal(resolveVodAsset('http://127.0.0.1:9978/file/token.txt', BASE),
+      'http://127.0.0.1:9978/file/token.txt');
+    assert.equal(resolveVodAsset('./libs/market.json', BASE),
+      'https://raw.liucn.cc/box/libs/market.json');
+    assert.equal(resolveVodAsset('/libs/tv/tvlive.txt', BASE),
+      'https://raw.liucn.cc/libs/tv/tvlive.txt');
+  });
+
+  await t.test('中文相对路径自动 percent-encode', () => {
+    const url = resolveVodAsset('./央视频道.m3u', 'https://live.hacks.tools/tv/ipv4/categories/base.json');
+    assert.ok(url.startsWith('https://live.hacks.tools/tv/ipv4/categories/%'));
+    assert.ok(!url.includes('央视频道'));
+  });
+
+  await t.test('资源库兼容带 md5 后缀的 jar，并透传 spiderMd5 / spiderFlavor', () => {
+    const [library] = normalizeLibrary({
+      vod: {
+        sources: [{
+          id: SOURCE, name: '饭太硬', url: BASE,
+          jar: './fty.jar;md5;3d161697458ecbcd2651a749db761ba1',
+        }],
+        sites: [{
+          sourceId: SOURCE, key: 'douban', name: '豆瓣', api: 'csp_DouDou',
+          ext: './libs/market.json',
+        }],
+      },
+    });
+    assert.equal(library.vod.sources[0].jar, 'https://raw.liucn.cc/box/fty.jar');
+    assert.equal(library.vod.sources[0].spiderMd5, '3d161697458ecbcd2651a749db761ba1');
+    assert.equal(library.vod.sources[0].spiderFlavor, 'fongmi');
+    assert.equal(library.vod.sites[0].api, 'csp_DouDou');
+    assert.equal(library.vod.sites[0].ext, 'https://raw.liucn.cc/box/libs/market.json');
+  });
+
+  await t.test('展开产物带上 md5 与流派，终端可直接校验 jar', () => {
+    const [library] = normalizeLibrary({
+      vod: {
+        sources: [{
+          id: SOURCE, url: BASE,
+          jar: 'https://cdn.example.com/fty.jar',
+          spiderMd5: '0123456789abcdef0123456789abcdef',
+          spiderFlavor: 'tvboxos',
+        }],
+        sites: [],
+      },
+    });
+    const [sections] = normalizeSections({ vod: { managed: true, sourceIds: [SOURCE] } });
+    const out = expandVodSites(sections, library);
+    assert.equal(out.vod.sources[0].spiderMd5, '0123456789abcdef0123456789abcdef');
+    assert.equal(out.vod.sources[0].spiderFlavor, 'tvboxos');
+  });
+
+  await t.test('设备内联源也兼容 "url;md5;hash"', () => {
+    const [sections] = normalizeSections({
+      vod: {
+        sources: [{ id: SOURCE, name: '快照', jar: 'https://x/spider.jar;md5;aabbccdd11223344' }],
+        sites: [],
+      },
+    });
+    assert.equal(sections.vod.sources[0].jar, 'https://x/spider.jar');
+    assert.equal(sections.vod.sources[0].spiderMd5, 'aabbccdd11223344');
+    assert.equal(sections.vod.sources[0].spiderFlavor, 'fongmi');
+  });
+
+  await t.test('未知流派回退 fongmi，不把脏值下发给终端', () => {
+    const [library] = normalizeLibrary({
+      vod: { sources: [{ id: SOURCE, url: BASE, spiderFlavor: 'unknown' }], sites: [] },
+    });
+    assert.equal(library.vod.sources[0].spiderFlavor, 'fongmi');
+  });
+
+  await t.test('编辑器脚本已内置注释剥离与 md5 拆分', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const source = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+    for (const name of ['parseTvboxJson', 'parseSpiderField', 'resolveVodAsset', 'spiderMd5']) {
+      assert.ok(source.includes(name), `editor/app.js 缺少 ${name}`);
+    }
   });
 });

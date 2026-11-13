@@ -27,6 +27,66 @@ const VERSION_RE = /^\d+(?:\.\d+){0,3}$/;
 const URL_RE = /^https?:\/\/[^\s]+$/i;
 const IPTV_URL_RE = /^(https?|rtmp|rtsp|udp|mms|p2p):\/\/[^\s]+$/i;
 
+/**
+ * 把 TVBox 配置里的 `./xxx` / `/xxx` 相对引用按配置地址解析成绝对 URL。
+ *
+ * 真实配置（例如饭太硬 m.json）里 `spider`、`ext`、`api` 大量写成
+ * `./libs/market.json`，只有按配置所在目录解析才拿得到资源。中文路径交给
+ * URL 构造器自动做 percent-encode，避免「IPTV 中文路径 400」同类问题。
+ * 已经是 http(s) 的、或 base 不合法的原样返回，不会凭空造地址。
+ */
+export function resolveVodAsset(ref, baseUrl = '') {
+  const value = typeof ref === 'string' ? ref.trim() : '';
+  if (!value || /^https?:\/\//i.test(value)) return value;
+  // 只有 "./" 或 "/" 开头才是相对资源引用。csp_Xxx、普通 ext 文本、
+  // 127.0.0.1 之外的自定义 scheme 一律原样返回，别被 URL 构造器改写成
+  // "https://host/box/csp_Xxx"。
+  if (!/^\.?\//.test(value)) return value;
+  if (!/^https?:\/\//i.test(baseUrl)) return value;
+  try {
+    // 去掉开头的 "./" 后交给 URL：相对 base 所在目录解析；
+    // 以 "/" 开头则相对域名根，语义与浏览器一致。
+    return new URL(value.replace(/^\.\//, ''), baseUrl).href;
+  } catch (_) {
+    return value;
+  }
+}
+
+/**
+ * 拆 TVBox 的 spider 字段。常见形态：
+ *   "https://x/fty.jar"
+ *   "./fty.jar;md5;3d161697458ecbcd2651a749db761ba1"
+ *   "./fty.jar;md5"                     （只声明算法，不带 hash）
+ *   "https://x/fty.jar;<hash>"
+ * 返回 { jar, md5 }；jar 一定是绝对 http(s) 地址或空串。
+ *
+ * FongMi 的 `BaseLoader.parseJar(spider, true)` 就是按 `url;md5;hash` 拆的。
+ * 编辑器已经拆过一次，云端这里做防御性兼容：老数据或手工填写的
+ * 带后缀字符串也不会被 URL_RE 判非法后整个丢掉。
+ */
+export function parseSpiderField(raw, baseUrl = '') {
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text) return { jar: '', md5: '' };
+  const parts = text.split(';').map((item) => item.trim()).filter(Boolean);
+  const jar = resolveVodAsset(parts[0] || '', baseUrl);
+  let md5 = '';
+  for (let i = 1; i < parts.length; i += 1) {
+    if (/^md5$/i.test(parts[i])) continue;
+    if (/^[0-9a-f]{16,64}$/i.test(parts[i])) { md5 = parts[i]; break; }
+  }
+  return { jar: jar && URL_RE.test(jar) ? jar : '', md5 };
+}
+
+/**
+ * spider 契约流派。FongMi :catvod 与 TVBoxOS 的 Spider 基类互不兼容
+ * （前者 abstract + AutoCloseable + dialog，后者有 initApi/proxyLocal/client），
+ * 两套 jar 不能混用宿主。缺省一律按 fongmi —— 现有 catvod-api.jar 就是这个契约。
+ */
+const VOD_FLAVORS = new Set(['fongmi', 'tvboxos']);
+function vodFlavor(value) {
+  return typeof value === 'string' && VOD_FLAVORS.has(value) ? value : 'fongmi';
+}
+
 /* ---------------- 全局资源库（与设备文档解耦） ----------------
  * 库独立存在 library_current，设备只保存 id 引用：
  *   iptv.packageIds → library.iptv.packages[].id
@@ -746,12 +806,15 @@ function inlineVodSources(raw, warnings) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     const id = str(entry.id, '', 'vod.sources.id', 32);
     const name = str(entry.name, '', 'vod.sources.name', 64);
-    const jar = str(entry.jar, '', 'vod.sources.jar', 1000);
+    // 内联源通常已经由编辑器拆过，但手工填的仍可能是 "url;md5;hash"。
+    const parsed = parseSpiderField(entry.jar, '');
     if (!id) continue;
     out.push({
       id,
       name: name || id,
-      jar: jar && URL_RE.test(jar) ? jar : '',
+      jar: parsed.jar,
+      spiderMd5: str(entry.spiderMd5, parsed.md5, 'vod.sources.spiderMd5', 64),
+      spiderFlavor: vodFlavor(entry.spiderFlavor),
     });
   }
   if (raw.length > MAX_VOD_SOURCES) {
@@ -855,6 +918,8 @@ export function expandVodSites(sections, library = null) {
     id: item.id,
     name: item.name,
     jar: item.jar || '',
+    spiderMd5: item.spiderMd5 || '',
+    spiderFlavor: vodFlavor(item.spiderFlavor),
   }));
   out.vod.sites = sites;
   return out;
@@ -1074,12 +1139,15 @@ function normalizeLibraryVod(part, warnings) {
       // jar 是这个源的爬虫包地址（TVBox 配置里的 spider 字段）。
       // 站点 api 以 csp_ 开头时终端必须靠它加载代码，缺失则该源下的
       // csp_ 站点全部不可用，所以这里允许为空但要在编辑器侧提示。
-      const jar = str(item.jar, '', 'library.vod.sources.jar', 1000);
+      // 编辑器导入时已拆过 "url;md5;hash"，这里再兼容一次老数据 / 手填值。
+      const parsed = parseSpiderField(item.jar, url);
       out.sources.push({
         id,
         name: str(item.name, '', 'library.vod.sources.name', 64) || url,
         url,
-        jar: jar && URL_RE.test(jar) ? jar : '',
+        jar: parsed.jar,
+        spiderMd5: str(item.spiderMd5, parsed.md5, 'library.vod.sources.spiderMd5', 64),
+        spiderFlavor: vodFlavor(item.spiderFlavor),
         siteCount: lenientInt(item.siteCount, 0, 0, MAX_VOD_SITES),
         addedAt: str(item.addedAt, nowIso(), 'library.vod.sources.addedAt', 40),
         note: str(item.note, '', 'library.vod.sources.note', 200),
@@ -1093,6 +1161,8 @@ function normalizeLibraryVod(part, warnings) {
       warnings.push(`library.vod.sites: 超过 ${MAX_VOD_SITES} 个上限，已截断`);
     }
     const sourceIds = new Set(out.sources.map((item) => item.id));
+    // 站点里的 ext / api 若写成 "./libs/xxx.json"，按所属源的配置地址解析。
+    const sourceUrlById = new Map(out.sources.map((item) => [item.id, item.url]));
     const perSource = new Map();
     const seen = new Set();
     for (const entry of raw.sites.slice(0, MAX_VOD_SITES)) {
@@ -1122,7 +1192,8 @@ function normalizeLibraryVod(part, warnings) {
         warnings.push(`library.vod.sites: 源 ${sourceId} 超过 ${MAX_VOD_SITES_PER_SOURCE} 个站点上限，已截断`);
         continue;
       }
-      const api = str(item.api, '', 'library.vod.sites.api', 500);
+      const sourceUrl = sourceUrlById.get(sourceId) || '';
+      const api = resolveVodAsset(str(item.api, '', 'library.vod.sites.api', 500), sourceUrl);
       if (!api) {
         warnings.push(`library.vod.sites[${id}]: 缺少 api，已忽略`);
         continue;
@@ -1137,7 +1208,8 @@ function normalizeLibraryVod(part, warnings) {
         api,
         // ext 是站点的扩展参数，spider 初始化时原样透传（token、接口地址等）。
         // 大量站点离了它就取不到数据，所以必须存进库、随配置下发。
-        ext: str(item.ext, '', `library.vod.sites[${id}].ext`, 1000),
+        // 绝对地址（含 127.0.0.1 本地代理）原样保留，"./" 开头才解析。
+        ext: resolveVodAsset(str(item.ext, '', `library.vod.sites[${id}].ext`, 1000), sourceUrl),
         type: lenientInt(item.type, 0, 0, 4),
         searchable: lenientInt(item.searchable, 0, 0, 2),
         quickSearch: lenientInt(item.quickSearch, 0, 0, 2),

@@ -1348,14 +1348,62 @@ function deleteVodSource(id) {
 
 const TVBOX_API_RE = /^(https?:\/\/|csp_)/i;
 
-/** 把任意形态的 TVBox 配置拍平成 [{name, sites, urls}]：对象 / 顶层数组 / 配置数组。 */
-function collectTvboxConfigs(json) {
+/** 剥离配置里常见的整行 `//` 注释。只删整行，不动 URL 里的 `//`。 */
+function parseTvboxJson(text) {
+  const cleaned = String(text == null ? '' : text)
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n');
+  return JSON.parse(cleaned);
+}
+
+/**
+ * 把 `./xxx` / `/xxx` 按配置地址解析成绝对 URL。
+ * `csp_Xxx`、普通 ext 文本、已是 http(s) 的地址原样返回。
+ */
+function resolveVodAsset(ref, baseUrl) {
+  const value = String(ref == null ? '' : ref).trim();
+  if (!value || /^https?:\/\//i.test(value) || !/^\.?\//.test(value)) return value;
+  if (!/^https?:\/\//i.test(baseUrl || '')) return value;
+  try { return new URL(value.replace(/^\.\//, ''), baseUrl).href; }
+  catch (_) { return value; }
+}
+
+/**
+ * spider 字段拆成 {jar, md5}。真实配置常写成
+ * `./fty.jar;md5;3d161697458ecbcd2651a749db761ba1`，FongMi 的
+ * `BaseLoader.parseJar(spider, true)` 就是按 `url;md5;hash` 拆的。
+ * 直接当 URL 存会被云端判非法清空，导致该源所有 csp_ 站点不可用。
+ */
+function parseSpiderField(raw, baseUrl) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return { jar: '', md5: '' };
+  const parts = text.split(';').map((item) => item.trim()).filter(Boolean);
+  const jar = resolveVodAsset(parts[0] || '', baseUrl);
+  let md5 = '';
+  for (let i = 1; i < parts.length; i += 1) {
+    if (/^md5$/i.test(parts[i])) continue;
+    if (/^[0-9a-f]{16,64}$/i.test(parts[i])) { md5 = parts[i]; break; }
+  }
+  return { jar: /^https?:\/\//i.test(jar) ? jar : '', md5 };
+}
+
+/** 把任意形态的 TVBox 配置拍平成 [{name, spider, sites, urls}]：对象 / 顶层数组 / 配置数组。 */
+function collectTvboxConfigs(json, baseUrl) {
   const configs = [];
+  const base = baseUrl || '';
+  const normalizeSite = (raw) => {
+    if (!isObj(raw)) return raw;
+    const site = Object.assign({}, raw);
+    if (typeof site.api === 'string') site.api = resolveVodAsset(site.api, base);
+    if (typeof site.ext === 'string') site.ext = resolveVodAsset(site.ext, base);
+    return site;
+  };
   const walk = (node) => {
     if (!node) return;
     if (Array.isArray(node)) {
       if (node.some((item) => isObj(item) && typeof item.api === 'string')) {
-        configs.push({ name: '', spider: '', sites: node, urls: [] });
+        configs.push({ name: '', spider: { jar: '', md5: '' }, sites: node.map(normalizeSite), urls: [] });
         return;
       }
       for (const item of node) walk(item);
@@ -1366,9 +1414,15 @@ function collectTvboxConfigs(json) {
       name: typeof node.name === 'string' ? node.name : '',
       // 顶层 spider 就是 csp_ 站点要用的爬虫 jar。它决定了这台设备能不能
       // 加载 type 3 的站点，必须跟着源一起存进库。
-      spider: typeof node.spider === 'string' ? node.spider.trim() : '',
-      sites: arr(node.sites),
-      urls: arr(node.urls).filter((item) => typeof item === 'string' && /^https?:\/\//i.test(item)),
+      spider: parseSpiderField(node.spider, base),
+      sites: arr(node.sites).map(normalizeSite),
+      // 多仓 urls 既有字符串也有 {url,name} 对象，还可能是 ./ 相对地址。
+      urls: arr(node.urls)
+        .map((item) => (typeof item === 'string'
+          ? item
+          : (isObj(item) && typeof item.url === 'string' ? item.url : '')))
+        .map((item) => resolveVodAsset(item, base))
+        .filter((item) => /^https?:\/\//i.test(item)),
     });
   };
   walk(json);
@@ -1433,7 +1487,7 @@ async function addVodSource() {
   try {
     const text = await fetchRemoteText(url);
     let json = null;
-    try { json = JSON.parse(text); } catch (_) {
+    try { json = parseTvboxJson(text); } catch (_) {
       throw new Error('返回内容不是合法 JSON，可能不是 TVBox 配置');
     }
     const sourceId = newLibraryId('vod');
@@ -1441,12 +1495,18 @@ async function addVodSource() {
     const seenIds = new Set();
     const names = [];
     let spiderJar = '';
+    let spiderMd5 = '';
+    const mergeSpider = (spider) => {
+      if (spiderJar || !spider || !spider.jar) return;
+      spiderJar = spider.jar;
+      spiderMd5 = spider.md5 || '';
+    };
     let sites = [];
     let skipped = 0;
-    const configs = collectTvboxConfigs(json);
+    const configs = collectTvboxConfigs(json, url);
     for (const cfg of configs) {
       if (cfg.name) names.push(cfg.name);
-      if (!spiderJar && cfg.spider && /^https?:\/\//i.test(cfg.spider)) spiderJar = cfg.spider;
+      mergeSpider(cfg.spider);
       const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
       sites = sites.concat(part.sites);
       skipped += part.skipped;
@@ -1457,10 +1517,11 @@ async function addVodSource() {
     let subFailed = 0;
     for (const sub of subUrls) {
       try {
-        const subJson = JSON.parse(await fetchRemoteText(sub));
-        for (const cfg of collectTvboxConfigs(subJson)) {
+        // 子仓里的 ./ 相对路径要按「子仓自己的地址」解析，不能用主仓的 base。
+        const subJson = parseTvboxJson(await fetchRemoteText(sub));
+        for (const cfg of collectTvboxConfigs(subJson, sub)) {
           if (cfg.name) names.push(cfg.name);
-          if (!spiderJar && cfg.spider && /^https?:\/\//i.test(cfg.spider)) spiderJar = cfg.spider;
+          mergeSpider(cfg.spider);
           const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
           sites = sites.concat(part.sites);
           skipped += part.skipped;
@@ -1489,12 +1550,16 @@ async function addVodSource() {
     let dropped = 0;
     if (sites.length > room) { dropped = sites.length - room; sites = sites.slice(0, room); }
     const name = (names[0] || sourceNameFromUrl(url)).slice(0, 64);
+    const needJar = sites.filter((site) => /^csp_/i.test(String(site.api || ''))).length;
     state.library.vod.sources.push({
       id: sourceId, name, url, jar: spiderJar,
+      spiderMd5, spiderFlavor: 'fongmi',
       siteCount: sites.length, addedAt: nowIso(), note: '',
     });
     state.library.vod.sites.push(...sites);
     state.tvboxSummary = '已导入「' + name + '」：' + sites.length + ' 个站点'
+      + (spiderJar ? '，spider jar 已识别' + (spiderMd5 ? '（含 md5 校验）' : '') : '，未发现 spider jar')
+      + (needJar && !spiderJar ? '，有 ' + needJar + ' 个 csp_ 站点会缺 jar' : '')
       + (skipped ? '，跳过 ' + skipped + ' 条（api 非法 / key 缺失或重复 / 超出单源 '
         + MAX_VOD_SITES_PER_SOURCE + ' 条上限）' : '')
       + (dropped ? '，超出资源库 ' + MAX_VOD_SITES + ' 条上限丢弃 ' + dropped + ' 条' : '')
