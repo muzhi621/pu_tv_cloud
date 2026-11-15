@@ -91,10 +91,10 @@ curl -s -H "Authorization: Bearer $READ" $BASE/api/config/catalog
 # ETag / 304
 curl -s -i -H "Authorization: Bearer $READ" -H 'If-None-Match: "0"' $BASE/api/config | head -8
 
-# 写入一次（revision 0 → 1），关闭斗鱼只留 B 站 / 虎牙 / IPTV
+# 写入一次（revision 0 → 1），把导航接管为 IPTV + 影音（TVBox）
 curl -s -X PUT -H "Authorization: Bearer $WRITE" -H "If-Match: 0" \
   -H 'Content-Type: application/json' \
-  -d '{"sections":{"sites":{"managed":true,"enabledSiteIds":["bilibili","huya","iptv"]}}}' \
+  -d '{"sections":{"navigation":{"managed":true,"railMenuIds":["iptv","vodBrowse","moviePlayback"],"defaultGroupId":"iptv"}}}' \
   $BASE/api/config
 
 # 用旧 revision 再写一次应返回 409 且带 currentRevision
@@ -110,7 +110,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X PUT \
 - **API 地址**：`https://<fc-domain>`（**只填域名，不要带 `/api/config`**，编辑器会自己拼路径）
 - **访问令牌**：填 `CONFIG_WRITE_TOKEN`（要保存配置就必须写令牌；只读查看可用 read token）
 
-四个视图分别控制：平台勾选（关掉斗鱼就不显示其菜单）、导航排序、启动弹窗文案、更新策略。保存时自动带 `If-Match`，遇到 409 会提示载入云端最新版。
+编辑器页签分别控制：IPTV 源 / TVBox 源 / IPTV 下发 / 终端管理 / 导航栏 / 启动弹窗 / 在线更新。保存时自动带 `If-Match`，遇到 409 会提示载入云端最新版。直播平台白名单页签已移除。
 
 > 浏览器把地址与令牌存在 localStorage，共用电脑记得清理。
 
@@ -189,7 +189,7 @@ AK/SK 只放在 FC 环境变量里（可配合 KMS 加密配置），定期轮�
 curl -s $BASE/health     # backend 应为 "oss"
 ```
 
-1. 在编辑器里关掉斗鱼并保存 → 返回新 revision，OSS 上出现 `pure_live_tv/history/00000001.json`。
+1. 在编辑器里修改导航白名单并保存 → 返回新 revision，OSS 上出现 `pure_live_tv/history/00000001.json`。
 2. 等函数实例冷启动（或手动「发布版本」触发新实例）后再 `GET /api/config`，
    **revision 与配置仍然是最新的**，说明持久化成功。
 3. `GET /api/config/revisions` 应列出历史快照；编辑器的「历史 / 回滚」可回到任意快照
@@ -217,8 +217,10 @@ flutter build apk --release --flavor impeller --split-per-abi \
 
 注意 TV 端只需要**只读令牌**；写令牌只给编辑器，不要打包进 APK。
 
-配置四节（`sites` / `navigation` / `startup` / `update`）每节都带 `managed`：
-未接管时完全不动用户本地设置。云端关掉 `douyu` 后，冷启动即不再显示斗鱼页签，但收藏/历史里的斗鱼房间仍保留。
+配置五节（`navigation` / `startup` / `update` / `iptv` / `vod`）每节都带 `managed`：
+未接管时完全不动用户本地设置。云端接管 `navigation` 后，冷启动按 `railMenuIds`
+显示 IPTV / 影音入口；`iptv` / `vod` 接管后分别下发云端套餐频道与 TVBox 站点。
+旧版直播平台节 `sites` 已下线，老文档带上它会被安全忽略。
 
 ---
 

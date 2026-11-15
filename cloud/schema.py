@@ -23,7 +23,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 SCHEMA_VERSION = 1
-SECTION_KEYS = ("sites", "navigation", "startup", "update", "iptv", "vod")
+SECTION_KEYS = ("navigation", "startup", "update", "iptv", "vod")
 MAX_TEXT_LEN = 20000
 MAX_LIST_ITEMS = 200
 
@@ -39,12 +39,6 @@ def _read_json(name: str) -> dict:
 CATALOG: dict = _read_json("site_catalog.json")
 SEED: dict = _read_json("seed.json")
 
-VALID_SITE_IDS: tuple[str, ...] = tuple(
-    item["id"] for item in CATALOG["sites"] if not item.get("retired")
-)
-RETIRED_SITE_IDS: frozenset[str] = frozenset(
-    item["id"] for item in CATALOG["sites"] if item.get("retired")
-)
 VALID_MENU_IDS: tuple[str, ...] = tuple(item["id"] for item in CATALOG["menus"])
 VALID_PROMPTS: frozenset[str] = frozenset(CATALOG["updatePrompts"])
 VALID_NOTICE_MODES: frozenset[str] = frozenset(CATALOG["noticeModes"])
@@ -53,19 +47,17 @@ VALID_NOTICE_MODES: frozenset[str] = frozenset(CATALOG["noticeModes"])
 def _id_index(ids: tuple[str, ...] | frozenset[str]) -> dict[str, str]:
     """小写 → catalog 中的原始 id。
 
-    客户端使用驼峰 id（favoriteAreas / moviePlayback），若直接转小写比对会全部
+    客户端使用驼峰 id（vodBrowse / moviePlayback），若直接转小写比对会全部
     判为未知并被丢弃；这里只把「比对」降级为大小写无关，写回时仍用原始 id。
     """
     return {str(item).strip().lower(): item for item in ids}
 
 
-VALID_SITE_BY_LOWER = _id_index(VALID_SITE_IDS)
-RETIRED_SITE_BY_LOWER = _id_index(RETIRED_SITE_IDS)
 VALID_MENU_BY_LOWER = _id_index(VALID_MENU_IDS)
 
-# 一级导航块（IPTV / 影音 / 直播 / 设置）；二级项沿用菜单 id 或字面量 'settings'。
+# 一级导航块（IPTV / 影音 / 设置）；二级项沿用菜单 id 或字面量 'settings'。
 # children 用「原始大小写」精确比对（与 contract.js 的 VALID_CHILD_IDS 一致）。
-VALID_GROUP_IDS: frozenset[str] = frozenset({"iptv", "vod", "live", "settings"})
+VALID_GROUP_IDS: frozenset[str] = frozenset({"iptv", "vod", "settings"})
 VALID_CHILD_IDS: frozenset[str] = frozenset(VALID_MENU_IDS) | {"settings"}
 MAX_NAV_GROUPS = 8
 MAX_NAV_CHILDREN = 30
@@ -338,9 +330,6 @@ def _filter_ids(raw: list[str] | None, valid: dict[str, str], seed: list[str],
     seen: set[str] = set()
     for item in raw:
         key = item.strip().lower()
-        if key in RETIRED_SITE_BY_LOWER:
-            warnings.append("%s: 忽略退役站点 %s" % (field, key))
-            continue
         canonical = valid.get(key)
         if canonical is None:
             warnings.append("%s: 忽略未知 id %s" % (field, key))
@@ -353,22 +342,6 @@ def _filter_ids(raw: list[str] | None, valid: dict[str, str], seed: list[str],
         warnings.append("%s: 白名单为空，回退内置全量（防止客户端 .first 崩溃）" % field)
         return list(seed)
     return result
-
-
-def normalize_sites(part: dict, warnings: list[str]) -> dict:
-    base = copy.deepcopy(SEED["sections"]["sites"])
-    base["managed"] = _bool(part.get("managed"), False, "sites.managed")
-    policy = _str(part.get("policy"), "whitelist", "sites.policy", 32)
-    if policy != "whitelist":
-        warnings.append("sites.policy: v1 仅支持 whitelist，已回退")
-        policy = "whitelist"
-    base["policy"] = policy
-    base["enabledSiteIds"] = _filter_ids(
-        _str_list(part.get("enabledSiteIds"), "sites.enabledSiteIds"),
-        VALID_SITE_BY_LOWER, base["enabledSiteIds"],
-        "sites.enabledSiteIds", warnings,
-    )
-    return base
 
 
 def normalize_navigation(part: dict, warnings: list[str]) -> dict:
@@ -1197,7 +1170,6 @@ def normalize_library(raw: Any) -> tuple[dict, list[str]]:
 
 
 _NORMALIZERS = {
-    "sites": normalize_sites,
     "navigation": normalize_navigation,
     "startup": normalize_startup,
     "update": normalize_update,

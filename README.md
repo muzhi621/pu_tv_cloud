@@ -2,6 +2,11 @@
 
 两个独立仓库中的**云端库**。只下发配置，不承载任何直播流、弹幕或转码流量。
 
+> **当前范围（2026-11-15 起）**：云端只下发 **IPTV** 与 **TVBox（影音）** 两类配置。
+> 直播平台白名单节 `sections.sites`、直播一级块 `live`、编辑器「直播平台」页签均已移除；
+> 老设备/老编辑器仍上传 `sections.sites` 时会被安全忽略并记 warning，不会写入配置文档。
+> 一级导航固定为 `iptv` / `vod` / `settings` 三大类，默认落在 `IPTV`。
+
 | 仓库 | 路径 | 内容 |
 |---|---|---|
 | **cloud（本库）** | `G:/workbuddy/puretv/pure_live_tv_cloud` | **EdgeOne 配置服务（默认）**、FC 备选、配置契约、在线编辑器、测试、部署脚本 |
@@ -17,7 +22,7 @@
 > **仓库状态**：已按用户审核同意后提交到 GitHub，默认分支 `main`。
 > 云端库 → `https://github.com/muzhi621/pu_tv_cloud`，
 > 终端库 → `https://github.com/muzhi621/pu_tv_client`。
-> 本库 CI 在 push / PR 时运行 86 个 Python 单元测试、75 项 EdgeOne 接口冒烟、
+> 本库 CI 在 push / PR 时运行 94 个 Python 单元测试、110 项 EdgeOne 接口冒烟、
 > 内联资源一致性检查与语法检查（`.github/workflows/ci.yml`）。
 
 ## 目录
@@ -47,13 +52,14 @@ package.json            声明 ESM 与 @edgeone/pages-blob 依赖（Blob 兜底�
 config/
   seed.json             内置兜底配置（五节全部 managed:false）—— 两个实现共用
                         （缺少的 vod 节与资源库字段由运行时补默认值）
-  site_catalog.json     35 个站点 id（含中文名、退役标记）+ 8 个导航 id（含 iptv）
+  site_catalog.json     已无直播平台白名单（sites: []）+ 3 个 IPTV/TVBox 菜单 id
 editor/                 在线配置编辑器源文件（零依赖静态页）
-  index.html / app.js / style.css —— 8 个页签（直播平台 / 导航栏 / 启动弹窗 / 在线更新 /
-                        IPTV 源 / TVBox 源 / IPTV 下发 / 终端管理）+ 在线状态 +
+  index.html / app.js / style.css —— 7 个页签（导航栏 / 启动弹窗 / 在线更新 /
+                        IPTV 源 / TVBox 源 / IPTV 下发 / 终端管理，默认 IPTV 下发）+ 在线状态 +
                         单终端全设置面板 + 显式「配置下发」按钮
-tests/                  86 个 Python 单元测试 + test_edgeone.mjs（Node 75 项冒烟，含
-                        Blob 回退、驼峰 id、每设备隔离、套餐展开、资源库、SSRF、在线状态）
+tests/                  94 个 Python 单元测试 + test_edgeone.mjs（Node 110 项冒烟，含
+                        Blob 回退、驼峰 id、每设备隔离、套餐展开、资源库、SSRF、在线状态、
+                        老 sites 节忽略）
 docs/
   API.md                接口说明（两种实现共用同一契约）
   DEPLOY_GITHUB.md      ★ GitHub 直连部署方案（控制台逐项、验证、维护、排错）
@@ -135,19 +141,18 @@ FC 版**没有**全局资源库（`/api/library` 返回 404 `not_supported`）�
 
 ## 配置契约（v1）
 
-单文档 `{schemaVersion, revision, updatedAt, sections}`，六个节各自带 `managed`：
+单文档 `{schemaVersion, revision, updatedAt, sections}`，五个节各自带 `managed`：
 
 | 节 | 接管内容 | 对应需求 |
 |---|---|---|
-| `sites` | `enabledSiteIds` 平台白名单（关闭斗鱼 → 终端不显示斗鱼页签） | FR-04 |
-| `navigation` | `railMenuIds` 二级菜单白名单与顺序、`groups`（IPTV / 影音 / 直播 / 设置四个一级块及其 children）、`defaultGroupId`（默认 `iptv`）、`sidebarExpanded`、`homeKeepAlive` | FR-05 / FR-08 |
+| `navigation` | `railMenuIds` 二级菜单白名单与顺序（`iptv` / `vodBrowse` / `moviePlayback`）、`groups`（IPTV / 影音 / 设置三个一级块及其 children）、`defaultGroupId`（默认 `iptv`）、`sidebarExpanded`、`homeKeepAlive` | FR-05 / FR-08 |
 | `startup` | 协议 `requiredVersion`、开机公告、`exitDialog`（退出 App 弹窗：开关 / 频率 / 可取消 / 捐赠码 / 文案）、`showSplashPage` | FR-06 |
 | `update` | 自动检查、间隔、提示策略、最低版本、镜像列表、更新日志 | FR-07 |
 | `iptv` | `managed` + `sources` / `groups` / `epgUrl` / **套餐库 `packages`** / **每台设备勾选的 `selectedPackageIds`** / **库引用 `packageIds`** / **锁定开关 `lockLibrary`** / **`libraryRevision`（服务端维护）** / `channels`（展开后最多 3000 条） | 新增 |
 | `vod` | **TVBox 源/站点引用**：`sourceIds`（≤20）、`siteIds`（≤500）、`lockLibrary`、`libraryRevision`；设备只存引用，站点清单在全局资源库 | 新增 |
 
-服务端兜底规则：未知 / 退役 id 静默过滤；白名单过滤后为空则回退内置全量（防止终端
-`global_room_push.dart:79` 的 `.first` 崩溃）；未知节忽略并记 warning；类型错误返回 400；
+服务端兜底规则：未知 id 静默过滤；白名单过滤后为空则回退内置全量（防止终端
+`.first` 崩溃）；未知节（含已下线的 `sites`）忽略并记 warning；类型错误返回 400；
 `iptv` 频道按 URL 去重、协议白名单 `http(s)/rtmp(s)/rtsp/udp/mms/p2p`、单包 3000 条、
 套餐库合计 5000 条、最多 12 个套餐、总文档上限 900 KB；`update.prompt=force`
 与不可关闭公告/不可取消退出弹窗会输出风险 warning。字段字典见需求文档 4.3。

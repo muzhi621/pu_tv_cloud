@@ -13,7 +13,7 @@ import { SEED, CATALOG, SCHEMA_VERSION } from './data.js';
 export { SCHEMA_VERSION };
 export { CATALOG };
 
-export const SECTION_KEYS = ['sites', 'navigation', 'startup', 'update', 'iptv', 'vod'];
+export const SECTION_KEYS = ['navigation', 'startup', 'update', 'iptv', 'vod'];
 const MAX_TEXT_LEN = 20000;
 const MAX_LIST_ITEMS = 200;
 /** 单份配置文档必须能塞进 Edge Functions 的请求体上限，频道列表要设硬上限。 */
@@ -116,8 +116,6 @@ const LIB_VOD_SOURCE_ID_RE = /^vs_[0-9a-f]{8}$/;
 /** TVBox 站点 id = `${sourceId}:${key}`，会作为设备 vod.siteIds 的引用值。 */
 const VOD_SITE_ID_RE = /^[A-Za-z0-9_:-]{1,96}$/;
 
-const VALID_SITE_IDS = CATALOG.sites.filter((item) => !item.retired).map((item) => item.id);
-const RETIRED_SITE_IDS = new Set(CATALOG.sites.filter((item) => item.retired).map((item) => item.id));
 const VALID_MENU_IDS = CATALOG.menus.map((item) => item.id);
 
 /**
@@ -131,8 +129,6 @@ function idIndex(ids) {
   return map;
 }
 
-const VALID_SITE_BY_LOWER = idIndex(VALID_SITE_IDS);
-const RETIRED_SITE_BY_LOWER = idIndex([...RETIRED_SITE_IDS]);
 const VALID_MENU_BY_LOWER = idIndex(VALID_MENU_IDS);
 const VALID_PROMPTS = new Set(CATALOG.updatePrompts);
 const VALID_NOTICE_MODES = new Set(CATALOG.noticeModes);
@@ -297,10 +293,6 @@ function filterIds(raw, validIndex, seed, field, warnings) {
   const seen = new Set();
   for (const item of raw) {
     const key = item.trim().toLowerCase();
-    if (RETIRED_SITE_BY_LOWER.has(key)) {
-      warnings.push(`${field}: 忽略退役站点 ${key}`);
-      continue;
-    }
     const canonical = validIndex.get(key);
     if (canonical === undefined) {
       warnings.push(`${field}: 忽略未知 id ${key}`);
@@ -317,27 +309,8 @@ function filterIds(raw, validIndex, seed, field, warnings) {
   return result;
 }
 
-function normalizeSites(part, warnings) {
-  const base = clone(SEED.sections.sites);
-  base.managed = bool(part.managed, false, 'sites.managed');
-  let policy = str(part.policy, 'whitelist', 'sites.policy', 32);
-  if (policy !== 'whitelist') {
-    warnings.push('sites.policy: v1 仅支持 whitelist，已回退');
-    policy = 'whitelist';
-  }
-  base.policy = policy;
-  base.enabledSiteIds = filterIds(
-    strList(part.enabledSiteIds, 'sites.enabledSiteIds'),
-    VALID_SITE_BY_LOWER,
-    base.enabledSiteIds,
-    'sites.enabledSiteIds',
-    warnings,
-  );
-  return base;
-}
-
-/** 一级导航块：IPTV / 影音（类 TVBox）/ 直播 / 设置；二级项沿用菜单 id。 */
-const VALID_GROUP_IDS = new Set(['iptv', 'vod', 'live', 'settings']);
+/** 一级导航块：IPTV / 影音（类 TVBox）/ 设置；二级项沿用菜单 id。 */
+const VALID_GROUP_IDS = new Set(['iptv', 'vod', 'settings']);
 const VALID_CHILD_IDS = new Set([...VALID_MENU_IDS, 'settings']);
 const MAX_NAV_GROUPS = 8;
 
@@ -944,7 +917,6 @@ export function expandVodSites(sections, library = null) {
 }
 
 const NORMALIZERS = {
-  sites: normalizeSites,
   navigation: normalizeNavigation,
   startup: normalizeStartup,
   update: normalizeUpdate,

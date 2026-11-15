@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from cloud.app import create_app
-from cloud.schema import VALID_SITE_IDS
+from cloud.schema import SECTION_KEYS, VALID_MENU_IDS
 from cloud.storage import FileStorage
 from tests.helpers import call, json_body
 
@@ -24,7 +24,10 @@ class ApiTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _payload(self):
-        return {"sections": {"sites": {"managed": True, "enabledSiteIds": ["bilibili", "huya", "iptv"]}}}
+        return {"sections": {"navigation": {
+            "managed": True,
+            "railMenuIds": ["iptv", "vodBrowse", "moviePlayback"],
+        }}}
 
     def test_health_and_seed(self):
         status, _, body = call(self.app, "GET", "/health")
@@ -53,7 +56,12 @@ class ApiTests(unittest.TestCase):
         status, headers, body = call(self.app, "GET", "/api/config/catalog",
                                      headers={"Accept-Encoding": "gzip"})
         self.assertEqual(headers["Content-Encoding"], "gzip")
-        self.assertEqual(len(json.loads(body)["sites"]), 35)
+        catalog = json.loads(body)
+        # 直播平台已整体下线：catalog 里不再有站点白名单，只保留 IPTV/TVBox 菜单。
+        self.assertEqual(catalog["sites"], [])
+        self.assertEqual(len(catalog["menus"]), 3)
+        self.assertEqual([item["id"] for item in catalog["menus"]],
+                         ["vodBrowse", "moviePlayback", "iptv"])
 
     def test_put_requires_explicit_revision(self):
         status, _, body = json_body(self.app, "PUT", "/api/config", self._payload())
@@ -73,8 +81,8 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(status.startswith("409"))
         conflict = json.loads(body)
         self.assertEqual(conflict["currentRevision"], 1)
-        self.assertEqual(conflict["document"]["sections"]["sites"]["enabledSiteIds"],
-                         ["bilibili", "huya", "iptv"])
+        self.assertEqual(conflict["document"]["sections"]["navigation"]["railMenuIds"],
+                         ["iptv", "vodBrowse", "moviePlayback"])
 
         status, _, body = call(self.app, "GET", "/api/config", query="since=0")
         self.assertTrue(status.startswith("200"))
@@ -88,22 +96,40 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(status.startswith("400"))
         self.assertEqual(self.storage.read()["revision"], 0)
 
-    def test_unknown_site_ids_filtered_and_empty_fallback(self):
+    def test_unknown_menu_ids_filtered_and_empty_fallback(self):
         status, _, body = json_body(
             self.app, "PUT", "/api/config",
-            {"sections": {"sites": {"managed": True, "enabledSiteIds": ["douyu", "alien"]}}},
+            {"sections": {"navigation": {
+                "managed": True, "railMenuIds": ["iptv", "alien"]}}},
             headers={"If-Match": "0"})
         self.assertIn("alien", str(json.loads(body)["warnings"]))
         doc = self.storage.read()
-        self.assertEqual(doc["sections"]["sites"]["enabledSiteIds"], ["douyu"])
+        self.assertEqual(doc["sections"]["navigation"]["railMenuIds"], ["iptv"])
 
         status, _, body = json_body(
             self.app, "PUT", "/api/config",
-            {"sections": {"sites": {"managed": True, "enabledSiteIds": []}}},
+            {"sections": {"navigation": {"managed": True, "railMenuIds": []}}},
             headers={"If-Match": "1"})
         self.assertTrue(status.startswith("200"))
-        self.assertEqual(self.storage.read()["sections"]["sites"]["enabledSiteIds"],
-                         list(VALID_SITE_IDS))
+        self.assertEqual(sorted(self.storage.read()["sections"]["navigation"]["railMenuIds"]),
+                         sorted(VALID_MENU_IDS))
+
+    def test_retired_sites_section_is_ignored(self):
+        """老设备/老编辑器仍上传 sections.sites 时必须安全忽略，不能污染文档。"""
+        self.assertNotIn("sites", SECTION_KEYS)
+        status, _, body = json_body(
+            self.app, "PUT", "/api/config",
+            {"sections": {
+                "navigation": {"managed": True, "railMenuIds": ["iptv"]},
+                "sites": {"managed": True, "enabledSiteIds": ["bilibili", "douyu"]},
+            }},
+            headers={"If-Match": "0"})
+        self.assertTrue(status.startswith("200"))
+        warnings = json.loads(body)["warnings"]
+        self.assertTrue(any("sites" in item for item in warnings))
+        sections = self.storage.read()["sections"]
+        self.assertNotIn("sites", sections)
+        self.assertEqual(sections["navigation"]["railMenuIds"], ["iptv"])
 
     def test_revisions_and_rollback(self):
         for revision in range(2):

@@ -8,8 +8,9 @@ from cloud.schema import (
     MAX_IPTV_CHANNELS,
     MAX_VOD_SITES,
     MAX_VOD_SITES_PER_SOURCE,
+    SECTION_KEYS,
+    VALID_GROUP_IDS,
     VALID_MENU_IDS,
-    VALID_SITE_IDS,
     empty_library,
     expand_iptv_channels,
     normalize_document,
@@ -35,43 +36,52 @@ class SchemaTests(unittest.TestCase):
 
     def test_unknown_section_is_ignored_with_warning(self):
         sections, warnings = normalize_sections({"typo": {"managed": True}})
-        self.assertEqual(set(sections), {"sites", "navigation", "startup", "update",
-                                         "iptv", "vod"})
+        self.assertEqual(set(sections), set(SECTION_KEYS))
+        self.assertNotIn("sites", sections)
         self.assertTrue(any("typo" in item for item in warnings))
 
-    def test_unknown_and_retired_site_ids_are_filtered(self):
+    def test_retired_live_sites_section_is_ignored(self):
+        """直播平台节已下线：老文档带 sites 时不得进入规范化结果。"""
         sections, warnings = normalize_sections({
-            "sites": {"managed": True, "enabledSiteIds": ["bilibili", "douyu", "not_a_site", "huajiao", "BILIBILI"]}
+            "navigation": {"managed": True, "railMenuIds": ["iptv"]},
+            "sites": {"managed": True, "enabledSiteIds": ["bilibili", "douyu"]},
         })
-        self.assertEqual(sections["sites"]["enabledSiteIds"], ["bilibili", "douyu"])
-        self.assertTrue(len(warnings) >= 2)
+        self.assertNotIn("sites", SECTION_KEYS)
+        self.assertNotIn("sites", sections)
+        self.assertEqual(sections["navigation"]["railMenuIds"], ["iptv"])
+        self.assertTrue(any("sites" in item for item in warnings))
+        self.assertEqual(set(VALID_GROUP_IDS), {"iptv", "vod", "settings"})
 
-    def test_empty_site_list_falls_back_to_full_seed(self):
-        sections, warnings = normalize_sections({"sites": {"managed": True, "enabledSiteIds": []}})
-        self.assertEqual(sections["sites"]["enabledSiteIds"], list(VALID_SITE_IDS))
-        self.assertTrue(any("回退内置全量" in item for item in warnings))
+    def test_unknown_menu_ids_are_filtered(self):
+        sections, warnings = normalize_sections({
+            "navigation": {"managed": True,
+                           "railMenuIds": ["iptv", "favorite", "not_a_menu", "IPTV"]}
+        })
+        self.assertEqual(sections["navigation"]["railMenuIds"], ["iptv"])
+        self.assertTrue(any("favorite" in item for item in warnings))
 
     def test_empty_menu_list_falls_back_to_default_order(self):
         sections, warnings = normalize_sections({"navigation": {"managed": True, "railMenuIds": []}})
-        self.assertEqual(sections["navigation"]["railMenuIds"], list(VALID_MENU_IDS))
+        self.assertEqual(sorted(sections["navigation"]["railMenuIds"]),
+                         sorted(VALID_MENU_IDS))
         self.assertTrue(any("回退内置全量" in item for item in warnings))
 
     def test_camel_case_menu_ids_are_kept(self):
         """回归：客户端用驼峰 id，服务端曾统一转小写比对导致这两项被丢弃。"""
         sections, warnings = normalize_sections({"navigation": {
             "managed": True,
-            "railMenuIds": ["favorite", "favoriteAreas", "moviePlayback", "search"],
+            "railMenuIds": ["vodBrowse", "moviePlayback", "iptv"],
         }})
         self.assertEqual(sections["navigation"]["railMenuIds"],
-                         ["favorite", "favoriteAreas", "moviePlayback", "search"])
+                         ["vodBrowse", "moviePlayback", "iptv"])
         self.assertEqual(warnings, [])
 
     def test_menu_ids_match_case_insensitively_but_keep_canonical(self):
         sections, _ = normalize_sections({"navigation": {
-            "railMenuIds": ["favoriteareas", "MOVIEPLAYBACK"],
+            "railMenuIds": ["vodBrowse".lower(), "MOVIEPLAYBACK"],
         }})
         self.assertEqual(sections["navigation"]["railMenuIds"],
-                         ["favoriteAreas", "moviePlayback"])
+                         ["vodBrowse", "moviePlayback"])
 
     def test_enum_errors_are_strict(self):
         with self.assertRaises(ConfigError):
@@ -121,9 +131,10 @@ class NavigationGroupsTests(unittest.TestCase):
     def test_default_navigation_groups_from_seed(self):
         sections, _ = normalize_sections({"navigation": {}})
         nav = sections["navigation"]
-        self.assertEqual(len(nav["groups"]), 4)
+        self.assertEqual(len(nav["groups"]), 3)
         self.assertEqual([g["id"] for g in nav["groups"]],
-                         ["iptv", "vod", "live", "settings"])
+                         ["iptv", "vod", "settings"])
+        self.assertEqual(nav["railMenuIds"], ["iptv", "vodBrowse", "moviePlayback"])
         self.assertEqual(nav["defaultGroupId"], "iptv")
         self.assertEqual(seed_document()["sections"]["navigation"]["defaultGroupId"],
                          "iptv")
@@ -133,17 +144,19 @@ class NavigationGroupsTests(unittest.TestCase):
             {"id": "IPTV", "label": "电视",
              "children": ["iptv", "unknown", "iptv", "FAVORITEAREAS"]},
             {"id": "nope", "label": "非法", "children": []},
-            {"id": "vod", "children": ["favoriteAreas"]},
+            {"id": "live", "label": "直播（已下线）", "children": ["iptv"]},
+            {"id": "vod", "children": ["favoriteAreas", "moviePlayback"]},
         ]}})
         groups = sections["navigation"]["groups"]
+        # live 一级块已从白名单移除，会被当成非法块过滤掉。
         self.assertEqual([g["id"] for g in groups], ["iptv", "vod"])
         # 未知 child 与重复 child 被过滤；children 按原始大小写精确匹配，故
-        # FAVORITEAREAS 不算有效（catalog 里是 favoriteAreas）。
+        # FAVORITEAREAS 不算有效（catalog 里也已无这个直播菜单）。
         self.assertEqual(groups[0]["children"], ["iptv"])
         self.assertEqual(groups[0]["label"], "电视")
         self.assertEqual(groups[0]["icon"], "")
         self.assertEqual(groups[1]["label"], "vod")  # label 缺省回退 id
-        self.assertEqual(groups[1]["children"], ["favoriteAreas"])
+        self.assertEqual(groups[1]["children"], ["moviePlayback"])
         self.assertTrue(any("非法或重复的一级块" in w for w in warnings))
         self.assertTrue(any("未知二级项" in w for w in warnings))
 
@@ -153,7 +166,7 @@ class NavigationGroupsTests(unittest.TestCase):
             "not-a-dict",
         ]}})
         self.assertEqual([g["id"] for g in sections["navigation"]["groups"]],
-                         ["iptv", "vod", "live", "settings"])
+                         ["iptv", "vod", "settings"])
         self.assertTrue(any("回退内置默认分组" in w for w in warnings))
 
     def test_default_group_id_falls_back_when_not_in_groups(self):
@@ -455,7 +468,7 @@ class ExpandIptvChannelsTests(unittest.TestCase):
         self.assertEqual(sections["iptv"]["packages"][0]["channels"][0]["name"], "A")
 
     def test_missing_iptv_section_returns_copy(self):
-        sections = {"sites": {}}
+        sections = {"navigation": {}}
         self.assertEqual(expand_iptv_channels(sections), sections)
 
     def test_integrates_with_normalized_sections(self):

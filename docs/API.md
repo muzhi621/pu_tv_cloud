@@ -56,12 +56,10 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
   "revision": 42,
   "updatedAt": "2026-11-11T08:00:00+08:00",
   "sections": {
-    "sites": {"managed": true, "policy": "whitelist", "enabledSiteIds": ["bilibili", "huya", "iptv"]},
-    "navigation": {"managed": true, "railMenuIds": ["favorite", "hot", "areas", "iptv"],
+    "navigation": {"managed": true, "railMenuIds": ["iptv", "vodBrowse", "moviePlayback"],
                    "groups": [
                      {"id": "iptv", "label": "IPTV", "icon": "live_tv", "children": ["iptv"]},
-                     {"id": "vod", "label": "影音", "icon": "movie", "children": ["moviePlayback"]},
-                     {"id": "live", "label": "直播", "icon": "tv", "children": ["favorite", "hot", "areas", "favoriteAreas", "search", "history"]},
+                     {"id": "vod", "label": "影音", "icon": "movie", "children": ["vodBrowse", "moviePlayback"]},
                      {"id": "settings", "label": "设置", "icon": "settings", "children": ["settings"]}
                    ],
                    "defaultGroupId": "iptv",
@@ -145,7 +143,7 @@ curl -X PUT "$BASE/api/config" \
   -H "Authorization: Bearer $WRITE_TOKEN" \
   -H "Content-Type: application/json" \
   -H 'If-Match: "42"' \
-  -d '{"sections":{"sites":{"managed":true,"enabledSiteIds":["bilibili","huya","iptv"]}}}'
+  -d '{"sections":{"navigation":{"managed":true,"railMenuIds":["iptv","vodBrowse","moviePlayback"]}}}'
 ```
 
 成功 `200`：

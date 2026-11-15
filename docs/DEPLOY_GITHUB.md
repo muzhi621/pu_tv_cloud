@@ -102,11 +102,11 @@ curl -i -H "Authorization: Bearer $READ_TOKEN" https://YOUR_DOMAIN/api/config
 curl -i -H "Authorization: Bearer $READ_TOKEN" \
      -H 'If-None-Match: "0"' https://YOUR_DOMAIN/api/config
 
-# 4) 写入：关闭斗鱼，只留 B 站 / 虎牙 / IPTV
+# 4) 写入：把导航接管为 IPTV + 影音（TVBox），默认落在 IPTV
 curl -i -X PUT https://YOUR_DOMAIN/api/config \
   -H "Authorization: Bearer $WRITE_TOKEN" \
   -H 'If-Match: 0' -H 'Content-Type: application/json' \
-  -d '{"sections":{"sites":{"managed":true,"enabledSiteIds":["bilibili","huya","iptv"]}}}'
+  -d '{"sections":{"navigation":{"managed":true,"railMenuIds":["iptv","vodBrowse","moviePlayback"],"defaultGroupId":"iptv"}}}'
 # 200 revision=1；被并发改过则 409 并带回当前文档
 
 # 5) 历史与回滚
@@ -223,7 +223,7 @@ flutter build apk --release \
 | 接口 | `POST /api/iptv/fetch` | **写令牌**、最多 10 个公网 http(s) 地址、单源 2 MiB / 10s、最多 3 跳重定向逐跳复核 SSRF、UTF-8 / GBK 自动识别；仅 EdgeOne |
 | 接口 | `GET/POST /api/devices` | GET 返回在线离线与 `pushedAt` 等；POST 8 种动作、单台或批量（≤50）、`{action,total,failed,results}`，单台失败不影响其它 |
 | 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备被拒绝下发配置 |
-| 契约 | `navigation.groups` / `defaultGroupId` / `startup.exitDialog` | 四大类一级栏 + 右侧二级菜单、退出 App 弹窗云端下发 |
+| 契约 | `navigation.groups` / `defaultGroupId` / `startup.exitDialog` | 三大类一级栏（IPTV / 影音 / 设置）+ 右侧二级菜单、退出 App 弹窗云端下发；直播平台节 `sites` 已下线 |
 | 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 3000 |
 | 接口 | `GET/PUT /api/library` | 全局资源库（IPTV 源/套餐 + TVBox 源/站点）；无库返回空库 revision 0；PUT 需 `If-Match`，返回 `affectedDevices` |
 | 契约 | `vod` 节、`iptv.packageIds` / `lockLibrary` / `libraryRevision` | 设备只存库 id 引用；锁定后冻结当前内容；revision 由服务端维护 |

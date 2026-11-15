@@ -205,11 +205,11 @@ curl -i -H "Authorization: Bearer $READ_TOKEN" https://YOUR_DOMAIN/api/config
 curl -i -H "Authorization: Bearer $READ_TOKEN" \
      -H 'If-None-Match: "0"' https://YOUR_DOMAIN/api/config
 
-# 4) 写入：关闭斗鱼、只留 B 站 / 虎牙 / IPTV
+# 4) 写入：把导航接管为 IPTV + 影音（TVBox），默认落在 IPTV
 curl -i -X PUT https://YOUR_DOMAIN/api/config \
   -H "Authorization: Bearer $WRITE_TOKEN" \
   -H 'If-Match: 0' -H 'Content-Type: application/json' \
-  -d '{"sections":{"sites":{"managed":true,"enabledSiteIds":["bilibili","huya","iptv"]}}}'
+  -d '{"sections":{"navigation":{"managed":true,"railMenuIds":["iptv","vodBrowse","moviePlayback"],"defaultGroupId":"iptv"}}}'
 # -> 200 revision=1；若被别人改过则 409 并带回当前文档
 
 # 5) 历史与回滚
@@ -378,7 +378,7 @@ python scripts/build_fc_package.py
 | 接口 | `GET /api/devices` | 返回 `{devices,total,online,blocked,onlineWindowMinutes}`；每台带 `online` / `status` / `lastSeenAgo` / `hidden` / `blocked` / `comment` / `pushedAt` / `pushedRevision` |
 | 接口 | `POST /api/devices` | 8 种动作 `rename` / `comment` / `delete` / `restore` / `purge` / `unblock` / `reset` / `push`；单台或批量（去重≤50）；响应 `{action,total,failed,results}`，单台失败不影响其它台 |
 | 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备请求 `/api/config` 被拒 |
-| 契约 | `navigation.groups` / `defaultGroupId` | 四大类一级栏（`iptv` / `vod` / `live` / `settings`）+ 右侧二级菜单；最多 8 组，默认 `iptv` |
+| 契约 | `navigation.groups` / `defaultGroupId` | 三大类一级栏（`iptv` / `vod` / `settings`）+ 右侧二级菜单（`iptv` / `vodBrowse` / `moviePlayback`）；最多 8 组，默认 `iptv`；直播平台节 `sites` 已下线 |
 | 契约 | `startup.exitDialog` | 退出 App 弹窗，云端下发；`enabled=false` 时终端沿用本地原弹窗 |
 | 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 `channels` 上限 3000 |
 | 接口 | `GET/PUT /api/library` | 全局资源库（IPTV 源/套餐 + TVBox 源/站点）；无库返回空库 revision 0；PUT 需 `If-Match`，返回 `affectedDevices` 预计影响台数 |

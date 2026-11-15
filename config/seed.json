@@ -3,65 +3,39 @@
   "revision": 0,
   "updatedAt": "2026-01-01T00:00:00+08:00",
   "sections": {
-    "sites": {
-      "managed": false,
-      "policy": "whitelist",
-      "enabledSiteIds": [
-        "weibo",
-        "niconico",
-        "bilibili",
-        "douyu",
-        "huya",
-        "douyin",
-        "kuaishou",
-        "cc",
-        "iptv",
-        "twitch",
-        "soop",
-        "yy",
-        "acfun",
-        "picarto",
-        "twitcasting",
-        "missevan",
-        "inke",
-        "kilakila",
-        "xiaohongshu",
-        "showroom",
-        "chzzk",
-        "kick",
-        "liveme",
-        "tiktok",
-        "youtube",
-        "bigo",
-        "pandalive",
-        "fc2live",
-        "steambroadcast",
-        "jdlive",
-        "kugoulive",
-        "baidulive",
-        "looklive",
-        "17live",
-        "sixroom"
-      ]
-    },
     "navigation": {
       "managed": false,
       "railMenuIds": [
-        "favorite",
-        "hot",
-        "areas",
-        "favoriteAreas",
+        "iptv",
         "vodBrowse",
-        "moviePlayback",
-        "search",
-        "history",
-        "iptv"
+        "moviePlayback"
       ],
       "groups": [
-        { "id": "iptv", "label": "IPTV", "icon": "live_tv", "children": ["iptv"] },
-        { "id": "vod", "label": "影音", "icon": "movie", "children": ["vodBrowse", "moviePlayback"] },
-        { "id": "live", "label": "直播", "icon": "tv", "children": ["favorite", "hot", "areas", "favoriteAreas", "search", "history"] },
-        { "id": "settings", "label": "设置", "icon": "settings", "children": ["settings"] }
+        {
+          "id": "iptv",
+          "label": "IPTV",
+          "icon": "live_tv",
+          "children": [
+            "iptv"
+          ]
+        },
+        {
+          "id": "vod",
+          "label": "影音",
+          "icon": "movie",
+          "children": [
+            "vodBrowse",
+            "moviePlayback"
+          ]
+        },
+        {
+          "id": "settings",
+          "label": "设置",
+          "icon": "settings",
+          "children": [
+            "settings"
+          ]
+        }
       ],
       "defaultGroupId": "iptv",
       "sidebarExpanded": false,

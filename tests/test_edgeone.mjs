@@ -80,7 +80,8 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(doc.schemaVersion, 1);
     assert.equal(doc.revision, 0);
     assert.deepEqual(Object.keys(doc.sections).sort(),
-      ['iptv', 'navigation', 'sites', 'startup', 'update', 'vod']);
+      ['iptv', 'navigation', 'startup', 'update', 'vod']);
+    assert.ok(!('sites' in doc.sections));
   });
 
   await t.test('since / If-None-Match 命中返回 304', async () => {
@@ -92,18 +93,18 @@ test('EdgeOne 配置服务完整流程', async (t) => {
   });
 
   await t.test('PUT 缺少 If-Match 返回 400', async () => {
-    const res = await configPut(ctx('PUT', '/api/config', { body: { sections: { sites: { managed: true } } } }));
+    const res = await configPut(ctx('PUT', '/api/config', { body: { sections: { navigation: { managed: true } } } }));
     assert.equal(res.status, 400);
     assert.equal((await json(res)).error, 'invalid_config');
   });
 
-  await t.test('PUT 写入、过滤未知 id、返回 warnings', async () => {
+  await t.test('PUT 写入、过滤未知 id、老直播节被忽略', async () => {
     const res = await configPut(ctx('PUT', '/api/config', {
       headers: { 'If-Match': '0' },
       body: {
         sections: {
           sites: { managed: true, enabledSiteIds: ['bilibili', 'not_a_site', 'douyu'] },
-          navigation: { managed: true, railMenuIds: ['favorite', 'hot'] },
+          navigation: { managed: true, railMenuIds: ['iptv', 'vodBrowse', 'not_a_menu'] },
         },
       },
     }));
@@ -112,38 +113,39 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     const data = await json(res);
     assert.equal(data.revision, 1);
     assert.equal(data.devMode, true);
-    assert.ok(data.warnings.some((line) => line.includes('not_a_site')));
+    assert.ok(data.warnings.some((line) => line.includes('not_a_menu')));
+    assert.ok(data.warnings.some((line) => line.includes('sites')));
     const doc = await json(await configGet(ctx('GET', '/api/config')));
-    assert.equal(doc.sections.sites.enabledSiteIds.join(','), 'bilibili,douyu');
-    assert.equal(doc.sections.sites.managed, true);
-    assert.deepEqual(doc.sections.navigation.railMenuIds, ['favorite', 'hot']);
+    assert.ok(!('sites' in doc.sections));
+    assert.equal(doc.sections.navigation.managed, true);
+    assert.deepEqual(doc.sections.navigation.railMenuIds, ['iptv', 'vodBrowse']);
   });
 
-  await t.test('驼峰菜单 id（favoriteAreas/moviePlayback）不被小写化误杀', async () => {
+  await t.test('驼峰菜单 id（vodBrowse/moviePlayback）不被小写化误杀', async () => {
     // 回归：客户端 AppMenuItem 用的是驼峰 id，服务端曾统一转小写比对，
     // 导致这两项被判为未知 id 而丢弃，开启导航管控后电视上直接少两个菜单。
     const [sections, warnings] = normalizeSections({
       navigation: {
         managed: true,
-        railMenuIds: ['favorite', 'favoriteAreas', 'moviePlayback', 'search'],
+        railMenuIds: ['vodBrowse', 'moviePlayback', 'iptv'],
       },
     });
     assert.deepEqual(sections.navigation.railMenuIds,
-      ['favorite', 'favoriteAreas', 'moviePlayback', 'search']);
+      ['vodBrowse', 'moviePlayback', 'iptv']);
     assert.equal(warnings.length, 0);
   });
 
   await t.test('大小写不敏感匹配，但写回 catalog 里的原始 id', async () => {
     const [sections] = normalizeSections({
-      navigation: { railMenuIds: ['favoriteareas', 'MOVIEPLAYBACK'] },
+      navigation: { railMenuIds: ['vodbrowse', 'MOVIEPLAYBACK'] },
     });
-    assert.deepEqual(sections.navigation.railMenuIds, ['favoriteAreas', 'moviePlayback']);
+    assert.deepEqual(sections.navigation.railMenuIds, ['vodBrowse', 'moviePlayback']);
   });
 
   await t.test('revision 冲突返回 409 并带回当前文档', async () => {
     const res = await configPut(ctx('PUT', '/api/config', {
       headers: { 'If-Match': '0' },
-      body: { sections: { sites: { managed: false } } },
+      body: { sections: { navigation: { managed: false } } },
     }));
     assert.equal(res.status, 409);
     const data = await json(res);
@@ -165,7 +167,7 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(data.rolledBackFrom, 1);
     const doc = await json(await configGet(ctx('GET', '/api/config')));
     assert.equal(doc.revision, 2);
-    assert.equal(doc.sections.sites.enabledSiteIds.join(','), 'bilibili,douyu');
+    assert.deepEqual(doc.sections.navigation.railMenuIds, ['iptv', 'vodBrowse']);
   });
 
   await t.test('回滚不存在的快照返回 400', async () => {
@@ -174,12 +176,13 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal((await json(res)).error, 'invalid_config');
   });
 
-  await t.test('catalog 返回站点与菜单目录', async () => {
+  await t.test('catalog 只返回 IPTV/TVBox 菜单，直播平台已下线', async () => {
     const res = await catalogGet(ctx('GET', '/api/config/catalog'));
     assert.equal(res.status, 200);
     const data = await json(res);
-    assert.equal(data.sites.length, 35);
-    assert.equal(data.menus.length, 9);
+    assert.deepEqual(data.sites, []);
+    assert.deepEqual(data.menus.map((item) => item.id),
+      ['vodBrowse', 'moviePlayback', 'iptv']);
     assert.ok(data.menus.some((item) => item.id === 'iptv'));
     assert.ok(data.menus.some((item) => item.id === 'vodBrowse'));
     assert.deepEqual(data.updatePrompts, ['silent', 'dialog', 'force']);
@@ -203,7 +206,7 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     const readOnly = await configPut(ctx('PUT', '/api/config', {
       env,
       headers: { Authorization: 'Bearer read-secret', 'If-Match': '2' },
-      body: { sections: { sites: { managed: true } } },
+      body: { sections: { navigation: { managed: true } } },
     }));
     assert.equal(readOnly.status, 401);
     const ok = await configGet(ctx('GET', '/api/config', {
@@ -213,7 +216,7 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     const write = await configPut(ctx('PUT', '/api/config', {
       env,
       headers: { Authorization: 'Bearer write-secret', 'If-Match': '2' },
-      body: { sections: { sites: { managed: true } } },
+      body: { sections: { navigation: { managed: true } } },
     }));
     assert.equal(write.status, 200);
   });
@@ -229,12 +232,20 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(enabled.headers.get('Access-Control-Allow-Origin'), 'https://admin.example.com');
   });
 
-  await t.test('规范化：空列表兜底、类型错误、未知节', async () => {
-    const [empty, emptyWarnings] = normalizeSections({ sites: { enabledSiteIds: [] } });
-    assert.equal(empty.sites.enabledSiteIds.length, 35);
+  await t.test('规范化：空列表兜底、类型错误、老直播节与未知节', async () => {
+    const [empty, emptyWarnings] = normalizeSections({ navigation: { railMenuIds: [] } });
+    assert.equal(empty.navigation.railMenuIds.length, 3);
     assert.ok(emptyWarnings.some((line) => line.includes('回退内置全量')));
 
-    assert.throws(() => normalizeSections({ sites: { managed: 'yes' } }), /必须是布尔值/);
+    const [legacy, legacyWarnings] = normalizeSections({
+      sites: { managed: true, enabledSiteIds: ['bilibili'] },
+      navigation: { managed: true, railMenuIds: ['iptv'] },
+    });
+    assert.ok(!('sites' in legacy));
+    assert.deepEqual(legacy.navigation.railMenuIds, ['iptv']);
+    assert.ok(legacyWarnings.some((line) => line.includes('sites')));
+
+    assert.throws(() => normalizeSections({ navigation: { managed: 'yes' } }), /必须是布尔值/);
     const [, unknownWarnings] = normalizeSections({ futureSection: { foo: 1 } });
     assert.ok(unknownWarnings.some((line) => line.includes('忽略未知节')));
 
@@ -292,7 +303,7 @@ test('KV 缺失时自动回退 Blob 后端', async (t) => {
 
     const put = await configPut(ctx('PUT', '/api/config', {
       headers: { 'If-Match': '0' },
-      body: { sections: { sites: { managed: true, policy: 'whitelist', enabledSiteIds: ['bilibili', 'huya'] } } },
+      body: { sections: { navigation: { managed: true, railMenuIds: ['iptv', 'moviePlayback'] } } },
     }));
     assert.equal(put.status, 200);
     assert.equal(put.headers.get('X-Revision'), '1');
@@ -301,7 +312,7 @@ test('KV 缺失时自动回退 Blob 后端', async (t) => {
     const fresh = await configGet(ctx('GET', '/api/config'));
     const doc = await json(fresh);
     assert.equal(doc.revision, 1);
-    assert.deepEqual(doc.sections.sites.enabledSiteIds, ['bilibili', 'huya']);
+    assert.deepEqual(doc.sections.navigation.railMenuIds, ['iptv', 'moviePlayback']);
 
     const notModified = await configGet(ctx('GET', '/api/config?since=1'));
     assert.equal(notModified.status, 304);
@@ -375,17 +386,18 @@ test('每设备完整独立配置与设备注册表', async (t) => {
   });
 
   await t.test('设备 A 的修改不影响全局模板与设备 B', async () => {
-    const res = await put('tv-living-room', { sites: { managed: true, enabledSiteIds: ['bilibili'] } }, 1);
+    const res = await put('tv-living-room',
+      { navigation: { managed: true, railMenuIds: ['iptv'] } }, 1);
     assert.equal(res.status, 200);
     const global = await json(await get(null));
     assert.equal(global.revision, 0);
-    assert.equal(global.sections.sites.managed, false);
+    assert.equal(global.sections.navigation.managed, false);
     const a = await json(await get('tv-living-room'));
     assert.equal(a.revision, 2);
-    assert.deepEqual(a.sections.sites.enabledSiteIds, ['bilibili']);
+    assert.deepEqual(a.sections.navigation.railMenuIds, ['iptv']);
     const b = await json(await get('tv-bedroom'));
     assert.equal(b.revision, 1);
-    assert.equal(b.sections.sites.managed, false);
+    assert.equal(b.sections.navigation.managed, false);
   });
 
   await t.test('非法 deviceId 返回 400，不写入任何键', async () => {
@@ -412,7 +424,7 @@ test('每设备完整独立配置与设备注册表', async (t) => {
     })));
     assert.equal(reset.results[0].revision, 3);
     const after = await json(await get('tv-living-room'));
-    assert.equal(after.sections.sites.managed, false);
+    assert.equal(after.sections.navigation.managed, false);
   });
 
   await t.test('历史与回滚按设备隔离', async () => {
@@ -939,15 +951,18 @@ test('退出弹窗与一级导航分组契约', async (t) => {
       /必须是 .* 之一/);
   });
 
-  await t.test('navigation.groups 四大类与 defaultGroupId 兜底', () => {
+  await t.test('navigation.groups 三大类与 defaultGroupId 兜底', () => {
     const [defaults] = normalizeSections({});
-    assert.equal(defaults.navigation.groups.length, 4);
+    assert.equal(defaults.navigation.groups.length, 3);
     assert.deepEqual(defaults.navigation.groups.map((g) => g.id),
-      ['iptv', 'vod', 'live', 'settings']);
+      ['iptv', 'vod', 'settings']);
+    assert.deepEqual(defaults.navigation.railMenuIds,
+      ['iptv', 'vodBrowse', 'moviePlayback']);
     assert.equal(defaults.navigation.defaultGroupId, 'iptv');
     const [custom, warnings] = normalizeSections({ navigation: {
       groups: [
         { id: 'iptv', label: '电视', children: ['iptv', 'unknown'] },
+        { id: 'live', label: '直播（已下线）', children: ['iptv'] },
         { id: 'nope', label: '非法', children: [] },
       ],
       defaultGroupId: 'nope',
@@ -976,6 +991,26 @@ test('退出弹窗与一级导航分组契约', async (t) => {
     assert.ok(source.includes("'navigation.groups.' + index + '.children'"),
       '缺少分组 children 的编辑入口（旧文档无法补上影视点播）');
     assert.ok(source.includes("id: 'settings'"), 'settings 是合法二级项，须在分组可选项里');
+  });
+
+  await t.test('编辑器与种子配置已彻底移除直播平台', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const html = await readFile(new URL('../editor/index.html', import.meta.url), 'utf8');
+    const source = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+    const seed = JSON.parse(await readFile(new URL('../config/seed.json', import.meta.url), 'utf8'));
+    const catalog = JSON.parse(await readFile(new URL('../config/site_catalog.json', import.meta.url), 'utf8'));
+
+    assert.ok(!html.includes('data-tab="sites"'), '编辑器仍有直播平台页签');
+    assert.ok(!source.includes('renderSites'), '编辑器仍有直播平台渲染逻辑');
+    assert.match(html, /data-tab="iptv" class="active"/, '默认页签应为 IPTV 下发');
+    assert.match(source, /activeTab:\s*'iptv'/);
+
+    assert.ok(!('sites' in seed.sections), 'seed 仍带直播平台节');
+    assert.deepEqual(catalog.sites, [], 'catalog 仍列出直播平台');
+    assert.deepEqual(seed.sections.navigation.groups.map((g) => g.id),
+      ['iptv', 'vod', 'settings']);
+    assert.deepEqual(seed.sections.navigation.railMenuIds,
+      ['iptv', 'vodBrowse', 'moviePlayback']);
   });
 });
 
@@ -1450,11 +1485,11 @@ test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔
     await deviceGet('tv-hist');
     // 两次真实编辑 → 留下 revision 2、3 两条快照
     assert.equal((await devicePut('tv-hist', {
-      sites: { managed: true, enabledSiteIds: ['bilibili'] },
+      navigation: { managed: true, railMenuIds: ['iptv'] },
     }, 1)).status, 200);
     assert.equal((await devicePut('tv-hist', {
       iptv: { managed: true, packageIds: [PACKAGE_ID], libraryRevision: 4 },
-      sites: { managed: true, enabledSiteIds: ['bilibili'] },
+      navigation: { managed: true, railMenuIds: ['iptv', 'vodBrowse'] },
     }, 2)).status, 200);
 
     const before = await json(await revisionsGet(ctx('GET',

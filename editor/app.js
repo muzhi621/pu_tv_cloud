@@ -1,4 +1,4 @@
-/* 纯粹直播 TV · 云端配置编辑器（零依赖，直接由配置服务同源托管） */
+/* IPTV / TVBox 云端配置编辑器（零依赖，直接由配置服务同源托管） */
 'use strict';
 
 const state = {
@@ -31,7 +31,7 @@ const state = {
   original: null,
   catalog: null,
   revision: 0,
-  activeTab: 'sites',
+  activeTab: 'iptv',
   extraMode: null,
   extraData: null,
   dirty: false,
@@ -173,30 +173,6 @@ function selectField(path, label, options) {
       const name = typeof item === 'string' ? item : item.label;
       return '<option value="' + esc(value) + '"' + (value === current ? ' selected' : '') + '>' + esc(name) + '</option>';
     }).join('') + '</select></div>';
-}
-
-function renderSites() {
-  const model = state.doc.sections.sites;
-  const selected = new Set(model.enabledSiteIds || []);
-  const sites = state.catalog.sites || [];
-  const cards = sites.map((site) => {
-    const retired = !!site.retired;
-    return '<label class="site' + (retired ? ' retired' : '') + '">' +
-      '<input class="switch" type="checkbox" data-site="' + esc(site.id) + '"' +
-      (selected.has(site.id) ? ' checked' : '') + (retired ? ' disabled' : '') + '>' +
-      '<span class="name">' + esc(site.name) + '</span>' +
-      (retired ? '<span class="tag">退役</span>' : '') +
-      '<code>' + esc(site.id) + '</code></label>';
-  }).join('');
-  return '<h2>直播平台显示</h2>' +
-    '<p class="hint">取消勾选「斗鱼」，终端冷启动后斗鱼的菜单与页签即不显示。至少保留 1 个平台；退役站点由终端自动剔除。</p>' +
-    managedHtml('sites', '平台白名单') +
-    '<div class="toolbar">' +
-      '<button class="tiny" data-action="sites-all">全选</button>' +
-      '<button class="tiny" data-action="sites-none">全不选</button>' +
-      '<button class="tiny" data-action="sites-seed">恢复内置全量</button>' +
-      '<button class="tiny" data-action="sites-off-douyu">示例：关闭斗鱼</button>' +
-    '</div><div class="grid">' + cards + '</div>';
 }
 
 function renderNavigation() {
@@ -1910,11 +1886,11 @@ function renderPanel() {
     $('panel').innerHTML = '<p class="muted">请先点击右上角「连接并加载」。</p>';
     return;
   }
-  const renderers = { sites: renderSites, navigation: renderNavigation,
+  const renderers = { navigation: renderNavigation,
     startup: renderStartup, update: renderUpdate,
     iptv: renderIptvDispatch, 'iptv-lib': renderIptvLibrary,
     'vod-lib': renderVodLibrary, devices: renderDevices };
-  const renderer = renderers[state.activeTab] || renderSites;
+  const renderer = renderers[state.activeTab] || renderIptvDispatch;
   $('panel').innerHTML = renderer();
 }
 
@@ -2039,7 +2015,6 @@ function renderDeviceEditor() {
   const device = deviceById(id) || {};
   const sections = state.doc.sections;
   const catalog = state.catalog || { sites: [], menus: [] };
-  const sites = (catalog.sites || []).filter((item) => !item.retired);
   const menus = catalog.menus || [];
   const groups = (sections.navigation && sections.navigation.groups) || [];
   // 'settings' 是合法的二级项但不在站点 catalog 的 menus 里（它不是菜单页，
@@ -2063,14 +2038,9 @@ function renderDeviceEditor() {
     + '终端前台约 15 分钟内的下一次同步即生效。</p>'
     + '<div class="df-grid">'
 
-    + '<div class="df-block"><h3>直播平台显隐</h3>'
-    + dfCheck('sites.managed', '云端接管本节')
-    + dfMulti('sites.enabledSiteIds', sites, (item) => item.name || item.id)
-    + '</div>'
-
-    + '<div class="df-block"><h3>导航（左侧四大类）</h3>'
+    + '<div class="df-block"><h3>导航（左侧三大类）</h3>'
     + dfCheck('navigation.managed', '云端接管本节')
-    + '<p class="meta">一级栏固定为 ' + esc(groups.map((g) => g.label).join(' / ') || 'IPTV / 影音 / 直播 / 设置')
+    + '<p class="meta">一级栏固定为 ' + esc(groups.map((g) => g.label).join(' / ') || 'IPTV / 影音 / 设置')
     + '；下面的白名单控制全局可见的二级菜单，分组勾选控制每个一级块展开哪些项。</p>'
     + dfSelect('navigation.defaultGroupId', '启动默认一级块',
       groups.map((g) => ({ value: g.id, label: g.label })))
@@ -2081,7 +2051,7 @@ function renderDeviceEditor() {
           '<p class="meta">' + esc(group.label || group.id) + '</p>'
           + dfMulti('navigation.groups.' + index + '.children', childItems,
             (item) => item.name || item.id)).join('')
-      : '<p class="meta">当前文档还没有分组信息，保存一次后服务端会按默认四大类补齐。</p>')
+      : '<p class="meta">当前文档还没有分组信息，保存一次后服务端会按默认三大类补齐。</p>')
     + '</div>'
 
     + '<div class="df-block"><h3>开机公告</h3>'
@@ -2347,13 +2317,7 @@ function onFieldChange(target) {
 function onAction(button) {
   const action = button.dataset.action;
   if (action === 'goto-devices') { state.activeTab = 'devices'; render(); return; }
-  const sites = state.doc.sections.sites;
-  const allIds = state.catalog.sites.filter((item) => !item.retired).map((item) => item.id);
-  if (action === 'sites-all') sites.enabledSiteIds = allIds.slice();
-  else if (action === 'sites-none') sites.enabledSiteIds = [];
-  else if (action === 'sites-seed') sites.enabledSiteIds = allIds.slice();
-  else if (action === 'sites-off-douyu') sites.enabledSiteIds = allIds.filter((id) => id !== 'douyu');
-  else if (action === 'menu-up' || action === 'menu-down') {
+  if (action === 'menu-up' || action === 'menu-down') {
     const list = state.doc.sections.navigation.railMenuIds;
     const index = list.indexOf(button.dataset.id);
     const target = index + (action === 'menu-up' ? -1 : 1);
@@ -2373,15 +2337,6 @@ function onMenuToggle(target) {
   if (!target.checked && index >= 0) list.splice(index, 1);
   markDirty();
   renderPanel();
-}
-
-function onSiteToggle(target) {
-  const id = target.dataset.site;
-  const list = state.doc.sections.sites.enabledSiteIds;
-  const index = list.indexOf(id);
-  if (target.checked && index < 0) list.push(id);
-  if (!target.checked && index >= 0) list.splice(index, 1);
-  markDirty();
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -2436,8 +2391,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('panel').addEventListener('change', (event) => {
     const target = event.target;
     if (target.dataset.libInput) { onLibraryInput(target); return; }
-    if (target.dataset.site) onSiteToggle(target);
-    else if (target.dataset.menu) onMenuToggle(target);
+    if (target.dataset.menu) onMenuToggle(target);
     else onFieldChange(target);
   });
   $('panel').addEventListener('input', (event) => {
