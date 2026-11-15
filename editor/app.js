@@ -2373,6 +2373,14 @@ function deviceIptvBlock() {
     html += '<label class="df-check"><input type="checkbox" data-df="iptv.lockLibrary"'
       + (iptv.lockLibrary ? ' checked' : '') + '> 锁定资源库</label>'
       + '<p class="meta">锁定后该终端不再跟随资源库变化，保持当前频道表。</p>';
+    // 引用的套餐被删掉后，勾选框自然消失，但 id 还在文档里——不提示的话
+    // 用户只会看到「频道少了几个」，找不到原因。
+    const known = new Set(libPackages.map((pkg) => pkg.id));
+    const stale = arr(iptv.packageIds).filter((id) => !known.has(id));
+    if (stale.length) {
+      html += '<p class="meta">有 ' + stale.length + ' 个引用已失效（源套餐被删）：'
+        + esc(stale.join('、')) + '。取消勾选后重新选择即可。</p>';
+    }
   }
   return html + legacyIptvHtml(iptv);
 }
@@ -2399,6 +2407,12 @@ function deviceVodBlock() {
   const pickedSources = arr(vod.sourceIds);
   const pickedSites = arr(vod.siteIds);
   const allSites = arr(sites);
+  const knownSources = new Set(sources.map((src) => src.id));
+  const staleSources = pickedSources.filter((id) => !knownSources.has(id));
+  if (staleSources.length) {
+    html += '<p class="meta">有 ' + staleSources.length + ' 个源引用已失效（源被删）：'
+      + esc(staleSources.join('、')) + '。取消勾选后重新选择即可。</p>';
+  }
   html += '<p class="meta">整源下发：勾选后该源下所有站点都会下发。</p>'
     + '<div class="df-multi">' + sources.map((src) =>
       '<label><input type="checkbox" data-df-multi="vod.sourceIds" data-value="' + esc(src.id) + '"'
