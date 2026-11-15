@@ -168,10 +168,8 @@ function clip(buffer) {
  */
 export function detectBinaryPayload(bytes, contentType) {
   const type = String(contentType || '').split(';')[0].trim().toLowerCase();
-  if (/^(image|audio|video)\//.test(type) || type === 'application/octet-stream') {
-    return `${type || '二进制'} 内容`;
-  }
   const b = bytes;
+  // 先按实际字节判定：content-type 经常被标错（例如把 JPEG 标成 image/x-ms-bmp）。
   if (b.length >= 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'JPEG 图片';
   if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'PNG 图片';
   if (b.length >= 3 && String.fromCharCode(b[0], b[1], b[2]) === 'GIF') return 'GIF 图片';
@@ -179,6 +177,16 @@ export function detectBinaryPayload(bytes, contentType) {
   if (b.length >= 2 && b[0] === 0x1F && b[1] === 0x8B) return 'gzip 压缩数据';
   if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4B) return 'ZIP/JAR 压缩包';
   if (b.length >= 4 && String.fromCharCode(b[0], b[1], b[2], b[3]) === '%PDF') return 'PDF 文件';
+  if (b.length >= 3 && String.fromCharCode(b[0], b[1], b[2]) === 'ID3') return 'MP3 音频';
+  // 只拦明确的二进制 MIME。M3U 的正当类型恰恰是 audio/x-mpegurl、
+  // application/vnd.apple.mpegurl 等，绝不能按 audio/video 大类一刀切。
+  if (/^image\//.test(type) || [
+    'application/octet-stream', 'application/zip', 'application/x-zip-compressed',
+    'application/gzip', 'application/x-gzip', 'application/pdf',
+    'application/java-archive',
+  ].includes(type)) {
+    return `${type} 内容`;
+  }
   // HTML 网页（反爬页 / 首页跳转）也不是配置。注意不能用「UTF-8 替换字符比例」
   // 判二进制：国内 GBK 编码的 M3U 会被误伤，编码识别交给 decodeSubscription。
   if (type === 'text/html' || /^\s*<(?:!doctype\s+html|html)/i.test(

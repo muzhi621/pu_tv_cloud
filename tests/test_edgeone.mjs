@@ -631,10 +631,22 @@ test('IPTV 云端代理：边缘运行时响应体读取与内容判定', async 
     assert.equal(data.results[1].finalUrl, 'http://www.xn--sss604efuw.net/tv');
   });
 
+  await t.test('M3U 的 audio/x-mpegurl 是合法文本，不能被误判成二进制', async () => {
+    const body = [...enc.encode('#EXTM3U\n#EXTINF:-1 group-title="央视",CCTV1\nhttp://a.example.com/1.m3u8\n')];
+    globalThis.fetch = async () => fakeResponse({ bytes: body, contentType: 'audio/x-mpegurl' });
+    const data = await json(await post(['https://example.com/list.m3u']));
+    assert.equal(data.succeeded, 1, data.results[0].error);
+    assert.equal(data.results[0].bytes, body.length);
+    assert.match(data.text, /CCTV1/);
+  });
+
   await t.test('GBK 中文订阅不会被误判成二进制', () => {
     const gbk = new Uint8Array([0xD1, 0xEB, 0xCA, 0xD3]); // 「央视」
     assert.equal(detectBinaryPayload(gbk, 'text/plain'), '');
+    assert.equal(detectBinaryPayload(enc.encode('#EXTM3U\n'), 'audio/x-mpegurl'), '');
+    assert.equal(detectBinaryPayload(enc.encode('{"sites":[]}'), 'application/vnd.apple.mpegurl'), '');
     assert.equal(detectBinaryPayload(new Uint8Array([0xFF, 0xD8, 0xFF]), 'text/plain'), 'JPEG 图片');
+    assert.equal(detectBinaryPayload(new Uint8Array([0xFF, 0xD8, 0xFF]), 'image/x-ms-bmp'), 'JPEG 图片');
     assert.equal(detectBinaryPayload(new Uint8Array(), 'image/png'), 'image/png 内容');
   });
 });
@@ -657,6 +669,25 @@ test('TVBox 配置解析：BOM / 注释 / 尾部逗号 / base64 封装', async (
   const b64 = Buffer.from(JSON.stringify(cfg), 'utf8').toString('base64');
   assert.equal(parse(b64).sites[0].api, 'https://a.example.com/api.php', 'base64 封装应能解开');
   assert.throws(() => parse('<html>不是配置</html>'), /不是合法 JSON/, '非配置内容应报可读错误');
+});
+
+test('终端在线/离线常驻显示，且不依赖连接设备', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const html = await readFile(new URL('../editor/index.html', import.meta.url), 'utf8');
+  const css = await readFile(new URL('../editor/style.css', import.meta.url), 'utf8');
+  const app = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+  const page = await readFile(new URL('../edge-functions/_lib/editor.js', import.meta.url), 'utf8');
+
+  assert.match(html, /id="deviceStatus"/, '状态条容器必须常驻在 statusbar');
+  assert.match(css, /\.dev-chip\.on/, '在线/离线徽标样式缺失');
+  for (const mark of ['renderDeviceStatus', 'loadDeviceStatus', 'deviceStatusError']) {
+    assert.ok(app.includes(mark), `editor/app.js 缺少 ${mark}`);
+    assert.ok(page.includes(mark), `内联生成物缺少 ${mark}`);
+  }
+  assert.match(app, /activeTab === 'devices'/, '终端管理页签未从「未连接」门槛放行');
+  assert.match(app, /setInterval/, '缺少定时刷新，状态会过期');
+  assert.match(app, /loadDeviceStatus\(\);/, '初始化时未立即拉取状态');
+  assert.match(app, /在线 ' \+ online/, '状态条未显示在线台数');
 });
 
 test('IPTV 套餐：组成套餐、按设备选择下发、GET 轻量视图', async (t) => {

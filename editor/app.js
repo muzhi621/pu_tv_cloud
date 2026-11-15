@@ -9,6 +9,7 @@ const state = {
   devices: [],        // 上线终端注册表
   blocked: [],        // 已拉黑（彻底删除）的设备 id
   onlineWindow: 30,   // 云端在线判定窗口（分钟）
+  deviceStatusError: '', // 顶部常驻状态条的最近一次读取错误
   showHiddenDevices: false,
   checkedDevices: new Set(),
   drawerDeviceId: '', // 单终端全设置面板当前设备
@@ -846,6 +847,62 @@ function deviceById(id) {
   return state.devices.find((item) => item.id === id);
 }
 
+/**
+ * 顶部常驻状态条：只显示终端在线 / 离线。
+ * 与「配置对象」选了谁、配置文档有没有加载完全解耦——打开编辑器就能看到。
+ */
+function renderDeviceStatus() {
+  const node = $('deviceStatus');
+  if (!node) return;
+  if (state.deviceStatusError) {
+    node.innerHTML = '<span class="badge off">终端状态：' + esc(state.deviceStatusError) + '</span>';
+    return;
+  }
+  const visible = arr(state.devices).filter((d) => !d.hidden);
+  if (!visible.length) {
+    node.innerHTML = '<span class="badge off">终端：暂无上线记录</span>';
+    return;
+  }
+  const online = visible.filter((d) => d.online).length;
+  const chips = visible.slice(0, 6).map((d) =>
+    '<span class="dev-chip ' + (d.online ? 'on' : 'off') + '">'
+    + esc(String(d.alias || d.id || '').slice(0, 12)) + ' · '
+    + (d.online ? '在线' : '离线') + '</span>').join('');
+  node.innerHTML = '<span class="badge ok">在线 ' + online + '</span>'
+    + '<span class="badge off">离线 ' + (visible.length - online) + '</span>'
+    + chips
+    + (visible.length > 6 ? '<span class="meta">共 ' + visible.length + ' 台</span>' : '');
+}
+
+/**
+ * 独立拉取终端注册表：不需要先点「连接并加载」，也不需要选中某台设备。
+ * /api/devices 只认读令牌、不带 deviceId，所以配置文档加载失败也不会影响它。
+ */
+async function loadDeviceStatus() {
+  if (!state.base) {
+    const baseInput = $('apiBase');
+    state.base = (baseInput && baseInput.value.trim()) || window.location.origin;
+  }
+  if (!state.token) {
+    const tokenInput = $('apiToken');
+    state.token = tokenInput ? tokenInput.value.trim() : '';
+  }
+  try {
+    const data = await request('/api/devices');
+    state.devices = arr(data && data.devices);
+    state.blocked = arr(data && data.blocked);
+    state.onlineWindow = (data && data.onlineWindowMinutes) || 30;
+    state.deviceStatusError = '';
+    renderDeviceSelect();
+    renderDeviceStatus();
+    if (state.activeTab === 'devices') renderPanel();
+  } catch (error) {
+    state.deviceStatusError = error && error.status === 401
+      ? '未授权（检查读令牌）' : '读取失败';
+    renderDeviceStatus();
+  }
+}
+
 function renderDevices() {
   const visible = state.devices.filter((d) => state.showHiddenDevices || !d.hidden);
   const online = state.devices.filter((d) => d.online && !d.hidden).length;
@@ -912,7 +969,9 @@ async function refreshDevices() {
     state.devices = data.devices || [];
     state.blocked = data.blocked || [];
     state.onlineWindow = data.onlineWindowMinutes || 30;
+    state.deviceStatusError = '';
     renderDeviceSelect();
+    renderDeviceStatus();
     if (state.activeTab === 'devices') renderPanel();
   } catch (error) {
     message('读取终端列表失败：' + error.message, 'err');
@@ -1723,9 +1782,11 @@ function onLibraryInput(target) {
 }
 
 function renderPanel() {
-  // 资源库页签与设备无关，未连接配置服务时也能打开（只提示先加载资源库）。
-  const libraryTab = state.activeTab === 'iptv-lib' || state.activeTab === 'vod-lib';
-  if (!state.doc && !libraryTab) {
+  // 资源库、终端管理页签都不依赖配置文档：前者单独加载资源库，后者只读
+  // /api/devices。这样即使没点「连接并加载」，终端在线/离线也能日常显示。
+  const standaloneTab = state.activeTab === 'iptv-lib'
+    || state.activeTab === 'vod-lib' || state.activeTab === 'devices';
+  if (!state.doc && !standaloneTab) {
     $('panel').innerHTML = '<p class="muted">请先点击右上角「连接并加载」。</p>';
     return;
   }
@@ -2377,6 +2438,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   render();
+  // 终端在线 / 离线常驻显示：打开页面立即拉取，之后每 60 秒在页面可见时刷新。
+  // 这条链路独立于 load()，配置文档加载失败、或没点「连接并加载」也能看到。
+  loadDeviceStatus();
+  window.setInterval(() => {
+    if (document.visibilityState === 'visible') loadDeviceStatus();
+  }, 60000);
   // 首次访问且服务端已注入连接信息时直接连上，省掉手动点一次按钮。
   if (autoConnect) load();
 });

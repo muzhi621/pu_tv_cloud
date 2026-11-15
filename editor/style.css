@@ -175,6 +175,11 @@ textarea.raw {
 .badge.ok { background: #dcfce7; color: #15803d; }
 .badge.off { background: #f1f5f9; color: #64748b; }
 .meta { color: var(--muted); font-size: 11px; }
+/* 顶部常驻终端状态条：只展示在线/离线，与「配置对象」选择无关。 */
+.device-status { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; }
+.dev-chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.dev-chip.on { background: #dcfce7; color: #15803d; }
+.dev-chip.off { background: #f1f5f9; color: #64748b; }
 .row-hidden { opacity: .62; }
 .device-table td.ops { min-width: 320px; }
 .device-table td.ops button { margin: 2px 2px 2px 0; }
