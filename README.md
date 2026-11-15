@@ -228,6 +228,31 @@ vod.sites[{id:'<sourceId>:<key>', sourceId, key, name, api, ext, type, searchabl
   per-device 文档，`GET/PUT /api/library` 返回 `404 not_supported`，编辑器按
   「服务端未升级」降级；`sections` 仍兼容 `vod` 与 `packageIds`，但引用不会被展开。
 
+## 下发套餐：终端只绑一个套餐（仅 EdgeOne）
+
+库键 `bundles_current`，接口 `GET/PUT/POST /api/bundles`。
+
+资源库解决的是「源存一份」，套餐解决的是「配置存一份」。**套餐 = 一份具名、可复用的完整
+sections**：导航栏 + 启动/退出弹窗 + 在线更新 + IPTV 源分组 + TVBox 源站点。
+
+```jsonc
+{ "id": "bd_xxxxxxxx", "name": "客厅电视", "remark": "主卧那台也用这个",
+  "revision": 3, "sections": { navigation: {}, startup: {}, update: {}, iptv: {}, vod: {} } }
+```
+
+- **终端只存 `packageId`**：设备注册表里多一个字段，配置内容由服务端在 `GET /api/config`
+  时按套餐渲染。日常管理就是「选套餐 → 下发」，不再逐台改导航和弹窗。
+- **改套餐即改所有绑定设备**：每个套餐有自己的 `revision`，内容变化才 +1；设备文档用
+  `sections.bundleStamp = {id, revision, updatedAt}` 记住渲染自哪一版，落后就在 GET 时
+  整份重建并推进设备 revision（`snapshot:false`，不占回滚历史）。所以一次保存不会放大成
+  N 次设备写，设备再多也只付一次套餐库写入。
+- **只改一个套餐不会影响别的套餐**：stamp 里带 `id`，绑 B 套餐的设备不会因为 A 变更而重写。
+- **304 不会被锁死**：追平会推进设备 revision，终端带 `since` 的请求必然拿到新文档。
+- **解绑**：`packageId` 置空，设备停在当前内容，回到「全局模板 + 独立配置」的老逻辑。
+- **兼容**：没绑套餐的设备行为完全不变；套餐删除后，绑定它的设备保持现状、不报错。
+- 编辑器顶层因此收敛为四页：**套餐管理 / IPTV 源 / TVBox 源 / 终端管理**，
+  导航栏、启动弹窗、退出弹窗、源选择都在套餐编辑页内。
+
 ## 与需求文档的实现偏差（需知悉）
 
 | 项 | 文档计划 | 实际实现 | 原因 |

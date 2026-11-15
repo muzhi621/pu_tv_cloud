@@ -978,8 +978,11 @@ function closeBundle() {
 function createBundle() {
   const name = window.prompt('新套餐名称（例如：客厅电视 / 老家盒子）', '新套餐');
   if (name === null) return;
+  // 以当前「全局模板」为底稿：用户已经配好的导航/弹窗/源选择不用重来。
+  // 必须走 sectionsForSave() 清洗 —— GET 带 withPackages=1 会把库里的频道和
+  // 站点整份展开，直接 clone 会把几百条频道固化进套餐，一份就撑爆文档上限。
   const base = state.doc && state.editing !== 'bundle'
-    ? clone(state.doc.sections)
+    ? clone(sectionsForSave())
     : clone((bundleItems()[0] && bundleItems()[0].sections) || {});
   const id = 'bd_' + Math.random().toString(16).slice(2, 10).padEnd(8, '0').slice(0, 8);
   const item = {
@@ -1111,6 +1114,15 @@ function renderBundleList() {
       + '<div class="toolbar"><button class="ghost" data-bundle="reload">重新加载</button></div>';
   }
   const items = bundleItems();
+  // 没绑套餐的终端仍在用「全局模板」的独立文档，列出来提醒用户去绑定，
+  // 否则「改了套餐但这台没变」会被当成 bug。
+  const orphans = arr(state.devices).filter((d) => !d.hidden && !d.packageId);
+  const orphanHtml = orphans.length
+    ? '<div class="lib-scroll">' + orphans.map((d) =>
+      '<div class="lib-source-head"><code>' + esc(d.alias || d.id.slice(0, 12)) + '</code>'
+      + '<span class="meta">' + (d.online ? '在线' : '离线') + ' · r' + esc(d.revision)
+      + ' · 未绑定套餐</span></div>').join('') + '</div>'
+    : '<p class="muted">所有终端都已绑定套餐。</p>';
   const cards = items.map((bundle) => {
     const iptv = (bundle.sections && bundle.sections.iptv) || {};
     const vod = (bundle.sections && bundle.sections.vod) || {};
@@ -1139,8 +1151,9 @@ function renderBundleList() {
     + (cards || '<p class="muted">还没有套餐。点「新建套餐」创建第一个，'
       + '它会以当前全局模板为底稿。</p>')
     + '<h3 style="margin-top:24px">未使用套餐的终端</h3>'
-    + '<p class="hint">新设备默认复制「全局模板」。在「终端管理」里给它们选一个套餐，'
-    + '就会脱离模板、跟随套餐变化。</p>';
+    + '<p class="hint">新设备默认复制「全局模板」。到「终端管理」里给它们选一个套餐，'
+    + '就会脱离模板、跟随套餐变化。</p>'
+    + orphanHtml;
 }
 
 function renderBundleEditor() {
@@ -2248,7 +2261,8 @@ function deviceIptvBlock() {
     ? state.doc.sections.iptv : { packages: [], selectedPackageIds: [], packageIds: [] };
   let html = dfCheck('iptv.managed', '云端接管本节');
   if (libPackages === null) {
-    html += '<p class="meta">当前服务端不支持资源库，请先升级云端；下方本地旧套餐仍可用。</p>';
+    html += '<p class="meta">资源库尚未加载成功（检查读令牌 / 服务端版本）。'
+      + '本节仍可保存已有的源引用，导入源请到「IPTV 源」页。</p>';
   } else {
     html += libPackages.length
       ? '<div class="df-multi">' + libPackages.map((pkg) =>
@@ -2456,6 +2470,12 @@ function render() {
     devicePicker.disabled = editingBundle;
     if (editingBundle) devicePicker.value = '';
   }
+  // 原始 JSON / 历史回滚是「设备文档」的概念（快照按设备 revision 存），
+  // 套餐走 /api/bundles，两者不通用，直接禁用避免误操作。
+  ['btnRaw', 'btnDiff', 'btnHistory'].forEach((id) => {
+    const node = $(id);
+    if (node) node.disabled = editingBundle;
+  });
   Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), (button) => {
     button.classList.toggle('active', button.dataset.tab === state.activeTab);
   });
