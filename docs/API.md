@@ -42,8 +42,10 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 | GET | `/api/bundles` | read | **仅 EdgeOne** | 下发套餐库（导航/弹窗/源选择组合）；额外返回 `usage{packageId: 设备数}` |
 | PUT | `/api/bundles` | write | **仅 EdgeOne** | 覆盖整库；需 `If-Match`，返回 `{revision, updatedAt, warnings, affectedDevices}` |
 | POST | `/api/bundles` | write | **仅 EdgeOne** | `{deviceId, bundleId}` 一次完成绑定 + 立即渲染（`bundleId: ""` 为解绑） |
+| POST | `/api/assets` | write | **仅 EdgeOne** | 上传小图片（退出弹窗二维码等），≤512 KB，PNG/JPG/WEBP/GIF，返回 `{id, url}` |
+| GET | `/api/assets?id=` | **无需鉴权** | **仅 EdgeOne** | 公开读取上一步上传的图片（终端用 CachedNetworkImage 拉，带不了令牌） |
 | GET | `/api/devices` | read | **仅 EdgeOne** | 设备注册表（在线/离线、别名、绑定套餐、最近下发、拉黑列表、在线判定窗口） |
-| POST | `/api/devices` | write | **仅 EdgeOne** | 9 种管理动作（含 `bind`），支持单台 / 批量 |
+| POST | `/api/devices` | write | **仅 EdgeOne** | 10 种管理动作（`bind` / `push` / `rename` / `delete` / `restore` / `purge` / `block` / `unblock` …），支持单台 / 批量 |
 | POST | `/api/iptv/fetch` | write | **仅 EdgeOne** | 云端代抓 M3U/M3U8/TXT 订阅（受限代理，一次最多 10 个地址） |
 | GET | `/` | 无 | 两端 | 在线编辑器；EdgeOne 版为内联单页并注入连接默认值，FC 版另提供 `/app.js`、`/style.css` 且需手动填令牌 |
 
