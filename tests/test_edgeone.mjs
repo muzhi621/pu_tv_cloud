@@ -951,6 +951,29 @@ test('退出弹窗与一级导航分组契约', async (t) => {
       /必须是 .* 之一/);
   });
 
+  await t.test('退出弹窗二维码、捐赠说明与按钮文案全部云端下发', () => {
+    const [sections, warnings] = normalizeSections({ startup: { exitDialog: {
+      enabled: true,
+      titleI18n: { zh: '确定要退出吗' },
+      bodyI18n: { zh: '感谢使用，期待下次再见' },
+      qrImageUrl: 'https://cdn.example.com/qr.png',
+      qrCaptionI18n: { zh: '扫码支持' },
+      donateBodyI18n: { zh: '扫码请开发者喝瓶牛奶' },
+      confirmTextI18n: { zh: '退出' },
+      cancelTextI18n: { zh: '再想想' },
+    } } });
+    const dialog = sections.startup.exitDialog;
+    assert.equal(dialog.qrImageUrl, 'https://cdn.example.com/qr.png');
+    assert.equal(dialog.qrCaptionI18n.zh, '扫码支持');
+    assert.equal(dialog.donateBodyI18n.zh, '扫码请开发者喝瓶牛奶');
+    assert.equal(dialog.confirmTextI18n.zh, '退出');
+    assert.equal(dialog.cancelTextI18n.zh, '再想想');
+    assert.equal(warnings.length, 0);
+    // 二维码只接受 http(s)，防止把本地路径或伪协议下发到终端
+    assert.throws(() => normalizeSections({ startup: { exitDialog: { qrImageUrl: 'ftp://x/y.png' } } }),
+      /http\(s\)/);
+  });
+
   await t.test('navigation.groups 三大类与 defaultGroupId 兜底', () => {
     const [defaults] = normalizeSections({});
     assert.equal(defaults.navigation.groups.length, 3);

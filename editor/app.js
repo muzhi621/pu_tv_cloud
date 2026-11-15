@@ -2067,6 +2067,11 @@ function renderDeviceEditor() {
     + dfSelect('startup.exitDialog.mode', '显示频率', noticeModes)
     + dfText('startup.exitDialog.titleI18n.zh', '标题（中文）', 'text')
     + dfText('startup.exitDialog.bodyI18n.zh', '正文（中文）', 'text')
+    + dfText('startup.exitDialog.qrImageUrl', '二维码图片地址（http(s)，留空用内置图）', 'text')
+    + dfText('startup.exitDialog.qrCaptionI18n.zh', '二维码下方标题（中文）', 'text')
+    + dfText('startup.exitDialog.donateBodyI18n.zh', '捐赠说明（中文）', 'text')
+    + dfText('startup.exitDialog.confirmTextI18n.zh', '确定按钮文案（中文）', 'text')
+    + dfText('startup.exitDialog.cancelTextI18n.zh', '取消按钮文案（中文）', 'text')
     + '</div>'
 
     + '<div class="df-block"><h3>在线更新</h3>'

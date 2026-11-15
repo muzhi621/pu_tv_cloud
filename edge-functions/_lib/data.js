@@ -71,7 +71,12 @@ export const SEED = {
         "dismissible": true,
         "showDonate": true,
         "titleI18n": {},
-        "bodyI18n": {}
+        "bodyI18n": {},
+        "qrImageUrl": "",
+        "qrCaptionI18n": {},
+        "donateBodyI18n": {},
+        "confirmTextI18n": {},
+        "cancelTextI18n": {}
       },
       "showSplashPage": true
     },

@@ -493,6 +493,18 @@ def normalize_startup(part: dict, warnings: list[str]) -> dict:
                                        "startup.exitDialog.bodyI18n")
         else:
             target.setdefault("bodyI18n", {})
+        # 二维码与捐赠文案同样云端化：换图 / 换文案不必重新发版。
+        qr_url = str(exit_dialog.get("qrImageUrl") or target.get("qrImageUrl") or "").strip()
+        if len(qr_url) > 512:
+            raise ConfigError("startup.exitDialog.qrImageUrl 超过 512 字符")
+        if qr_url and not re.match(r"^https?://", qr_url, re.I):
+            raise ConfigError("startup.exitDialog.qrImageUrl 必须是 http(s) 图片地址")
+        target["qrImageUrl"] = qr_url
+        for key in ("qrCaptionI18n", "donateBodyI18n", "confirmTextI18n", "cancelTextI18n"):
+            if key in exit_dialog:
+                target[key] = _i18n(exit_dialog[key], "startup.exitDialog.%s" % key)
+            else:
+                target.setdefault(key, {})
         base["exitDialog"] = target
     elif exit_dialog is not None:
         raise ConfigError("startup.exitDialog 必须是对象")

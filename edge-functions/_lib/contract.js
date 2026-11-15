@@ -439,6 +439,26 @@ function normalizeStartup(part, warnings) {
     if ('bodyI18n' in exitDialog) {
       target.bodyI18n = i18n(exitDialog.bodyI18n, 'startup.exitDialog.bodyI18n');
     }
+    // 二维码与捐赠文案也走云端：换图 / 换文案不必再发版。
+    // qrImageUrl 只接受 http(s)；留空表示继续用 APK 内置的 assets/images/wechat.png。
+    const qrImageUrl = str(exitDialog.qrImageUrl, target.qrImageUrl,
+      'startup.exitDialog.qrImageUrl', 512);
+    if (qrImageUrl && !/^https?:\/\//i.test(qrImageUrl)) {
+      throw new ConfigError('startup.exitDialog.qrImageUrl 必须是 http(s) 图片地址');
+    }
+    target.qrImageUrl = qrImageUrl;
+    if ('qrCaptionI18n' in exitDialog) {
+      target.qrCaptionI18n = i18n(exitDialog.qrCaptionI18n, 'startup.exitDialog.qrCaptionI18n');
+    }
+    if ('donateBodyI18n' in exitDialog) {
+      target.donateBodyI18n = i18n(exitDialog.donateBodyI18n, 'startup.exitDialog.donateBodyI18n');
+    }
+    if ('confirmTextI18n' in exitDialog) {
+      target.confirmTextI18n = i18n(exitDialog.confirmTextI18n, 'startup.exitDialog.confirmTextI18n');
+    }
+    if ('cancelTextI18n' in exitDialog) {
+      target.cancelTextI18n = i18n(exitDialog.cancelTextI18n, 'startup.exitDialog.cancelTextI18n');
+    }
     base.exitDialog = target;
   }
 
