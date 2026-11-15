@@ -1830,6 +1830,10 @@ function renderDeviceEditor() {
   const sites = (catalog.sites || []).filter((item) => !item.retired);
   const menus = catalog.menus || [];
   const groups = (sections.navigation && sections.navigation.groups) || [];
+  // 'settings' 是合法的二级项但不在站点 catalog 的 menus 里（它不是菜单页，
+  // 而是设置目录）；补进来才能完整编辑 settings 一级块的 children。
+  const childItems = menus.some((item) => item.id === 'settings')
+    ? menus : menus.concat([{ id: 'settings', name: '设置' }]);
   const noticeModes = [
     { value: 'once_per_revision', label: '每个新版本弹一次' },
     { value: 'always', label: '每次都弹' },
@@ -1855,10 +1859,17 @@ function renderDeviceEditor() {
     + '<div class="df-block"><h3>导航（左侧四大类）</h3>'
     + dfCheck('navigation.managed', '云端接管本节')
     + '<p class="meta">一级栏固定为 ' + esc(groups.map((g) => g.label).join(' / ') || 'IPTV / 影音 / 直播 / 设置')
-    + '；下面勾选各块里显示的二级菜单。</p>'
+    + '；下面的白名单控制全局可见的二级菜单，分组勾选控制每个一级块展开哪些项。</p>'
     + dfSelect('navigation.defaultGroupId', '启动默认一级块',
       groups.map((g) => ({ value: g.id, label: g.label })))
     + dfMulti('navigation.railMenuIds', menus, (item) => item.name || item.id)
+    + '<p class="meta">各一级块的二级菜单（终端取「白名单 ∩ 本块勾选」的交集，两处都要勾）：</p>'
+    + (groups.length
+      ? groups.map((group, index) =>
+          '<p class="meta">' + esc(group.label || group.id) + '</p>'
+          + dfMulti('navigation.groups.' + index + '.children', childItems,
+            (item) => item.name || item.id)).join('')
+      : '<p class="meta">当前文档还没有分组信息，保存一次后服务端会按默认四大类补齐。</p>')
     + '</div>'
 
     + '<div class="df-block"><h3>开机公告</h3>'

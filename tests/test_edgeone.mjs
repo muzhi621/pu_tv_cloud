@@ -683,6 +683,26 @@ test('退出弹窗与一级导航分组契约', async (t) => {
     assert.equal(custom.navigation.defaultGroupId, 'iptv');
     assert.ok(warnings.some((w) => w.includes('非法或重复的一级块')));
   });
+
+  await t.test('默认影音块含影视点播，且 vodBrowse 是合法二级项', () => {
+    const [defaults] = normalizeSections({});
+    const vod = defaults.navigation.groups.find((g) => g.id === 'vod');
+    assert.ok(vod.children.includes('vodBrowse'), '影音块必须默认展开影视点播');
+    assert.ok(defaults.navigation.railMenuIds.includes('vodBrowse'), '白名单必须含影视点播');
+    const [custom, warnings] = normalizeSections({ navigation: {
+      groups: [{ id: 'vod', children: ['vodBrowse', 'moviePlayback'] }],
+    } });
+    assert.deepEqual(custom.navigation.groups[0].children, ['vodBrowse', 'moviePlayback']);
+    assert.ok(!warnings.some((w) => w.includes('未知二级项')));
+  });
+
+  await t.test('编辑器可编辑每个一级块的 children', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const source = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+    assert.ok(source.includes("'navigation.groups.' + index + '.children'"),
+      '缺少分组 children 的编辑入口（旧文档无法补上影视点播）');
+    assert.ok(source.includes("id: 'settings'"), 'settings 是合法二级项，须在分组可选项里');
+  });
 });
 
 /* ================= 全局资源库（设备只存引用） ================= */

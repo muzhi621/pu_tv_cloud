@@ -51,6 +51,7 @@
         "hot",
         "areas",
         "favoriteAreas",
+        "vodBrowse",
         "moviePlayback",
         "search",
         "history",
@@ -58,7 +59,7 @@
       ],
       "groups": [
         { "id": "iptv", "label": "IPTV", "icon": "live_tv", "children": ["iptv"] },
-        { "id": "vod", "label": "影音", "icon": "movie", "children": ["moviePlayback"] },
+        { "id": "vod", "label": "影音", "icon": "movie", "children": ["vodBrowse", "moviePlayback"] },
         { "id": "live", "label": "直播", "icon": "tv", "children": ["favorite", "hot", "areas", "favoriteAreas", "search", "history"] },
         { "id": "settings", "label": "设置", "icon": "settings", "children": ["settings"] }
       ],

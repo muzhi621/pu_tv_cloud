@@ -195,6 +195,10 @@
       "name": "关注分区"
     },
     {
+      "id": "vodBrowse",
+      "name": "影视点播"
+    },
+    {
       "id": "moviePlayback",
       "name": "链接放映"
     },
