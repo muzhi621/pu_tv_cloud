@@ -1926,3 +1926,74 @@ test('下发套餐：终端只绑一个套餐，改套餐自动生效', async (t
     assert.equal(doc.status, 200);
   });
 });
+
+/* ================= 默认套餐：新终端上线即有内容 ================= */
+
+test('默认套餐：新设备首次上线自动绑定', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  globalThis.PURETV_KV = new MemoryKV();
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {};
+  const listBundles = async () => json(await bundlesGet(ctx('GET', '/api/bundles', { env })));
+  const putBundles = (body, rev) => bundlesPut(ctx('PUT', '/api/bundles', {
+    env, headers: { 'If-Match': String(rev) }, body,
+  }));
+  const getDevice = (id) => configGet(ctx('GET', `/api/config?deviceId=${id}`, { env }));
+
+  await t.test('空套餐库带 defaultBundleId=""', async () => {
+    const data = await listBundles();
+    assert.equal(data.defaultBundleId, '');
+  });
+
+  await t.test('默认套餐指向不存在的 id 时被清空并给出警告', async () => {
+    const res = await putBundles({
+      defaultBundleId: 'bd_deadbeef',
+      items: [{ name: 'A', sections: { navigation: { managed: true, railMenuIds: ['iptv'] } } }],
+    }, 0);
+    assert.equal(res.status, 200);
+    const data = await json(res);
+    assert.ok(data.warnings.some((w) => w.includes('默认套餐')));
+    const list = await listBundles();
+    assert.equal(list.defaultBundleId, '');
+  });
+
+  await t.test('设为默认后 GET 能读回来', async () => {
+    const list = await listBundles();
+    const bundleId = list.items[0].id;
+    const res = await putBundles({
+      defaultBundleId: bundleId,
+      items: list.items,
+    }, list.revision);
+    assert.equal(res.status, 200);
+    const after = await listBundles();
+    assert.equal(after.defaultBundleId, bundleId);
+  });
+
+  await t.test('新设备第一次 GET 就绑上默认套餐并拿到内容', async () => {
+    const doc = await json(await getDevice('tv-new'));
+    const list = await listBundles();
+    assert.equal(doc.sections.bundleStamp.id, list.defaultBundleId);
+    assert.deepEqual(doc.sections.navigation.railMenuIds, ['iptv']);
+
+    const devices = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
+    const row = devices.devices.find((item) => item.id === 'tv-new');
+    assert.equal(row.packageId, list.defaultBundleId);
+  });
+
+  await t.test('已有设备不会被默认套餐改写', async () => {
+    // tv-old 先上线、此时没有默认套餐 → 保持未绑定
+    const list = await listBundles();
+    await putBundles({ defaultBundleId: '', items: list.items }, list.revision);
+    const first = await json(await getDevice('tv-old'));
+    assert.equal(first.sections.bundleStamp, undefined);
+
+    // 再设默认套餐，tv-old 依然不绑
+    const list2 = await listBundles();
+    await putBundles({ defaultBundleId: list2.items[0].id, items: list2.items }, list2.revision);
+    await json(await getDevice('tv-old'));
+    const devices = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
+    const row = devices.devices.find((item) => item.id === 'tv-old');
+    assert.equal(row.packageId, '');
+  });
+});

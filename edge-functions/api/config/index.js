@@ -8,7 +8,7 @@ import {
   deviceScope, handle, HttpError, optionsHandler, readJsonBody, requireAuth, send,
 } from '../../_lib/http.js';
 import {
-  isBlocked, markPushed, read, readLibrary, touchDevice, write,
+  isBlocked, markPushed, read, readBundles, readLibrary, touchDevice, updateDevice, write,
 } from '../../_lib/storage.js';
 
 export const onRequestOptions = optionsHandler;
@@ -29,6 +29,37 @@ async function safeReadLibrary(env) {
     return await readLibrary(env);
   } catch (_) {
     return null;
+  }
+}
+
+/** 读套餐库失败同样不能影响下发：退化成「没有默认套餐」。 */
+async function safeReadBundles(env) {
+  try {
+    return await readBundles(env);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * 新终端第一次上线时套用「默认套餐」。
+ *
+ * 老流程给新设备复制全局模板，模板里没选源就是一片空白——重装 APK 换了
+ * deviceId 之后又会重演一次。默认套餐把这件事变成一次显式选择：管理员在
+ * 套餐卡片上点「设为默认」，之后任何新设备上线都直接有内容。
+ *
+ * 失败一律吞掉：绑不上就退回模板，不能让首屏配置请求 500。
+ */
+async function autoBindDefaultBundle(env, deviceId, item) {
+  if (!deviceId || !item || !item.isNew || item.packageId) return item;
+  const bundles = await safeReadBundles(env);
+  const defaultId = bundles && bundles.defaultBundleId;
+  if (!defaultId) return item;
+  try {
+    await updateDevice(env, deviceId, { packageId: defaultId });
+    return { ...item, packageId: defaultId };
+  } catch (_) {
+    return item;
   }
 }
 
@@ -73,7 +104,9 @@ export async function onRequestGet(context) {
     await rejectBlocked(env, id);
     const document0 = await read(env, id);
     // 每次成功拉取即视为「上线」，不额外做心跳请求。
-    const item = id ? await touchDevice(env, id, meta) : null;
+    let item = id ? await touchDevice(env, id, meta) : null;
+    // 新设备首次上线：有默认套餐就直接绑定，终端首帧即拿到完整内容。
+    item = await autoBindDefaultBundle(env, id, item);
     let document = document0;
 
     // 套餐优先：设备绑了套餐就以套餐为准。文档落后于套餐当前版本时在这里重渲染，

@@ -1273,6 +1273,7 @@ export function emptyBundles() {
     schemaVersion: BUNDLE_SCHEMA_VERSION,
     revision: 0,
     updatedAt: '',
+    defaultBundleId: '',
     items: [],
   };
 }
@@ -1318,11 +1319,19 @@ export function normalizeBundles(raw) {
       updatedAt: str(entry.updatedAt, nowIso(), `套餐 ${id}.updatedAt`, 40),
     });
   }
+  // 默认套餐：新终端第一次上线时自动绑定，避免「装完 APK 一片空白」。
+  // 只接受确实存在的 id —— 套餐被删掉后这里自动回落成空串，不会把设备指向幽灵。
+  const wantedDefault = String(raw.defaultBundleId == null ? '' : raw.defaultBundleId).trim();
+  const defaultBundleId = items.some((item) => item.id === wantedDefault) ? wantedDefault : '';
+  if (wantedDefault && !defaultBundleId) {
+    warnings.push(`默认套餐 ${wantedDefault} 不存在，已清空`);
+  }
   return [
     {
       schemaVersion: BUNDLE_SCHEMA_VERSION,
       revision: 0,
       updatedAt: '',
+      defaultBundleId,
       items,
     },
     warnings,

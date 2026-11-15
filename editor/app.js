@@ -1006,6 +1006,36 @@ function createBundle() {
   render();
 }
 
+/**
+ * 设置 / 取消「默认套餐」。
+ *
+ * 默认套餐只影响新设备：所有已登记终端保持各自绑定不变。取消后新设备回到
+ * 「复制全局模板」的老行为。
+ */
+async function setDefaultBundle(id, makeDefault) {
+  const bundle = bundleById(id);
+  if (!bundle) return;
+  const next = {
+    ...state.bundles,
+    defaultBundleId: makeDefault ? id : '',
+    items: bundleItems(),
+  };
+  try {
+    const result = await request('/api/bundles', {
+      write: true,
+      method: 'PUT',
+      headers: { 'If-Match': String(state.bundleRevision) },
+      body: JSON.stringify({ ...next, expectedRevision: state.bundleRevision }),
+    });
+    state.bundleRevision = result.revision;
+    await loadBundles();
+    toast(makeDefault ? '已设为默认：新终端上线自动绑定' : '已取消默认套餐');
+    render();
+  } catch (error) {
+    message('设置失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
 async function deleteBundle(id) {
   const bundle = bundleById(id);
   if (!bundle) return;
@@ -1021,7 +1051,11 @@ async function deleteBundle(id) {
       write: true,
       method: 'PUT',
       headers: { 'If-Match': String(state.bundleRevision) },
-      body: JSON.stringify({ ...next, expectedRevision: state.bundleRevision }),
+      body: JSON.stringify({
+        ...next,
+        defaultBundleId: (state.bundles && state.bundles.defaultBundleId) || '',
+        expectedRevision: state.bundleRevision,
+      }),
     });
     state.bundleRevision = result.revision;
     await loadBundles();
@@ -1050,6 +1084,8 @@ async function saveBundle() {
       body: JSON.stringify({
         schemaVersion: 1,
         revision: state.bundleRevision,
+        // 默认套餐是库级字段：保存套餐时一起带上，否则会被服务端按空值规范化掉。
+        defaultBundleId: (state.bundles && state.bundles.defaultBundleId) || '',
         items: bundleItems(),
         expectedRevision: state.bundleRevision,
       }),
@@ -1129,9 +1165,11 @@ function renderBundleList() {
     const pkgCount = arr(iptv.packageIds).length;
     const vodCount = arr(vod.sourceIds).length;
     const used = bundleUsage(bundle.id);
+    const isDefault = !!state.bundles && state.bundles.defaultBundleId === bundle.id;
     return '<div class="bundle-card">'
       + '<div class="bundle-head"><strong>' + esc(bundle.name) + '</strong>'
       + (used ? '<span class="badge ok">' + used + ' 台在用</span>' : '<span class="badge off">未绑定</span>')
+      + (isDefault ? '<span class="badge ok">新终端默认</span>' : '')
       + '</div>'
       + '<p class="meta">' + esc(bundle.remark || '无备注') + '</p>'
       + '<p class="meta">IPTV ' + pkgCount + ' 个源套餐 · TVBox ' + vodCount + ' 个源 · 更新于 '
@@ -1139,6 +1177,9 @@ function renderBundleList() {
       + '<div class="toolbar">'
       + '<button class="tiny primary" data-bundle="edit" data-id="' + esc(bundle.id) + '">编辑</button>'
       + '<button class="tiny" data-bundle="delete" data-id="' + esc(bundle.id) + '">删除</button>'
+      + (isDefault
+        ? '<button class="tiny" data-bundle="undefault" data-id="' + esc(bundle.id) + '">取消默认</button>'
+        : '<button class="tiny" data-bundle="default" data-id="' + esc(bundle.id) + '">设为默认</button>')
       + '</div></div>';
   }).join('');
 
@@ -1151,8 +1192,9 @@ function renderBundleList() {
     + (cards || '<p class="muted">还没有套餐。点「新建套餐」创建第一个，'
       + '它会以当前全局模板为底稿。</p>')
     + '<h3 style="margin-top:24px">未使用套餐的终端</h3>'
-    + '<p class="hint">新设备默认复制「全局模板」。到「终端管理」里给它们选一个套餐，'
-    + '就会脱离模板、跟随套餐变化。</p>'
+    + '<p class="hint">新设备上线会<b>自动绑定「默认套餐」</b>（在套餐卡片上点「设为默认」）；'
+    + '没有设默认套餐时才复制全局模板。重装 APK 换了设备 id 也不用再来手动点一次。'
+    + '下面这些终端还没绑套餐，到「终端管理」里选一个即可。</p>'
     + orphanHtml;
 }
 
@@ -2759,6 +2801,8 @@ document.addEventListener('DOMContentLoaded', () => {
     else if (action === 'reload') loadBundles().then(render);
     else if (action === 'edit') openBundle(button.dataset.id);
     else if (action === 'delete') deleteBundle(button.dataset.id);
+    else if (action === 'default') setDefaultBundle(button.dataset.id, true);
+    else if (action === 'undefault') setDefaultBundle(button.dataset.id, false);
     else if (action === 'back') closeBundle();
     else if (action === 'save') saveBundle();
     else if (action === 'dispatch') {

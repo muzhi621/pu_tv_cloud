@@ -345,9 +345,14 @@ export async function writeBundles(env, bundles, expectedRevision) {
     };
   });
 
+  // 默认套餐在套餐被删后必须立刻失效，否则新终端会指向一个不存在的 id，
+  // 表现成「新设备上线后什么都没拿到」。
+  const defaultBundleId = items.some((item) => item.id === bundles.defaultBundleId)
+    ? bundles.defaultBundleId : '';
   const next = {
     ...bundles,
     items,
+    defaultBundleId,
     schemaVersion: BUNDLE_SCHEMA_VERSION,
     revision: expectedRevision + 1,
     updatedAt: nowIso(),
@@ -437,6 +442,7 @@ export async function touchDevice(env, deviceId, meta = {}) {
   const devices = (await db.getJSON(KEY_DEVICES)) || [];
   const now = nowIso();
   let item = devices.find((entry) => entry.id === deviceId);
+  const isNew = !item;
   if (!item) {
     item = {
       id: deviceId,
@@ -464,7 +470,8 @@ export async function touchDevice(env, deviceId, meta = {}) {
   const doc = await db.getJSON(scopeKeys(deviceId).current);
   if (doc && doc.sections) item.revision = doc.revision;
   await db.put(KEY_DEVICES, JSON.stringify(devices.slice(0, MAX_DEVICES)));
-  return item;
+  // isNew 只对本进程有效（未落盘）：GET /api/config 用它决定要不要自动套默认套餐。
+  return { ...item, isNew };
 }
 
 /** 返回带在线状态的视图；所有连接过的设备都在里面（含已移除的，由编辑器筛选）。 */
