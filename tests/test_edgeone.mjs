@@ -749,6 +749,56 @@ test('TVBox 源双轨：mode 规范化、URL 下发与解析站点兜底', async
   assert.match(app, /mode: 'parsed'/, '新建源未默认走云端解析');
 });
 
+test('TVBox 站点级 jar 保留：库入库出、随文档下发，聚合族 jar 不丢', async () => {
+  // 聚合配置里各族站点靠站点级 jar 指向自己的爬虫包；任何一层丢字段都会
+  // 让终端报「在 jar 里找不到类 com.github.catvod.spider.XxxGuard」。
+  const [library] = normalizeLibrary({
+    vod: {
+      sources: [
+        { id: 'vs_aaaaaaaa', name: '聚合', url: 'https://a.example.com/output/单仓聚合.json', jar: 'https://jar.example.com/main.jar' },
+      ],
+      sites: [
+        {
+          sourceId: 'vs_aaaaaaaa', key: 'own', name: '带jar', api: 'csp_Own', type: 3,
+          // `url;md5;hash` 写法 + 相对路径，按所属源的配置地址解析。
+          jar: './libs/jar/Panda.jar;md5;00112233445566778899aabbccddeeff',
+        },
+        {
+          sourceId: 'vs_aaaaaaaa', key: 'wex', name: '族jar', api: 'csp_WexmuouggGuard', type: 3,
+          jar: 'https://family.example.com/wex.jar;md5;11223344556677889900aabbccddeeff',
+        },
+        { sourceId: 'vs_aaaaaaaa', key: 'http', name: '采集', api: 'https://a.example.com/api.php' },
+      ],
+    },
+  });
+  const [own, wex, httpSite] = library.vod.sites;
+  assert.equal(own.jar, 'https://a.example.com/output/libs/jar/Panda.jar', '相对 jar 要按源地址解析');
+  assert.equal(own.jarMd5, '00112233445566778899aabbccddeeff');
+  assert.equal(wex.jar, 'https://family.example.com/wex.jar');
+  assert.equal(wex.jarMd5, '11223344556677889900aabbccddeeff');
+  assert.equal(httpSite.jar, '', 'http 站点不需要 jar');
+
+  const [sections] = normalizeSections({
+    vod: { managed: true, sourceIds: ['vs_aaaaaaaa'] },
+  });
+  const out = expandVodSites(sections, library);
+  assert.equal(out.vod.sites.length, 3);
+  assert.equal(out.vod.sites[0].jar, 'https://a.example.com/output/libs/jar/Panda.jar', '展开下发不能丢站点级 jar');
+  assert.equal(out.vod.sites[1].jar, 'https://family.example.com/wex.jar');
+  assert.equal(out.vod.sites[1].jarMd5, '11223344556677889900aabbccddeeff');
+
+  const [inline] = normalizeSections({
+    vod: {
+      sources: [{ id: 'vs_dddddddd', url: 'https://d.example.com/tv', jar: 'https://jar.example.com/main.jar' }],
+      sites: [
+        { id: 'vs_dddddddd:x', sourceId: 'vs_dddddddd', name: 'X', api: 'csp_X', type: 3, jar: 'https://family.example.com/wex.jar', jarMd5: 'aabbccdd' },
+      ],
+    },
+  });
+  assert.equal(inline.vod.sites[0].jar, 'https://family.example.com/wex.jar', '锁定快照的内联站点也要带 jar');
+  assert.equal(inline.vod.sites[0].jarMd5, 'aabbccdd');
+});
+
 test('TVBox 解析失败可降级：只下发配置 URL，零站点源仍能下发', async () => {
   const { readFile } = await import('node:fs/promises');
   const app = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');

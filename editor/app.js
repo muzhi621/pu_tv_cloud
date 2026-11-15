@@ -1891,6 +1891,13 @@ function collectTvboxConfigs(json, baseUrl) {
     const site = Object.assign({}, raw);
     if (typeof site.api === 'string') site.api = resolveVodAsset(site.api, base);
     if (typeof site.ext === 'string') site.ext = resolveVodAsset(site.ext, base);
+    // 站点级 jar（TVBox 站点自带的 `jar` 字段，常写 `url;md5;hash`）必须留下：
+    // 聚合配置里各族站点靠它指向自己的爬虫包，丢了就是「jar 里找不到类」。
+    if (typeof site.jar === 'string' && site.jar) {
+      const parsed = parseSpiderField(site.jar, base);
+      site.jar = parsed.jar;
+      site.jarMd5 = parsed.md5;
+    }
     return site;
   };
   const walk = (node) => {
@@ -1937,7 +1944,15 @@ function tvboxSiteId(sourceId, key) {
   return sourceId + ':' + key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
 }
 
-function tvboxSitesFrom(list, sourceId, seen, seenIds) {
+/**
+ * sites → 库站点；api 非 http(s)/csp_、key 缺失或重复都跳过并计数。
+ *
+ * [familySpider] 是这套配置自己的 spider（`{jar, md5}`）：csp_ 站点没有
+ * 站点级 jar 时继承它（族 jar）。多仓聚合只把第一个源的 spider 记成源级
+ * jar，其它族的站点（如 Wex*Guard 系）离了自己的 jar 会在 prepare 阶段
+ * 报「找不到类」。与源级 jar 相同的部分在导入收尾时清掉，不重复下发。
+ */
+function tvboxSitesFrom(list, sourceId, seen, seenIds, familySpider) {
   const sites = [];
   const ids = seenIds || new Set();
   let skipped = 0;
@@ -1951,6 +1966,13 @@ function tvboxSitesFrom(list, sourceId, seen, seenIds) {
     if (ids.has(id)) { skipped += 1; continue; }
     seen.add(key);
     ids.add(id);
+    const ownJar = String(raw.jar == null ? '' : raw.jar).trim();
+    const needJar = /^csp_/i.test(api);
+    const effJar = ownJar
+      || (needJar && familySpider && familySpider.jar ? familySpider.jar : '');
+    const effMd5 = ownJar
+      ? String(raw.jarMd5 == null ? '' : raw.jarMd5).trim()
+      : (needJar && familySpider && familySpider.jar ? (familySpider.md5 || '') : '');
     sites.push({
       id,
       sourceId,
@@ -1962,6 +1984,8 @@ function tvboxSitesFrom(list, sourceId, seen, seenIds) {
       ext: raw.ext == null
         ? ''
         : (typeof raw.ext === 'string' ? raw.ext.trim() : JSON.stringify(raw.ext)).slice(0, 1000),
+      jar: effJar.slice(0, 1000),
+      jarMd5: effMd5.slice(0, 64),
       type: String(raw.type == null ? '' : raw.type).trim().slice(0, 16),
       searchable: raw.searchable == null ? true : !!raw.searchable,
       quickSearch: !!raw.quickSearch,
@@ -2076,13 +2100,15 @@ async function addVodSource() {
     for (const cfg of configs) {
       if (cfg.name) names.push(cfg.name);
       mergeSpider(cfg.spider);
-      const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
+      const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds, cfg.spider);
       sites = sites.concat(part.sites);
       skipped += part.skipped;
     }
     const subSet = new Set();
     for (const cfg of configs) for (const sub of cfg.urls) subSet.add(sub);
-    const subUrls = [...subSet].slice(0, 5);
+    // 多仓订阅常有 10+ 个族（每族一个 spider jar），截到 5 会让后半部分族
+    // 的站点全部落到错误的 jar 上。
+    const subUrls = [...subSet].slice(0, 12);
     let subFailed = 0;
     for (const sub of subUrls) {
       try {
@@ -2091,11 +2117,16 @@ async function addVodSource() {
         for (const cfg of collectTvboxConfigs(subJson, sub)) {
           if (cfg.name) names.push(cfg.name);
           mergeSpider(cfg.spider);
-          const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds);
+          const part = tvboxSitesFrom(cfg.sites, sourceId, seen, seenIds, cfg.spider);
           sites = sites.concat(part.sites);
           skipped += part.skipped;
         }
       } catch (_) { subFailed += 1; }
+    }
+    // 与源级 jar 相同的站点级 jar 不重复下发（省流量；语义不变——终端
+    // jarFor 对空 jar 会回退到源 jar）。
+    for (const site of sites) {
+      if (site.jar && site.jar === spiderJar) { site.jar = ''; site.jarMd5 = ''; }
     }
     statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
     if (!sites.length) {
@@ -2112,6 +2143,7 @@ async function addVodSource() {
     if (sites.length > room) { dropped = sites.length - room; sites = sites.slice(0, room); }
     const name = (names[0] || sourceNameFromUrl(url)).slice(0, 64);
     const needJar = sites.filter((site) => /^csp_/i.test(String(site.api || ''))).length;
+    const ownJarCount = sites.filter((site) => String(site.jar || '')).length;
     state.library.vod.sources.push({
       id: sourceId, name, url, jar: spiderJar,
       spiderMd5, spiderFlavor: 'fongmi',
@@ -2123,6 +2155,7 @@ async function addVodSource() {
     state.library.vod.sites.push(...sites);
     state.tvboxSummary = '已导入「' + name + '」：' + sites.length + ' 个站点'
       + (spiderJar ? '，spider jar 已识别' + (spiderMd5 ? '（含 md5 校验）' : '') : '，未发现 spider jar')
+      + (ownJarCount ? '，' + ownJarCount + ' 个站点带站点级/族 jar' : '')
       + (needJar && !spiderJar ? '，有 ' + needJar + ' 个 csp_ 站点会缺 jar' : '')
       + (skipped ? '，跳过 ' + skipped + ' 条（api 非法 / key 缺失或重复 / 超出单源 '
         + MAX_VOD_SITES_PER_SOURCE + ' 条上限）' : '')

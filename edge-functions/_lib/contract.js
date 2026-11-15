@@ -855,6 +855,9 @@ function inlineVodSites(raw, warnings) {
       name: str(entry.name, '', 'vod.sites.name', 64) || id,
       api,
       ext: str(entry.ext, '', 'vod.sites.ext', 1000),
+      // 站点级 jar：TVBox 站点自带的 jar / 多仓族 jar。空 = 用源级 jar。
+      jar: str(entry.jar, '', 'vod.sites.jar', 1000),
+      jarMd5: str(entry.jarMd5, '', 'vod.sites.jarMd5', 64),
       type: lenientInt(entry.type, 0, 0, 4),
       searchable: lenientInt(entry.searchable, 0, 0, 2),
       quickSearch: lenientInt(entry.quickSearch, 0, 0, 2),
@@ -916,6 +919,9 @@ export function expandVodSites(sections, library = null) {
       name: site.name,
       api: site.api,
       ext: site.ext || '',
+      // 站点级 jar（TVBox 站点自带 jar / 多仓族 jar）；空 = 用源级 jar。
+      jar: site.jar || '',
+      jarMd5: site.jarMd5 || '',
       type: site.type,
       searchable: site.searchable,
       quickSearch: site.quickSearch,
@@ -1211,6 +1217,9 @@ function normalizeLibraryVod(part, warnings) {
       }
       perSource.set(sourceId, used + 1);
       seen.add(id);
+      // 站点级 jar（TVBox 站点自带 jar / 多仓族 jar），`url;md5;hash` 写法
+      // 与源级 jar 同一套拆分；"./" 相对地址按所属源的配置地址解析。
+      const siteJar = parseSpiderField(item.jar, sourceUrl);
       out.sites.push({
         id,
         sourceId,
@@ -1221,6 +1230,8 @@ function normalizeLibraryVod(part, warnings) {
         // 大量站点离了它就取不到数据，所以必须存进库、随配置下发。
         // 绝对地址（含 127.0.0.1 本地代理）原样保留，"./" 开头才解析。
         ext: resolveVodAsset(str(item.ext, '', `library.vod.sites[${id}].ext`, 1000), sourceUrl),
+        jar: siteJar.jar,
+        jarMd5: str(item.jarMd5, siteJar.md5, `library.vod.sites[${id}].jarMd5`, 64),
         type: lenientInt(item.type, 0, 0, 4),
         searchable: lenientInt(item.searchable, 0, 0, 2),
         quickSearch: lenientInt(item.quickSearch, 0, 0, 2),
