@@ -16,19 +16,22 @@
  * 在线判定：客户端 v3.0.14 起前台每 15 分钟同步一次配置，云端以 lastSeen
  * 距今是否超过 CONFIG_ONLINE_WINDOW_MINUTES（默认 30 分钟）兜底判定。
  */
-import { ConfigError } from '../../_lib/contract.js';
+import { ConfigError, sectionsFromBundle } from '../../_lib/contract.js';
+import { applyBoundBundle, findBundle } from '../../_lib/bundle.js';
 import {
   deviceScope, handle, optionsHandler, readJsonBody, requireAuth, send,
 } from '../../_lib/http.js';
 import {
   deleteDevice, isBlocked, listBlocked, listDevices, markPushed,
   normalizeDeviceId, onlineWindowMinutes, purgeDevice, read as readConfig,
-  resetDevice, restoreDevice, unblockDevice, updateDevice, write as writeConfig,
+  readDevice, resetDevice, restoreDevice, unblockDevice, updateDevice, write as writeConfig,
 } from '../../_lib/storage.js';
 
 export const onRequestOptions = optionsHandler;
 
-const ACTIONS = new Set(['rename', 'comment', 'delete', 'restore', 'purge', 'unblock', 'reset', 'push']);
+const ACTIONS = new Set([
+  'rename', 'comment', 'delete', 'restore', 'purge', 'unblock', 'reset', 'push', 'bind',
+]);
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
@@ -85,15 +88,43 @@ async function runAction(env, action, id, body) {
     }
     case 'push': {
       if (await isBlocked(env, id)) throw new ConfigError(`设备 ${id} 已被拉黑，请先解除`);
+      const item = await readDevice(env, id);
       const current = await readConfig(env, id);
-      const sections = JSON.parse(JSON.stringify(current.sections));
-      const document = await writeConfig(env, sections, current.revision, id);
+      let document = null;
+      if (item && item.packageId) {
+        // 绑了套餐：按套餐当前版本整份重渲染并写一次。
+        // 即使套餐没变也生成新 revision —— 用户点「下发」就是要终端必然重拉。
+        const bundle = await findBundle(env, item.packageId);
+        if (bundle) {
+          document = await writeConfig(env, sectionsFromBundle(bundle), current.revision, id);
+        }
+      }
+      if (!document) {
+        const sections = JSON.parse(JSON.stringify(current.sections));
+        document = await writeConfig(env, sections, current.revision, id);
+      }
       await markPushed(env, id, document.revision);
       return {
         deviceId: id,
         revision: document.revision,
         pushedAt: document.updatedAt,
-        note: '终端将在下次同步（前台约 15 分钟内）拉取此 revision',
+        packageId: (item && item.packageId) || '',
+        note: '终端将在下次同步（前台约 3 分钟内）拉取此 revision',
+      };
+    }
+    case 'bind': {
+      if (await isBlocked(env, id)) throw new ConfigError(`设备 ${id} 已被拉黑，请先解除`);
+      const bundleId = String(body.packageId || '').trim();
+      const item = await updateDevice(env, id, { packageId: bundleId });
+      const current = await readConfig(env, id);
+      const { document, applied } = await applyBoundBundle(env, current, id, item);
+      await markPushed(env, id, document.revision);
+      return {
+        deviceId: id,
+        packageId: bundleId,
+        revision: document.revision,
+        applied,
+        pushedAt: document.updatedAt,
       };
     }
     default:

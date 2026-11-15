@@ -8,8 +8,9 @@
  *   device_<id>_current               某台设备的独立完整文档
  *   device_<id>_snapshot_000000NN     该设备的快照
  *   device_<id>_revisions             该设备的快照索引
- *   devices_index                     设备注册表（别名 / 上线时间 / 版本 / revision）
+ *   devices_index                     设备注册表（别名 / 上线时间 / 版本 / revision / 套餐）
  *   library_current                   全局资源库（IPTV 源/套餐 + TVBox 源/站点）
+ *   bundles_current                   全局下发套餐库（导航/启动/退出弹窗/源选择）
  *
  * 「每设备完整独立」语义：不带 deviceId 的请求读写全局模板；带 deviceId 的请求读写
  * 该设备自己的完整文档。设备首次上线时自动以当前全局模板深拷贝一份（revision 0），
@@ -24,7 +25,8 @@
  * 可通过 CONFIG_STORAGE=kv|blob 强制指定后端（默认 auto：有 KV 用 KV）。
  */
 import {
-  buildDocument, ConfigError, emptyLibrary, LIBRARY_SCHEMA_VERSION, nowIso, seedDocument,
+  buildDocument, ConfigError, emptyBundles, emptyLibrary, BUNDLE_SCHEMA_VERSION,
+  LIBRARY_SCHEMA_VERSION, nowIso, seedDocument,
 } from './contract.js';
 
 const KEY_CURRENT = 'config_current';
@@ -33,6 +35,8 @@ const KEY_SNAPSHOT = (revision) => `config_snapshot_${String(revision).padStart(
 const KEY_DEVICES = 'devices_index';
 /** 全局资源库（IPTV 源/套餐 + TVBox 源/站点），与任何设备文档解耦。 */
 const KEY_LIBRARY = 'library_current';
+/** 全局下发套餐库（导航 + 启动/退出弹窗 + IPTV/TVBox 选择的具名组合）。 */
+const KEY_BUNDLES = 'bundles_current';
 const MAX_HISTORY = 100;
 const MAX_DEVICES = 200;
 const DEFAULT_BLOB_NAMESPACE = 'pu_tv_cloud';
@@ -298,11 +302,75 @@ export async function writeLibrary(env, library, expectedRevision) {
   return next;
 }
 
+/* ---------------- 全局下发套餐库 ---------------- */
+
+/** 读套餐库；从未写过时返回空库（revision 0）。 */
+export async function readBundles(env) {
+  const db = await backend(env);
+  const value = await db.getJSON(KEY_BUNDLES);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return emptyBundles();
+  return value;
+}
+
+/**
+ * 写套餐库：与资源库同样的 If-Match 乐观锁语义。
+ *
+ * 套餐本身保留 revision，设备文档靠 bundleStamp 记录「渲染自哪一版套餐」，
+ * 所以改一次套餐，所有绑定该套餐的设备在下次 GET 时各推进一格 revision，
+ * 不需要批量写设备（设备再多也不会把一次保存放大成 N 次写）。
+ */
+export async function writeBundles(env, bundles, expectedRevision) {
+  const db = await backend(env);
+  const current = (await db.getJSON(KEY_BUNDLES)) || emptyBundles();
+  if (current.revision !== expectedRevision) throw new Conflict(current);
+
+  // 逐套餐自增 revision：只有内容真的变了才 +1，绑定别的套餐的设备不会被牵连重写。
+  // 用 sections + name + remark 比对（而不是整个对象），避免 updatedAt 每次都不同
+  // 导致「什么都没改也推进版本」。
+  const previous = new Map((current.items || []).map((item) => [item.id, item]));
+  const items = (bundles.items || []).map((item) => {
+    const before = previous.get(item.id);
+    const same = !!before
+      && JSON.stringify(before.sections) === JSON.stringify(item.sections)
+      && before.name === item.name
+      && (before.remark || '') === (item.remark || '');
+    const revision = before
+      ? (same ? (before.revision || 1) : (before.revision || 0) + 1)
+      : 1;
+    return {
+      ...item,
+      revision,
+      createdAt: (before && before.createdAt) || item.createdAt || nowIso(),
+      updatedAt: same ? before.updatedAt : nowIso(),
+    };
+  });
+
+  const next = {
+    ...bundles,
+    items,
+    schemaVersion: BUNDLE_SCHEMA_VERSION,
+    revision: expectedRevision + 1,
+    updatedAt: nowIso(),
+  };
+  await db.put(KEY_BUNDLES, JSON.stringify(next));
+  return next;
+}
+
+/**
+ * 统计绑定了这些套餐的设备台数。用于编辑器保存前提示影响面。
+ */
+export async function countBundleDevices(env, bundleIds = []) {
+  const wanted = new Set(bundleIds);
+  if (!wanted.size) return 0;
+  const db = await backend(env);
+  const devices = (await db.getJSON(KEY_DEVICES)) || [];
+  return devices.filter((entry) => entry && wanted.has(entry.packageId)).length;
+}
+
 /**
  * 统计「引用了这些库 id 且未锁定」的设备台数。
  * 只读不写：写库不应该顺带改设备文档，真正的生效发生在设备下次 GET。
- */
-export async function countAffectedDevices(env, refs = {}) {
+ */export async function countAffectedDevices(env, refs = {}) {
   const packageIds = new Set(refs.packageIds || []);
   const sourceIds = new Set(refs.sourceIds || []);
   const siteIds = new Set(refs.siteIds || []);
@@ -384,6 +452,8 @@ export async function touchDevice(env, deviceId, meta = {}) {
       model: '',
       revision: 0,
       editedAt: '',
+      /** 绑定的下发套餐 id；空串表示「不用套餐」，设备文档按老逻辑独立维护。 */
+      packageId: '',
     };
     devices.unshift(item);
   }
@@ -419,8 +489,15 @@ export async function listDevices(env, now = Date.now()) {
   });
 }
 
-export async function updateDevice(env, deviceId, patch = {}) {
+/** 读单台设备的注册项（含 packageId）；不存在返回 null。 */
+export async function readDevice(env, deviceId) {
+  if (!deviceId) return null;
   const db = await backend(env);
+  const devices = (await db.getJSON(KEY_DEVICES)) || [];
+  return devices.find((entry) => entry && entry.id === deviceId) || null;
+}
+
+export async function updateDevice(env, deviceId, patch = {}) {  const db = await backend(env);
   const devices = (await db.getJSON(KEY_DEVICES)) || [];
   const item = devices.find((entry) => entry.id === deviceId);
   if (!item) throw new ConfigError(`找不到设备 ${deviceId}`);
@@ -429,6 +506,10 @@ export async function updateDevice(env, deviceId, patch = {}) {
   if (typeof patch.hidden === 'boolean') {
     item.hidden = patch.hidden;
     item.hiddenAt = patch.hidden ? nowIso() : '';
+  }
+  // 套餐绑定/解绑。空串 = 解除绑定（回到设备独立配置）。
+  if (typeof patch.packageId === 'string') {
+    item.packageId = patch.packageId.trim().slice(0, 64);
   }
   await db.put(KEY_DEVICES, JSON.stringify(devices));
   return item;

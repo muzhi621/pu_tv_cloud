@@ -19,6 +19,9 @@ import {
   onRequestGet as libraryGet, onRequestPut as libraryPut,
 } from '../edge-functions/api/library/index.js';
 import {
+  onRequestGet as bundlesGet, onRequestPut as bundlesPut,
+} from '../edge-functions/api/bundles/index.js';
+import {
   onRequestGet as editorGet, preloadDefaults, injectDefaults,
 } from '../edge-functions/index.js';
 import {
@@ -1025,8 +1028,12 @@ test('退出弹窗与一级导航分组契约', async (t) => {
 
     assert.ok(!html.includes('data-tab="sites"'), '编辑器仍有直播平台页签');
     assert.ok(!source.includes('renderSites'), '编辑器仍有直播平台渲染逻辑');
-    assert.match(html, /data-tab="iptv" class="active"/, '默认页签应为 IPTV 下发');
-    assert.match(source, /activeTab:\s*'iptv'/);
+    // 导航 / 启动 / 退出弹窗 / IPTV 下发 都已收进「套餐管理」，顶层只留四个页签。
+    assert.match(html, /data-tab="bundles" class="active"/, '默认页签应为套餐管理');
+    assert.match(source, /activeTab:\s*'bundles'/);
+    assert.ok(!html.includes('data-tab="iptv"'), 'IPTV 下发页签应已并入套餐');
+    assert.ok(!html.includes('data-tab="navigation"'), '导航栏页签应已并入套餐');
+    assert.ok(!html.includes('data-tab="startup"'), '启动页签应已并入套餐');
 
     assert.ok(!('sites' in seed.sections), 'seed 仍带直播平台节');
     assert.deepEqual(catalog.sites, [], 'catalog 仍列出直播平台');
@@ -1785,5 +1792,137 @@ test('TVBox spider 字段：md5 拆分、相对资源解析、流派标记', asy
     for (const name of ['parseTvboxJson', 'parseSpiderField', 'resolveVodAsset', 'spiderMd5']) {
       assert.ok(source.includes(name), `editor/app.js 缺少 ${name}`);
     }
+  });
+});
+
+/* ================= 下发套餐（导航 + 弹窗 + 源选择 → 一份配置） ================= */
+
+test('下发套餐：终端只绑一个套餐，改套餐自动生效', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  const fresh = new MemoryKV();
+  globalThis.PURETV_KV = fresh;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {};
+  const listBundles = () => bundlesGet(ctx('GET', '/api/bundles', { env }));
+  const putBundles = (body, rev) => bundlesPut(ctx('PUT', '/api/bundles', {
+    env, headers: { 'If-Match': String(rev) }, body,
+  }));
+  // /api/devices 支持批量：结果包在 results[0] 里，ok 由 runAction 的容错分支决定。
+  const bind = async (deviceId, packageId) => {
+    const data = await json(await devicesPost(ctx('POST', '/api/devices', {
+      env, body: { action: 'bind', deviceId, packageId },
+    })));
+    return (data.results || [])[0] || {};
+  };
+  const getDevice = (id) => configGet(ctx('GET', `/api/config?deviceId=${id}`, { env }));
+
+  await t.test('空套餐库结构完整，usage 为空', async () => {
+    const data = await json(await listBundles());
+    assert.equal(data.revision, 0);
+    assert.deepEqual(data.items, []);
+    assert.deepEqual(data.usage, {});
+  });
+
+  await t.test('PUT 自动补 id、补全五节 sections', async () => {
+    const res = await putBundles({
+      items: [{
+        name: '客厅',
+        remark: '主卧电视用',
+        sections: { navigation: { managed: true, railMenuIds: ['iptv'] } },
+      }],
+    }, 0);
+    assert.equal(res.status, 200);
+    const data = await json(res);
+    assert.equal(data.revision, 1);
+    const list = await json(await listBundles());
+    assert.equal(list.items.length, 1);
+    assert.match(list.items[0].id, /^bd_[0-9a-f]{8}$/);
+    assert.equal(list.items[0].name, '客厅');
+    assert.deepEqual(Object.keys(list.items[0].sections).sort(),
+      ['iptv', 'navigation', 'startup', 'update', 'vod']);
+  });
+
+  await t.test('未注册设备直接绑定会被逐台拒绝', async () => {
+    const list = await json(await listBundles());
+    const res = await bind('tv-unknown', list.items[0].id);
+    assert.equal(res.ok, false);
+    assert.match(res.error, /找不到设备/);
+  });
+
+  await t.test('绑定后设备文档整份替换为套餐内容，并记录 bundleStamp', async () => {
+    await json(await getDevice('tv-a')); // 先上线，让注册表里有这台设备
+    const list = await json(await listBundles());
+    const bundleId = list.items[0].id;
+    const res = await bind('tv-a', bundleId);
+    assert.equal(res.ok, true);
+    assert.equal(res.deviceId, 'tv-a');
+    assert.equal(res.packageId, bundleId);
+
+    const doc = await json(await getDevice('tv-a'));
+    assert.deepEqual(doc.sections.navigation.railMenuIds, ['iptv']);
+    assert.equal(doc.sections.bundleStamp.id, bundleId);
+    assert.equal(doc.sections.bundleStamp.revision, 1);
+  });
+
+  await t.test('设备列表回报绑定的套餐', async () => {
+    const data = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
+    const row = data.devices.find((item) => item.id === 'tv-a');
+    const list = await json(await listBundles());
+    assert.equal(row.packageId, list.items[0].id);
+  });
+
+  await t.test('改套餐后，终端下次 GET 自动追平并推进 revision', async () => {
+    const before = await json(await getDevice('tv-a'));
+    const list = await json(await listBundles());
+    const bundle = list.items[0];
+    const res = await putBundles({
+      items: [{
+        id: bundle.id,
+        name: '客厅（改）',
+        sections: {
+          navigation: { managed: true, railMenuIds: ['iptv', 'vodBrowse'] },
+          startup: { exitDialog: { enabled: true, titleI18n: { zh: '改过了' } } },
+        },
+      }],
+    }, list.revision);
+    assert.equal(res.status, 200);
+
+    const after = await json(await getDevice('tv-a'));
+    assert.ok(after.revision > before.revision, 'revision 必须推进，否则终端会命中 304');
+    assert.deepEqual(after.sections.navigation.railMenuIds, ['iptv', 'vodBrowse']);
+    assert.equal(after.sections.startup.exitDialog.titleI18n.zh, '改过了');
+    assert.equal(after.sections.bundleStamp.revision, 2);
+  });
+
+  await t.test('再拉一次不再重复写（stamp 命中）', async () => {
+    const first = await json(await getDevice('tv-a'));
+    const second = await json(await getDevice('tv-a'));
+    assert.equal(second.revision, first.revision);
+  });
+
+  await t.test('解绑后设备保留当前内容，不再跟随套餐', async () => {
+    const before = await json(await getDevice('tv-a'));
+    const res = await bind('tv-a', '');
+    assert.equal(res.ok, true);
+    assert.equal(res.packageId, '');
+    const after = await json(await getDevice('tv-a'));
+    assert.deepEqual(after.sections.navigation.railMenuIds, before.sections.navigation.railMenuIds);
+
+    const list = await json(await listBundles());
+    const bundle = list.items[0];
+    await putBundles({
+      items: [{ id: bundle.id, name: bundle.name, sections: { navigation: { managed: true, railMenuIds: [] } } }],
+    }, list.revision);
+    const still = await json(await getDevice('tv-a'));
+    assert.deepEqual(still.sections.navigation.railMenuIds, before.sections.navigation.railMenuIds);
+  });
+
+  await t.test('删除套餐后，绑定它的终端保持现状而不报错', async () => {
+    const list = await json(await listBundles());
+    const res = await putBundles({ items: [] }, list.revision);
+    assert.equal(res.status, 200);
+    const doc = await getDevice('tv-a');
+    assert.equal(doc.status, 200);
   });
 });

@@ -261,6 +261,18 @@ button.tiny.danger { color: var(--danger); border-color: #fecaca; }
 .lib-site-checks code { font-size: 11px; color: var(--muted); }
 p.meta { margin: 6px 0; }
 
+/* ---- 套餐管理 ---- */
+.bundle-card {
+  border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+  margin: 12px 0; background: var(--panel, rgba(127, 127, 127, 0.04));
+}
+.bundle-card .bundle-head {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
+}
+.bundle-card .bundle-head strong { font-size: 15px; }
+.bundle-card .toolbar { margin-top: 10px; }
+.device-table select { max-width: 180px; }
+
 @media (max-width: 720px) {
   .conn input { width: 150px; }
   main { padding: 16px; }

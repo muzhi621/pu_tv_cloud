@@ -3,6 +3,7 @@ import {
   ConfigError, expandIptvChannels, expandVodSites, MAX_DOCUMENT_BYTES, normalizeSections,
   viewDocument,
 } from '../../_lib/contract.js';
+import { applyBoundBundle } from '../../_lib/bundle.js';
 import {
   deviceScope, handle, HttpError, optionsHandler, readJsonBody, requireAuth, send,
 } from '../../_lib/http.js';
@@ -70,9 +71,16 @@ export async function onRequestGet(context) {
     requireAuth(request, env, 'read');
     const { id, meta } = deviceScope(request);
     await rejectBlocked(env, id);
-    let document = await read(env, id);
+    const document0 = await read(env, id);
     // 每次成功拉取即视为「上线」，不额外做心跳请求。
-    if (id) await touchDevice(env, id, meta);
+    const item = id ? await touchDevice(env, id, meta) : null;
+    let document = document0;
+
+    // 套餐优先：设备绑了套餐就以套餐为准。文档落后于套餐当前版本时在这里重渲染，
+    // revision 自然 +1，终端带 since 的 304 判定随即失效并拿到新内容。
+    // 放在资源库追平之前：套餐本身只存 id 引用，追平完再展开才是最新库内容。
+    const bound = await applyBoundBundle(env, document, id, item);
+    document = bound.document;
 
     // 库有新版本时先追平设备 revision，再做 304 判定，终端才不会漏掉新频道。
     const library = await safeReadLibrary(env);

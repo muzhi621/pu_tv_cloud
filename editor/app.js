@@ -31,11 +31,22 @@ const state = {
   original: null,
   catalog: null,
   revision: 0,
-  activeTab: 'iptv',
+  activeTab: 'bundles',
   extraMode: null,
   extraData: null,
   dirty: false,
   devMode: false,
+  // ---- 下发套餐（与设备无关，GET/PUT /api/bundles） ----
+  // 套餐是「导航栏 + 启动/退出弹窗 + IPTV 选择 + TVBox 选择」的具名组合。
+  // 进入套餐编辑时 state.doc / state.original 指向该套餐的 sections，
+  // 这样下面所有表单渲染函数完全复用，不需要为套餐再写一套控件。
+  bundles: null,          // 套餐库文档；null = 尚未加载
+  bundleState: 'idle',    // idle | loading | ready | unsupported | error
+  bundleError: '',
+  bundleRevision: 0,
+  bundleId: '',           // 当前编辑的套餐 id；空 = 显示套餐列表
+  bundleTab: 'base',      // base | navigation | startup | iptv | vod | update
+  editing: 'template',    // bundle | device | template —— 决定保存走哪个接口
 };
 
 const $ = (id) => document.getElementById(id);
@@ -893,6 +904,280 @@ async function loadDeviceStatus() {
   }
 }
 
+/* ---------------- 套餐管理 ---------------- */
+
+function bundleItems() { return arr(state.bundles && state.bundles.items); }
+
+function bundleById(id) { return bundleItems().find((item) => item && item.id === id) || null; }
+
+/**
+ * 读套餐库。服务端未升级（404）时降级为「不支持」，页面给出升级提示，
+ * 其余功能（资源库、终端）照常可用，不会白屏。
+ */
+async function loadBundles() {
+  if (!state.base) return;
+  state.bundleState = 'loading';
+  try {
+    const data = await request('/api/bundles');
+    state.bundles = data;
+    state.bundleRevision = Number(data && data.revision) || 0;
+    state.bundleState = 'ready';
+    state.bundleError = '';
+  } catch (error) {
+    if (error.status === 404) {
+      state.bundleState = 'unsupported';
+      state.bundleError = '当前云端还没有 /api/bundles 接口，请先部署最新 Edge Functions。';
+    } else if (error.status === 401) {
+      state.bundleState = 'error';
+      state.bundleError = '读令牌无效（套餐库只认 CONFIG_READ_TOKEN）。';
+    } else {
+      state.bundleState = 'error';
+      state.bundleError = error.message || '读取套餐库失败';
+    }
+  }
+}
+
+/** 当前套餐绑定了几台设备（服务端 GET 时顺带算好）。 */
+function bundleUsage(id) {
+  const usage = (state.bundles && state.bundles.usage) || {};
+  return Number(usage[id]) || 0;
+}
+
+/** 进入套餐编辑：把 state.doc 指向这份套餐，下面的表单全部复用。 */
+function openBundle(id) {
+  const bundle = bundleById(id);
+  if (!bundle) return;
+  if (state.dirty && !window.confirm('当前有未保存的改动，切到套餐会丢弃，继续？')) return;
+  state.bundleId = id;
+  state.editing = 'bundle';
+  state.doc = {
+    schemaVersion: 1,
+    revision: state.bundleRevision,
+    updatedAt: bundle.updatedAt || '',
+    sections: clone(bundle.sections),
+  };
+  state.original = clone(state.doc);
+  state.revision = state.bundleRevision;
+  state.dirty = false;
+  state.extraMode = null;
+  render();
+}
+
+/** 退出套餐编辑，回到套餐列表。 */
+function closeBundle() {
+  if (state.dirty && !window.confirm('套餐有未保存的改动，确定放弃？')) return;
+  state.bundleId = '';
+  state.doc = null;
+  state.original = null;
+  state.dirty = false;
+  state.extraMode = null;
+  render();
+}
+
+/** 新建套餐：以当前全局模板为底稿，避免从空白开始配置。 */
+function createBundle() {
+  const name = window.prompt('新套餐名称（例如：客厅电视 / 老家盒子）', '新套餐');
+  if (name === null) return;
+  const base = state.doc && state.editing !== 'bundle'
+    ? clone(state.doc.sections)
+    : clone((bundleItems()[0] && bundleItems()[0].sections) || {});
+  const id = 'bd_' + Math.random().toString(16).slice(2, 10).padEnd(8, '0').slice(0, 8);
+  const item = {
+    id,
+    name: String(name).trim().slice(0, 64) || '新套餐',
+    remark: '',
+    sections: base,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  state.bundles = state.bundles || { schemaVersion: 1, revision: 0, items: [] };
+  state.bundles.items = arr(state.bundles.items).concat([item]);
+  // 直接进入编辑态，用户填完点保存才真正落库。
+  state.bundleId = id;
+  state.editing = 'bundle';
+  state.doc = { schemaVersion: 1, revision: state.bundleRevision, sections: clone(base) };
+  state.original = { schemaVersion: 1, revision: state.bundleRevision, sections: {} };
+  state.revision = state.bundleRevision;
+  state.dirty = true;
+  toast('已创建套餐草稿，填好后点「保存套餐」');
+  render();
+}
+
+async function deleteBundle(id) {
+  const bundle = bundleById(id);
+  if (!bundle) return;
+  const used = bundleUsage(id);
+  const extra = used ? '\n\n注意：有 ' + used + ' 台终端正在使用它，删除后这些终端会停留在上一次的内容。' : '';
+  if (!window.confirm('删除套餐「' + bundle.name + '」？' + extra)) return;
+  const next = {
+    ...state.bundles,
+    items: bundleItems().filter((item) => item.id !== id),
+  };
+  try {
+    const result = await request('/api/bundles', {
+      write: true,
+      method: 'PUT',
+      headers: { 'If-Match': String(state.bundleRevision) },
+      body: JSON.stringify({ ...next, expectedRevision: state.bundleRevision }),
+    });
+    state.bundleRevision = result.revision;
+    await loadBundles();
+    if (state.bundleId === id) { state.bundleId = ''; state.doc = null; state.original = null; }
+    state.dirty = false;
+    toast('已删除套餐');
+    render();
+  } catch (error) {
+    message('删除失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
+async function saveBundle() {
+  const bundle = bundleById(state.bundleId);
+  if (!bundle) return;
+  clearMessage();
+  // 与设备文档同样清洗：套餐里只存「源 id 引用」，不存展开后的几百条频道，
+  // 否则一份套餐就能把 900 KB 的文档上限吃掉。
+  bundle.sections = sectionsForSave();
+  bundle.updatedAt = new Date().toISOString();
+  try {
+    const result = await request('/api/bundles', {
+      write: true,
+      method: 'PUT',
+      headers: { 'If-Match': String(state.bundleRevision) },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        revision: state.bundleRevision,
+        items: bundleItems(),
+        expectedRevision: state.bundleRevision,
+      }),
+    });
+    state.bundleRevision = result.revision;
+    await loadBundles();
+    // 服务端会重新规范化（可能改 id、补默认值），以返回值刷新编辑中的 doc。
+    const fresh = bundleById(state.bundleId) || bundle;
+    state.doc = { schemaVersion: 1, revision: state.bundleRevision, sections: clone(fresh.sections) };
+    state.original = clone(state.doc);
+    state.dirty = false;
+    statusText('套餐已保存，套餐库 revision ' + result.revision);
+    message('套餐「' + fresh.name + '」已保存，套餐库 revision ' + result.revision + '。'
+      + (result.affectedDevices ? '\n有 ' + result.affectedDevices + ' 台终端绑定了套餐，它们下次同步（约 3 分钟内）会自动拿到新配置。' : '')
+      + ((result.warnings && result.warnings.length) ? '\n服务端兜底提示：\n' + result.warnings.join('\n') : ''), 'ok');
+    render();
+  } catch (error) {
+    if (error.status === 409) {
+      message('套餐库已被其他页面修改（当前 revision ' + state.bundleRevision + '）。请刷新后重试。', 'err');
+      $('message').innerHTML += '<div class="toolbar" style="margin-top:10px">'
+        + '<button class="ghost" data-bundle="reload">重新加载套餐库</button></div>';
+    } else {
+      message('保存套餐失败：' + error.message + hintOf(error), 'err');
+    }
+  }
+}
+
+/** 把某个套餐绑定并立即下发到一台终端。 */
+async function dispatchBundle(deviceId, bundleId) {
+  if (!deviceId) { message('请先选择终端。', 'err'); return; }
+  if (!bundleId) { message('请先选择套餐。', 'err'); return; }
+  try {
+    const result = await request('/api/devices', {
+      write: true,
+      method: 'POST',
+      body: JSON.stringify({ action: 'bind', deviceId, packageId: bundleId }),
+    });
+    const row = arr(result.results).find((item) => item.deviceId === deviceId);
+    if (row && row.ok === false) throw new Error(row.error || '下发失败');
+    toast('已下发，revision ' + ((row && row.revision) || '?'));
+    await refreshDevices();
+    renderPanel();
+  } catch (error) {
+    message('下发失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
+function bundleSelectHtml(selected, attrs) {
+  return '<select ' + (attrs || '') + '><option value="">未绑定套餐</option>'
+    + bundleItems().map((item) =>
+      '<option value="' + esc(item.id) + '"' + (item.id === selected ? ' selected' : '') + '>'
+      + esc(item.name) + '</option>').join('')
+    + '</select>';
+}
+
+/* ---------------- 套餐页面 ---------------- */
+
+function renderBundleList() {
+  if (state.bundleState === 'loading') return '<p class="muted">正在读取套餐库…</p>';
+  if (state.bundleState === 'unsupported' || state.bundleState === 'error') {
+    return '<h2>套餐管理</h2><div class="message err">' + esc(state.bundleError) + '</div>'
+      + '<div class="toolbar"><button class="ghost" data-bundle="reload">重新加载</button></div>';
+  }
+  const items = bundleItems();
+  const cards = items.map((bundle) => {
+    const iptv = (bundle.sections && bundle.sections.iptv) || {};
+    const vod = (bundle.sections && bundle.sections.vod) || {};
+    const pkgCount = arr(iptv.packageIds).length;
+    const vodCount = arr(vod.sourceIds).length;
+    const used = bundleUsage(bundle.id);
+    return '<div class="bundle-card">'
+      + '<div class="bundle-head"><strong>' + esc(bundle.name) + '</strong>'
+      + (used ? '<span class="badge ok">' + used + ' 台在用</span>' : '<span class="badge off">未绑定</span>')
+      + '</div>'
+      + '<p class="meta">' + esc(bundle.remark || '无备注') + '</p>'
+      + '<p class="meta">IPTV ' + pkgCount + ' 个源套餐 · TVBox ' + vodCount + ' 个源 · 更新于 '
+      + esc((bundle.updatedAt || '').replace('T', ' ').slice(0, 19)) + '</p>'
+      + '<div class="toolbar">'
+      + '<button class="tiny primary" data-bundle="edit" data-id="' + esc(bundle.id) + '">编辑</button>'
+      + '<button class="tiny" data-bundle="delete" data-id="' + esc(bundle.id) + '">删除</button>'
+      + '</div></div>';
+  }).join('');
+
+  return '<h2>套餐管理</h2>'
+    + '<p class="hint">套餐 = 导航栏 + 启动/退出弹窗 + IPTV 源分组 + TVBox 源站点 的<b>具名组合</b>。'
+    + '终端只需要「选择套餐 → 下发」，不再逐台改配置。'
+    + '要改内容就回来改套餐再保存——所有绑定该套餐的终端会在下次同步（约 3 分钟内）自动生效。</p>'
+    + '<div class="toolbar"><button class="primary" data-bundle="create">+ 新建套餐</button>'
+    + '<button class="ghost" data-bundle="reload">刷新</button></div>'
+    + (cards || '<p class="muted">还没有套餐。点「新建套餐」创建第一个，'
+      + '它会以当前全局模板为底稿。</p>')
+    + '<h3 style="margin-top:24px">未使用套餐的终端</h3>'
+    + '<p class="hint">新设备默认复制「全局模板」。在「终端管理」里给它们选一个套餐，'
+    + '就会脱离模板、跟随套餐变化。</p>';
+}
+
+function renderBundleEditor() {
+  const bundle = bundleById(state.bundleId);
+  if (!bundle) return '<p class="muted">套餐不存在，请刷新。</p>';
+  const deviceOptions = arr(state.devices).filter((d) => !d.hidden)
+    .map((d) => '<option value="' + esc(d.id) + '">'
+      + esc(d.alias || d.id.slice(0, 12)) + (d.online ? '（在线）' : '（离线）') + '</option>').join('');
+
+  return '<div class="toolbar">'
+    + '<button class="ghost" data-bundle="back">← 返回套餐列表</button>'
+    + '<span class="badge">套餐库 revision ' + esc(state.bundleRevision) + '</span>'
+    + '<span class="badge ' + (bundleUsage(bundle.id) ? 'ok' : 'off') + '">'
+    + bundleUsage(bundle.id) + ' 台终端在用</span></div>'
+    + '<h2>编辑套餐 · ' + esc(bundle.name) + '</h2>'
+    + '<div class="df-block" style="margin-bottom:16px">'
+    + '<label class="df-field"><span>套餐名称</span>'
+    + '<input data-bundle-field="name" value="' + esc(bundle.name) + '"></label>'
+    + '<label class="df-field"><span>备注（给谁用、什么区别）</span>'
+    + '<input data-bundle-field="remark" value="' + esc(bundle.remark || '') + '"></label>'
+    + '<p class="meta">保存后，绑定该套餐的终端会在约 3 分钟内自动拿到新配置。'
+    + '想立刻生效，用下面的「下发到终端」。</p>'
+    + '<div class="toolbar">'
+    + '<select id="bundleDispatchDevice">' + (deviceOptions || '<option value="">暂无终端</option>') + '</select>'
+    + '<button class="tiny primary" data-bundle="dispatch" data-id="' + esc(bundle.id) + '">下发到终端</button>'
+    + '</div></div>'
+    + sectionsFormHtml()
+    + '<div class="toolbar" style="margin-top:16px">'
+    + '<button class="primary" data-bundle="save">保存套餐</button>'
+    + '<button class="ghost" data-bundle="back">取消</button>'
+    + '</div>';
+}
+
+function renderBundles() {
+  return state.bundleId ? renderBundleEditor() : renderBundleList();
+}
+
 function renderDevices() {
   const visible = state.devices.filter((d) => state.showHiddenDevices || !d.hidden);
   const online = state.devices.filter((d) => d.online && !d.hidden).length;
@@ -921,6 +1206,9 @@ function renderDevices() {
       + '<td>' + esc(d.appVersion || '—') + '</td>'
       + '<td>' + agoText(d.lastSeenAgo) + '<br><span class="meta">' + esc(d.lastSeen || '—') + '</span></td>'
       + '<td>r' + esc(d.revision) + '</td>'
+      + '<td>' + (bundleItems().length
+        ? bundleSelectHtml(d.packageId || '', 'data-device-bundle="' + esc(d.id) + '"')
+        : '<span class="meta">' + (d.packageId ? esc(d.packageId) : '—') + '</span>') + '</td>'
       + '<td>' + (d.pushedAt ? agoFromIso(d.pushedAt) + '<br><span class="meta">r'
         + esc(d.pushedRevision || 0) + '</span>' : '—') + '</td>'
       + '<td class="ops">' + ops + '</td></tr>';
@@ -933,10 +1221,9 @@ function renderDevices() {
   return '<h2>上线终端 · ' + online + ' 台在线 / ' + state.devices.length + ' 台已连接</h2>'
     + '<p class="hint">所有连接过的设备都会登记在这里。'
     + '云端以「最后上线距今 ≤ ' + esc(state.onlineWindow) + ' 分钟」判定在线。'
-    + '每台终端保存一份<b>完整独立</b>的配置：新设备首次上线复制全局模板，'
-    + '之后改全局模板<b>不会</b>影响已登记设备。点「编辑设置」可单独改一台的全部设置，'
-    + '再点「配置下发」立即生成新 revision；终端下次同步即生效'
-    + '（客户端 3.0.18 起每 3 分钟同步一次，旧版本约 15 分钟）。</p>'
+    + '<b>日常只需要在「套餐」列里选一个套餐</b>：选完立即下发，终端约 3 分钟内同步生效。'
+    + '没绑套餐的终端沿用「全局模板」的独立配置，改模板不会影响已登记设备。'
+    + '要长期改内容请去「套餐管理」改套餐，而不是逐台编辑。</p>'
     + '<div class="toolbar device-batch">'
     + '<label><input type="checkbox" data-batch="all"> 全选可见设备</label>'
     + '<button class="tiny" data-batch="push">批量下发</button>'
@@ -947,9 +1234,9 @@ function renderDevices() {
     + '<button class="tiny" data-batch="refresh">刷新状态</button>'
     + '</div>'
     + '<table class="device-table"><thead><tr><th></th><th>状态</th><th>别名</th><th>设备 ID</th>'
-    + '<th>App 版本</th><th>最后上线</th><th>版本</th><th>最近下发</th><th>操作</th>'
+    + '<th>App 版本</th><th>最后上线</th><th>版本</th><th>套餐</th><th>最近下发</th><th>操作</th>'
     + '</tr></thead><tbody>'
-    + (rows || '<tr><td colspan="9">还没有终端上线。安装并打开一次 App 即会出现在这里。</td></tr>')
+    + (rows || '<tr><td colspan="10">还没有终端上线。安装并打开一次 App 即会出现在这里。</td></tr>')
     + '</tbody></table>'
     + (blockedRows ? '<h3>已拉黑的设备</h3>' + blockedRows : '');
 }
@@ -1884,16 +2171,18 @@ function renderPanel() {
   // 资源库、终端管理页签都不依赖配置文档：前者单独加载资源库，后者只读
   // /api/devices。这样即使没点「连接并加载」，终端在线/离线也能日常显示。
   const standaloneTab = state.activeTab === 'iptv-lib'
-    || state.activeTab === 'vod-lib' || state.activeTab === 'devices';
+    || state.activeTab === 'vod-lib' || state.activeTab === 'devices'
+    || state.activeTab === 'bundles';
   if (!state.doc && !standaloneTab) {
     $('panel').innerHTML = '<p class="muted">请先点击右上角「连接并加载」。</p>';
     return;
   }
-  const renderers = { navigation: renderNavigation,
+  const renderers = { bundles: renderBundles,
+    navigation: renderNavigation,
     startup: renderStartup, update: renderUpdate,
     iptv: renderIptvDispatch, 'iptv-lib': renderIptvLibrary,
     'vod-lib': renderVodLibrary, devices: renderDevices };
-  const renderer = renderers[state.activeTab] || renderIptvDispatch;
+  const renderer = renderers[state.activeTab] || renderBundles;
   $('panel').innerHTML = renderer();
 }
 
@@ -2012,14 +2301,17 @@ function deviceVodBlock() {
   return html;
 }
 
-function renderDeviceEditor() {
-  if (!state.doc) return '<p class="muted">请先连接云端。</p>';
-  const id = state.drawerDeviceId;
-  const device = deviceById(id) || {};
-  const sections = state.doc.sections;
+/**
+ * 一份完整配置的表单：导航 / 公告 / 退出弹窗 / 在线更新 / IPTV / TVBox。
+ *
+ * 抽出来是因为「套餐」和「单终端」需要一模一样的控件——套餐就是一份可复用的
+ * 配置，终端只是绑定了某份套餐。两者共用同一套 data-df 路径，写入的都是
+ * state.doc.sections，所以不存在「套餐能改但终端不支持」的字段。
+ */
+function sectionsFormHtml() {
   const catalog = state.catalog || { sites: [], menus: [] };
   const menus = catalog.menus || [];
-  const groups = (sections.navigation && sections.navigation.groups) || [];
+  const groups = (state.doc.sections.navigation && state.doc.sections.navigation.groups) || [];
   // 'settings' 是合法的二级项但不在站点 catalog 的 menus 里（它不是菜单页，
   // 而是设置目录）；补进来才能完整编辑 settings 一级块的 children。
   const childItems = menus.some((item) => item.id === 'settings')
@@ -2035,12 +2327,7 @@ function renderDeviceEditor() {
     { value: 'force', label: '强制更新' },
   ];
 
-  return '<h2>单终端配置 · ' + esc(device.alias || id) + '</h2>'
-    + '<p class="hint">以下设置<b>只对 <code>' + esc(id) + '</code> 生效</b>，'
-    + '不会影响其它终端或全局模板。改完点「下发配置」：先保存本页改动，再生成新 revision，'
-    + '终端（3.0.18+）约 3 分钟内自动同步，旧版本约 15 分钟；影音页的'
-    + '「重新获取配置」可让终端立即重拉。</p>'
-    + '<div class="df-grid">'
+  return '<div class="df-grid">'
 
     + '<div class="df-block"><h3>导航（左侧三大类）</h3>'
     + dfCheck('navigation.managed', '云端接管本节')
@@ -2089,7 +2376,20 @@ function renderDeviceEditor() {
 
     + '<div class="df-block"><h3>TVBox 站点下发</h3>' + deviceVodBlock() + '</div>'
 
-    + '</div>'
+    + '</div>';
+}
+
+function renderDeviceEditor() {
+  if (!state.doc) return '<p class="muted">请先连接云端。</p>';
+  const id = state.drawerDeviceId;
+  const device = deviceById(id) || {};
+
+  return '<h2>单终端配置 · ' + esc(device.alias || id) + '</h2>'
+    + '<p class="hint">以下设置<b>只对 <code>' + esc(id) + '</code> 生效</b>，'
+    + '不会影响其它终端或全局模板。若这台终端已绑定套餐，套餐每次同步都会覆盖这里的改动——'
+    + '<b>要长期生效请改套餐</b>。改完点「下发配置」：先保存本页改动，再生成新 revision，'
+    + '终端（3.0.18+）约 3 分钟内自动同步；影音页的「重新获取配置」可让终端立即重拉。</p>'
+    + sectionsFormHtml()
     + '<div class="toolbar" style="margin-top:16px">'
     + '<button class="primary" data-extra="device-push">下发配置到这台终端</button>'
     + '<button class="ghost" data-extra="device-save">仅保存（不生成额外 revision）</button>'
@@ -2137,12 +2437,25 @@ function renderExtra() {
 }
 
 function render() {
-  $('revBadge').textContent = 'revision ' + (state.doc ? state.revision : '—');
+  const editingBundle = state.editing === 'bundle';
+  $('revBadge').textContent = editingBundle
+    ? '套餐库 r' + state.bundleRevision
+    : 'revision ' + (state.doc ? state.revision : '—');
   $('devBadge').hidden = !state.devMode;
   $('btnSave').disabled = !state.doc || !state.dirty;
   const pushButton = $('btnPush');
-  pushButton.disabled = !state.doc || !state.deviceId;
-  pushButton.textContent = state.deviceId ? '下发到该终端' : '配置下发';
+  pushButton.disabled = editingBundle
+    ? !state.bundleId
+    : (!state.doc || !state.deviceId);
+  pushButton.textContent = editingBundle
+    ? '下发到终端'
+    : (state.deviceId ? '下发到该终端' : '配置下发');
+  // 编辑套餐时不希望「配置对象」下拉把人带走到某台终端的文档。
+  const devicePicker = $('deviceSelect');
+  if (devicePicker) {
+    devicePicker.disabled = editingBundle;
+    if (editingBundle) devicePicker.value = '';
+  }
   Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), (button) => {
     button.classList.toggle('active', button.dataset.tab === state.activeTab);
   });
@@ -2177,10 +2490,14 @@ async function load() {
     state.revision = doc.revision;
     state.dirty = false;
     state.extraMode = null;
+    // 切到具体终端时退出套餐编辑态，否则保存会写错端点。
+    state.bundleId = '';
+    state.editing = state.deviceId ? 'device' : 'template';
+    renderDeviceSelect();
     statusText('已连接（' + deviceLabel() + '，schemaVersion ' + doc.schemaVersion + '）');
     render();
-    // 资源库与设备无关，单独加载；加载失败不影响配置编辑。
-    await loadLibrary(false);
+    // 资源库 / 套餐库与设备无关，单独加载；加载失败不影响配置编辑。
+    await Promise.all([loadLibrary(false), loadBundles()]);
     render();
     toast('配置加载成功');
   } catch (error) {
@@ -2218,6 +2535,12 @@ function sectionsForSave() {
 }
 
 async function save() {
+  // 套餐编辑写 /api/bundles，终端/模板编辑写 /api/config：两条链路语义不同，
+  // 不能共用一个端点（套餐没有「设备 revision」概念）。
+  if (state.editing === 'bundle') {
+    if (!state.bundleId) return;
+    return saveBundle();
+  }
   if (!state.doc || !state.dirty) return;
   clearMessage();
   $('btnSave').disabled = true;
@@ -2386,7 +2709,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   $('btnHistory').addEventListener('click', showHistory);
   $('btnPush').addEventListener('click', () => {
-    if (!state.deviceId) { message('请先在「配置对象」里选中一台终端。', 'err'); return; }
+    // 套餐编辑态：把当前套餐下发到套餐页里选中的终端。
+    if (state.editing === 'bundle') {
+      const select = $('bundleDispatchDevice');
+      if (!select || !select.value) { message('请先在套餐页选择要下发的终端。', 'err'); return; }
+      dispatchBundle(select.value, state.bundleId);
+      return;
+    }
+    if (!state.deviceId) { message('请先在「当前编辑」里选中一台终端。', 'err'); return; }
     pushToDevice(state.deviceId, true);
   });
 
@@ -2395,6 +2725,51 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!button) return;
     state.activeTab = button.dataset.tab;
     render();
+  });
+
+  // ---- 套餐管理 ----
+  $('panel').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-bundle]');
+    if (!button) return;
+    const action = button.dataset.bundle;
+    if (action === 'create') createBundle();
+    else if (action === 'reload') loadBundles().then(render);
+    else if (action === 'edit') openBundle(button.dataset.id);
+    else if (action === 'delete') deleteBundle(button.dataset.id);
+    else if (action === 'back') closeBundle();
+    else if (action === 'save') saveBundle();
+    else if (action === 'dispatch') {
+      const select = $('bundleDispatchDevice');
+      dispatchBundle(select ? select.value : '', button.dataset.id);
+    }
+  });
+
+  $('panel').addEventListener('change', (event) => {
+    const target = event.target;
+    // 终端列表里直接改套餐：选完即下发，不需要再点按钮。
+    if ('deviceBundle' in target.dataset) {
+      dispatchBundle(target.dataset.deviceBundle, target.value);
+      return;
+    }
+    if (target.dataset.bundleField) {
+      const bundle = bundleById(state.bundleId);
+      if (!bundle) return;
+      const field = target.dataset.bundleField;
+      bundle[field] = target.value.slice(0, field === 'name' ? 64 : 200);
+      state.dirty = true;
+      $('btnSave').disabled = false;
+    }
+  });
+
+  $('panel').addEventListener('input', (event) => {
+    const target = event.target;
+    if (!target.dataset.bundleField) return;
+    const bundle = bundleById(state.bundleId);
+    if (!bundle) return;
+    const field = target.dataset.bundleField;
+    bundle[field] = target.value.slice(0, field === 'name' ? 64 : 200);
+    state.dirty = true;
+    $('btnSave').disabled = false;
   });
 
   $('panel').addEventListener('change', (event) => {
@@ -2518,6 +2893,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('message').addEventListener('click', (event) => {
     const button = event.target.closest('button[data-conflict]');
     if (button && button.dataset.conflict === 'reload') load();
+    const bundleButton = event.target.closest('button[data-bundle]');
+    if (bundleButton && bundleButton.dataset.bundle === 'reload') loadBundles().then(render);
   });
 
   render();

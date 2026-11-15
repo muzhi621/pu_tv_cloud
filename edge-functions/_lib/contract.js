@@ -1248,3 +1248,114 @@ export function normalizeLibrary(raw) {
     warnings,
   ];
 }
+
+/* ================= 下发套餐（bundle） ================= */
+
+/**
+ * 「套餐」是比资源库更高一层的组合：把导航栏、启动/退出弹窗、IPTV 源与分组、
+ * TVBox 源与站点固化成一个具名整体。终端只做一件事——绑一个套餐。
+ *
+ * 为什么不再是「每台设备各存一份完整 sections」：
+ *   以前改导航要逐台设备点进去改，改 IPTV 又要逐台设备选套餐，设备一多就必然
+ *   出现「这台改了那台忘了」。套餐把这层收敛成一份可复用的模板，设备只剩
+ *   packageId 一个引用，改套餐即改所有绑定设备。
+ *
+ * 存储上套餐库仍是独立文档（与资源库同构），设备侧通过 bundleStamp 判断
+ * 「当前文档是哪一版套餐渲染出来的」，落后就在 GET 时自动追平。
+ */
+export const BUNDLE_SCHEMA_VERSION = 1;
+export const MAX_BUNDLES = 20;
+const BUNDLE_ID_RE = /^bd_[0-9a-f]{8}$/;
+
+/** 空库：从未写过套餐时也返回结构完整的文档（revision 0）。 */
+export function emptyBundles() {
+  return {
+    schemaVersion: BUNDLE_SCHEMA_VERSION,
+    revision: 0,
+    updatedAt: '',
+    items: [],
+  };
+}
+
+/**
+ * 校验并规范化套餐库（PUT /api/bundles 用）。返回 [bundles, warnings]。
+ *
+ * 每个套餐的 sections 走与设备文档完全相同的 NORMALIZERS，所以套餐里能配的
+ * 东西就是终端能吃的全部契约，不存在「套餐支持但终端不认」的字段。
+ */
+export function normalizeBundles(raw) {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new ConfigError('套餐文档必须是对象');
+  }
+  const warnings = [];
+  const rawItems = raw.items === undefined || raw.items === null ? [] : raw.items;
+  if (!Array.isArray(rawItems)) throw new ConfigError('套餐文档 items 必须是数组');
+  if (rawItems.length > MAX_BUNDLES) {
+    warnings.push(`套餐超过 ${MAX_BUNDLES} 个上限，已截断`);
+  }
+  const taken = new Set();
+  const items = [];
+  for (const entry of rawItems.slice(0, MAX_BUNDLES)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      warnings.push('套餐库: 忽略非对象条目');
+      continue;
+    }
+    let id = String(entry.id == null ? '' : entry.id).trim();
+    if (!BUNDLE_ID_RE.test(id) || taken.has(id)) id = randomLibraryId('bd_', taken);
+    const [sections, sectionWarnings] = normalizeSections(entry.sections || {});
+    for (const warning of sectionWarnings) warnings.push(`套餐 ${id}: ${warning}`);
+    const name = str(entry.name, '', `套餐 ${id}.name`, 64);
+    taken.add(id);
+    items.push({
+      id,
+      name: name || `套餐 ${items.length + 1}`,
+      remark: str(entry.remark, '', `套餐 ${id}.remark`, 200),
+      sections,
+      // 单个套餐自己的版本号：由 storage.writeBundles 在内容变化时 +1。
+      // 设备端的 bundleStamp 记的就是它，所以「改 A 套餐」不会让绑 B 套餐的设备重写。
+      revision: Number.isInteger(entry.revision) && entry.revision >= 0 ? entry.revision : 0,
+      createdAt: str(entry.createdAt, nowIso(), `套餐 ${id}.createdAt`, 40),
+      updatedAt: str(entry.updatedAt, nowIso(), `套餐 ${id}.updatedAt`, 40),
+    });
+  }
+  return [
+    {
+      schemaVersion: BUNDLE_SCHEMA_VERSION,
+      revision: 0,
+      updatedAt: '',
+      items,
+    },
+    warnings,
+  ];
+}
+
+/**
+ * 设备文档是不是「由这个套餐的当前版本渲染出来的」。
+ *
+ * 三个字段都比：只比 id 会漏掉「同名套餐改了内容」，只比 revision 会漏掉
+ * 「两台设备绑了不同套餐但 revision 恰好相同」。
+ */
+export function bundleStampMatches(sections, bundle) {
+  const stamp = sections && sections.bundleStamp;
+  return !!stamp
+    && stamp.id === bundle.id
+    && stamp.revision === bundle.revision
+    && stamp.updatedAt === bundle.updatedAt;
+}
+
+/**
+ * 由套餐生成设备文档的 sections，并记录「已经用的是哪一版套餐」。
+ *
+ * 用整份替换而不是 merge：套餐是一次下发的完整结果，merge 会让设备上残留
+ * 上一个套餐的源，用户改了套餐却发现旧频道还在。
+ */
+export function sectionsFromBundle(bundle) {
+  const sections = clone(bundle.sections);
+  sections.bundleStamp = {
+    id: bundle.id,
+    revision: bundle.revision,
+    updatedAt: bundle.updatedAt,
+    appliedAt: nowIso(),
+  };
+  return sections;
+}
