@@ -100,40 +100,91 @@ export function decodeSubscription(bytes) {
   return { text, encoding };
 }
 
+/**
+ * 读取响应体，最多 MAX_BYTES 字节。
+ *
+ * 坑（2026-11-15 线上实测）：EdgeOne Pages Functions 里 response.body 虽然
+ * 提供了 getReader()，但读出来是「空流」（第一次 read 就 done:true），导致
+ * 所有订阅都抓成 0 字节，编辑器只会含糊地报「抓取成功但内容为空」。
+ * 而同一个 Response 的 arrayBuffer() 能拿到完整内容。因此改为**整体读取优先**，
+ * 只有 arrayBuffer 不可用或确实为空时才退回流式读取。
+ */
 async function readLimited(response) {
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared > MAX_BYTES) throw new Error(`内容超过 ${MAX_BYTES / 1024 / 1024} MiB`);
-  // 部分边缘运行时不提供可读流（response.body 为 null 或没有 getReader），
-  // 直接读 arrayBuffer 兜底；大文件已在上面按 content-length 拦掉，这里再截一次。
-  if (!response.body || typeof response.body.getReader !== 'function') {
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    const truncated = buffer.length > MAX_BYTES;
-    return { bytes: truncated ? buffer.slice(0, MAX_BYTES) : buffer, truncated };
-  }
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-  let truncated = false;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const room = MAX_BYTES - total;
-    if (value.length > room) {
-      if (room > 0) chunks.push(value.slice(0, room));
-      total = MAX_BYTES;
-      truncated = true;
-      break;
+
+  let buffer = null;
+  try {
+    if (typeof response.arrayBuffer === 'function') {
+      buffer = new Uint8Array(await response.arrayBuffer());
     }
-    chunks.push(value);
-    total += value.length;
+  } catch (_) { /* 某些运行时只实现 body 流，走下面的兜底 */ }
+  if (buffer && buffer.length > 0) {
+    return clip(buffer);
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
+
+  // 兜底：整体读取不可用 / 返回空时再试流。body 可能已被消费，失败就忽略。
+  if (response.body && typeof response.body.getReader === 'function') {
+    try {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let total = 0;
+      let truncated = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || !value.length) continue;
+        const room = MAX_BYTES - total;
+        if (value.length > room) {
+          if (room > 0) chunks.push(value.slice(0, room));
+          total = MAX_BYTES;
+          truncated = true;
+          break;
+        }
+        chunks.push(value);
+        total += value.length;
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      if (bytes.length > 0) return { bytes, truncated };
+    } catch (_) { /* body 已被 arrayBuffer 消费，忽略 */ }
   }
-  return { bytes, truncated };
+  return { bytes: buffer && buffer.length ? clip(buffer).bytes : new Uint8Array(0), truncated: false };
+}
+
+function clip(buffer) {
+  const truncated = buffer.length > MAX_BYTES;
+  return { bytes: truncated ? buffer.slice(0, MAX_BYTES) : buffer, truncated };
+}
+
+/**
+ * 判断响应体是不是配置文本。订阅/TVBox 配置都是纯文本，源站偶尔会返回
+ * 头像、验证码图、jar / gzip 等二进制，把乱码当 GBK 文本解析只会得到「0 个频道」，
+ * 用户完全看不出原因。这里提前给出人话提示。导出便于离线测试。
+ */
+export function detectBinaryPayload(bytes, contentType) {
+  const type = String(contentType || '').split(';')[0].trim().toLowerCase();
+  if (/^(image|audio|video)\//.test(type) || type === 'application/octet-stream') {
+    return `${type || '二进制'} 内容`;
+  }
+  const b = bytes;
+  if (b.length >= 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'JPEG 图片';
+  if (b.length >= 4 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'PNG 图片';
+  if (b.length >= 3 && String.fromCharCode(b[0], b[1], b[2]) === 'GIF') return 'GIF 图片';
+  if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4D) return 'BMP 图片';
+  if (b.length >= 2 && b[0] === 0x1F && b[1] === 0x8B) return 'gzip 压缩数据';
+  if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4B) return 'ZIP/JAR 压缩包';
+  if (b.length >= 4 && String.fromCharCode(b[0], b[1], b[2], b[3]) === '%PDF') return 'PDF 文件';
+  // HTML 网页（反爬页 / 首页跳转）也不是配置。注意不能用「UTF-8 替换字符比例」
+  // 判二进制：国内 GBK 编码的 M3U 会被误伤，编码识别交给 decodeSubscription。
+  if (type === 'text/html' || /^\s*<(?:!doctype\s+html|html)/i.test(
+    new TextDecoder('utf-8').decode(b.subarray(0, 256)),
+  )) return 'HTML 网页';
+  return '';
 }
 
 async function fetchOne(raw) {
@@ -157,14 +208,41 @@ async function fetchOne(raw) {
         current = new URL(location, current).href;
         continue;
       }
-      if (!response.ok) {
-        return { url: String(raw), ok: false, error: `源站 HTTP ${response.status}` };
-      }
-      const { bytes, truncated } = await readLimited(response);
-      const decoded = decodeSubscription(bytes);
-      return {
+      const contentType = response.headers.get('content-type') || '';
+      const meta = {
         url: String(raw),
         finalUrl: current,
+        httpStatus: response.status,
+        contentType,
+        // 诊断用：declaredLength > 0 但 bytes 为 0 说明是运行时读取问题，
+        // 两者都为 0 才是源站真的没返回内容。
+        declaredLength: Number(response.headers.get('content-length') || 0),
+      };
+      if (!response.ok) {
+        return { ...meta, ok: false, error: `源站 HTTP ${response.status}` };
+      }
+      const { bytes, truncated } = await readLimited(response);
+      // 空内容必须判失败：以前会 ok:true + bytes:0，编辑器只得到一句
+      // 「抓取成功但内容为空」，用户无从判断是源站问题还是云端问题。
+      if (!bytes.length) {
+        return {
+          ...meta, ok: false, bytes: 0,
+          error: `源站返回空内容（HTTP ${response.status}${contentType ? '，' + contentType.split(';')[0] : ''}）`,
+        };
+      }
+      const binary = detectBinaryPayload(bytes, contentType);
+      if (binary) {
+        return {
+          ...meta, ok: false, bytes: bytes.length,
+          error: `源站返回的是${binary}，不是订阅文本；请确认配置地址是否正确或已失效`,
+        };
+      }
+      const decoded = decodeSubscription(bytes);
+      if (!decoded.text.trim()) {
+        return { ...meta, ok: false, bytes: bytes.length, error: '源站内容为空文本' };
+      }
+      return {
+        ...meta,
         ok: true,
         bytes: bytes.length,
         encoding: decoded.encoding,

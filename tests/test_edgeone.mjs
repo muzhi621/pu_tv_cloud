@@ -28,7 +28,7 @@ import {
 import { optionsHandler } from '../edge-functions/_lib/http.js';
 import { listDevices as storageListDevices } from '../edge-functions/_lib/storage.js';
 import {
-  onRequestPost as iptvFetchPost, checkFetchUrl, decodeSubscription,
+  onRequestPost as iptvFetchPost, checkFetchUrl, decodeSubscription, detectBinaryPayload,
 } from '../edge-functions/api/iptv/fetch.js';
 
 class MemoryKV {
@@ -520,6 +520,143 @@ test('IPTV 云端代理：SSRF 防护、编码识别与失败隔离', async (t) 
     assert.ok(data.results.every((item) => item.ok === false));
     assert.ok(!('text' in data.results[0]));
   });
+});
+
+/**
+ * 线上回归（2026-11-15）：EdgeOne Pages Functions 的 response.body 是「空流」，
+ * getReader().read() 第一次就 done:true，但 arrayBuffer() 有完整内容。
+ * 旧实现流优先 → 所有订阅抓成 0 字节 → 编辑器全线「无法解析」。
+ */
+test('IPTV 云端代理：边缘运行时响应体读取与内容判定', async (t) => {
+  const savedFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = savedFetch; });
+  const enc = new TextEncoder();
+
+  /** 可分别控制 arrayBuffer() 与 body 流的假 Response，用来复刻各运行时差异。 */
+  const fakeResponse = ({
+    bytes = null, stream = [], status = 200,
+    contentType = 'text/plain; charset=utf-8',
+  } = {}) => ({
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers({ 'content-type': contentType }),
+    async arrayBuffer() {
+      if (bytes === null) throw new TypeError('arrayBuffer 不支持');
+      return Uint8Array.from(bytes).buffer;
+    },
+    body: {
+      getReader() {
+        let i = 0;
+        return {
+          async read() {
+            if (i >= stream.length) return { done: true, value: undefined };
+            return { done: false, value: Uint8Array.from(stream[i++]) };
+          },
+        };
+      },
+    },
+  });
+
+  const post = (urls) => iptvFetchPost(ctx('POST', '/api/iptv/fetch', {
+    headers: { 'Content-Type': 'application/json' },
+    body: { urls },
+  }));
+
+  await t.test('空流但 arrayBuffer 有内容时仍能抓到全文（EdgeOne 回归）', async () => {
+    const body = [...enc.encode('#EXTM3U\n#EXTINF:-1 group-title="央视",CCTV1\nhttp://a.example.com/1.m3u8\n')];
+    globalThis.fetch = async () => fakeResponse({ bytes: body, stream: [] });
+    const data = await json(await post(['https://example.com/list.m3u']));
+    assert.equal(data.succeeded, 1);
+    assert.equal(data.results[0].bytes, body.length);
+    assert.match(data.text, /CCTV1/);
+  });
+
+  await t.test('arrayBuffer 不可用时会退回流式读取', async () => {
+    globalThis.fetch = async () => fakeResponse({
+      bytes: null,
+      stream: [enc.encode('#EXTM3U\n'), enc.encode('http://a.example.com/1.m3u8\n')],
+    });
+    const data = await json(await post(['https://example.com/list.m3u']));
+    assert.equal(data.succeeded, 1);
+    assert.match(data.text, /#EXTM3U/);
+    assert.match(data.text, /1\.m3u8/);
+  });
+
+  await t.test('真正空的响应明确判失败，不再伪装成抓取成功', async () => {
+    globalThis.fetch = async () => fakeResponse({ bytes: [], stream: [] });
+    const data = await json(await post(['https://example.com/empty.m3u']));
+    assert.equal(data.succeeded, 0);
+    assert.equal(data.results[0].ok, false);
+    assert.match(data.results[0].error, /空内容/);
+    assert.equal(data.results[0].httpStatus, 200);
+    assert.equal(data.text.trim(), '');
+  });
+
+  await t.test('图片 / 二进制响应给出人话提示，不当乱码文本解析', async () => {
+    const jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0, 1, 0, 1];
+    globalThis.fetch = async () => fakeResponse({ bytes: jpeg, contentType: 'text/plain' });
+    let data = await json(await post(['https://example.com/tv']));
+    assert.equal(data.succeeded, 0);
+    assert.match(data.results[0].error, /JPEG 图片/);
+    assert.match(data.results[0].error, /不是订阅文本/);
+
+    globalThis.fetch = async () => fakeResponse({ bytes: [...enc.encode('<html>ok</html>')], contentType: 'image/jpeg' });
+    data = await json(await post(['https://example.com/tv']));
+    assert.match(data.results[0].error, /image\/jpeg/);
+  });
+
+  await t.test('HTML 反爬页 / 首页跳转被识别', async () => {
+    globalThis.fetch = async () => fakeResponse({
+      bytes: [...enc.encode('<!DOCTYPE html><html lang="en">...</html>')],
+      contentType: 'text/html',
+    });
+    const data = await json(await post(['https://example.com/tv']));
+    assert.equal(data.succeeded, 0);
+    assert.match(data.results[0].error, /HTML 网页/);
+  });
+
+  await t.test('中文路径 percent-encode、中文域名 punycode 后发起请求', async () => {
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(url);
+      return fakeResponse({ bytes: [...enc.encode('#EXTM3U\n')] });
+    };
+    const data = await json(await post([
+      'https://live.hacks.tools/tv/ipv4/categories/央视频道.m3u',
+      'http://www.饭太硬.net/tv',
+    ]));
+    assert.equal(data.succeeded, 2);
+    assert.match(seen[0], /%E5%A4%AE%E8%A7%86%E9%A2%91%E9%81%93\.m3u/);
+    assert.match(seen[1], /xn--sss604efuw\.net/);
+    assert.equal(data.results[1].finalUrl, 'http://www.xn--sss604efuw.net/tv');
+  });
+
+  await t.test('GBK 中文订阅不会被误判成二进制', () => {
+    const gbk = new Uint8Array([0xD1, 0xEB, 0xCA, 0xD3]); // 「央视」
+    assert.equal(detectBinaryPayload(gbk, 'text/plain'), '');
+    assert.equal(detectBinaryPayload(new Uint8Array([0xFF, 0xD8, 0xFF]), 'text/plain'), 'JPEG 图片');
+    assert.equal(detectBinaryPayload(new Uint8Array(), 'image/png'), 'image/png 内容');
+  });
+});
+
+test('TVBox 配置解析：BOM / 注释 / 尾部逗号 / base64 封装', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+  const start = source.indexOf('function decodeTvboxBase64(');
+  const end = source.indexOf('function resolveVodAsset(');
+  assert.ok(start > 0 && end > start, 'app.js 里找不到 TVBox 解析函数');
+  const parse = new Function(source.slice(start, end) + '; return parseTvboxJson;')();
+
+  assert.deepEqual(parse('\uFEFF{"sites":[{"key":"a","api":"csp_X"}]}').sites,
+    [{ key: 'a', api: 'csp_X' }], 'UTF-8 BOM 应被剥离');
+  assert.deepEqual(parse('// 仓库注释\n{"sites":[],}').sites, [], '整行注释与尾部逗号应被容忍');
+  const cfg = {
+    sites: [{ key: 'a', api: 'https://a.example.com/api.php' }],
+    spider: './a.jar;md5;abcdef0123456789',
+  };
+  const b64 = Buffer.from(JSON.stringify(cfg), 'utf8').toString('base64');
+  assert.equal(parse(b64).sites[0].api, 'https://a.example.com/api.php', 'base64 封装应能解开');
+  assert.throws(() => parse('<html>不是配置</html>'), /不是合法 JSON/, '非配置内容应报可读错误');
 });
 
 test('IPTV 套餐：组成套餐、按设备选择下发、GET 轻量视图', async (t) => {

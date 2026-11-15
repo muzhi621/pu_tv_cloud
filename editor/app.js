@@ -1160,8 +1160,9 @@ async function fetchLibraryUrls() {
   statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
   if (!texts.length) {
     message('抓取失败：' + failed.join('；')
-      + '\n提示：地址含中文时已自动 percent-encode；若两边都失败，一般是源站限制了服务器访问，'
-      + '可下载文件后用「本地文件」导入，或直接粘贴内容。', 'err');
+      + '\n提示：中文路径/域名已自动编码；若提示「图片 / HTML 网页 / 空内容」，'
+      + '说明该地址当前返回的不是订阅文本，请核对配置地址是否失效。'
+      + '也可下载文件后用「本地文件」导入，或直接粘贴内容。', 'err');
     return;
   }
   state.libPasteText = texts.join('\n');
@@ -1348,13 +1349,42 @@ function deleteVodSource(id) {
 
 const TVBOX_API_RE = /^(https?:\/\/|csp_)/i;
 
-/** 剥离配置里常见的整行 `//` 注释。只删整行，不动 URL 里的 `//`。 */
+/** 纯 base64 封装的 TVBox 配置（可含换行/空白）→ UTF-8 文本；不是 base64 原样返回。 */
+function decodeTvboxBase64(raw) {
+  const compact = raw.replace(/\s+/g, '');
+  if (compact.length < 40 || !/^[A-Za-z0-9+/=]+$/.test(compact)) return raw;
+  try {
+    const binary = atob(compact);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes).replace(/^\uFEFF/, '');
+  } catch (_) { return raw; }
+}
+
+/**
+ * 解析 TVBox 配置：兼容 UTF-8 BOM、整行 `//` 注释（不动 URL 里的 `//`）、
+ * 尾部逗号、以及常见的 base64 封装。失败时带上内容预览，便于区分
+ 「地址失效返回网页/图片」与「配置格式暂不支持」。
+ */
 function parseTvboxJson(text) {
-  const cleaned = String(text == null ? '' : text)
+  const raw = String(text == null ? '' : text).replace(/^\uFEFF/, '').trim();
+  if (!raw) throw new Error('返回内容为空');
+  const strip = (value) => String(value)
     .split(/\r?\n/)
     .filter((line) => !/^\s*\/\//.test(line))
-    .join('\n');
-  return JSON.parse(cleaned);
+    .join('\n')
+    .replace(/,\s*([}\]])/g, '$1');
+  const attempt = (value) => {
+    try { return JSON.parse(strip(value)); } catch (_) { return null; }
+  };
+  let json = attempt(raw);
+  if (json === null) json = attempt(decodeTvboxBase64(raw));
+  if (json === null) {
+    const preview = raw.slice(0, 80).replace(/\s+/g, ' ');
+    throw new Error('返回内容不是合法 JSON / base64 配置，可能不是 TVBox 配置地址'
+      + '（开头：' + preview + '…）');
+  }
+  return json;
 }
 
 /**
@@ -1487,8 +1517,9 @@ async function addVodSource() {
   try {
     const text = await fetchRemoteText(url);
     let json = null;
-    try { json = parseTvboxJson(text); } catch (_) {
-      throw new Error('返回内容不是合法 JSON，可能不是 TVBox 配置');
+    try { json = parseTvboxJson(text); } catch (error) {
+      // 保留解析器给出的具体原因（内容预览 / base64 失败等），别再吞成一句笼统提示。
+      throw new Error(error && error.message ? error.message : '返回内容不是合法 TVBox 配置');
     }
     const sourceId = newLibraryId('vod');
     const seen = new Set();
