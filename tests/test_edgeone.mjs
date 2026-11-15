@@ -690,6 +690,47 @@ test('终端在线/离线常驻显示，且不依赖连接设备', async () => {
   assert.match(app, /在线 ' \+ online/, '状态条未显示在线台数');
 });
 
+test('TVBox 源双轨：mode 规范化、URL 下发与解析站点兜底', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const [library] = normalizeLibrary({
+    vod: {
+      sources: [
+        { id: 'vs_aaaaaaaa', name: '解析源', url: 'https://a.example.com/config.json' },
+        { id: 'vs_bbbbbbbb', name: '直连源', url: 'https://b.example.com/tv', mode: 'url' },
+        { id: 'vs_cccccccc', name: '脏值', url: 'https://c.example.com/tv', mode: 'bogus' },
+      ],
+      sites: [
+        { sourceId: 'vs_aaaaaaaa', key: 'a1', name: 'A1', api: 'https://a.example.com/api.php' },
+        { sourceId: 'vs_bbbbbbbb', key: 'b1', name: 'B1', api: 'csp_B1', type: 3 },
+      ],
+    },
+  });
+  assert.deepEqual(library.vod.sources.map((s) => s.mode), ['parsed', 'url', 'parsed'],
+    '未指定 / 非法 mode 一律回退 parsed');
+
+  const [sections] = normalizeSections({
+    vod: { managed: true, sourceIds: ['vs_aaaaaaaa', 'vs_bbbbbbbb'] },
+  });
+  const out = expandVodSites(sections, library);
+  assert.equal(out.vod.sources[0].url, 'https://a.example.com/config.json');
+  assert.equal(out.vod.sources[0].mode, 'parsed');
+  assert.equal(out.vod.sources[1].url, 'https://b.example.com/tv', 'URL 必须随文档下发');
+  assert.equal(out.vod.sources[1].mode, 'url');
+  assert.equal(out.vod.sites.length, 2, 'url 模式仍下发云端站点作为终端解析失败的兜底');
+
+  const [inline] = normalizeSections({
+    vod: { sources: [{ id: 'vs_dddddddd', url: 'https://d.example.com/tv', mode: 'url' }], sites: [] },
+  });
+  assert.equal(inline.vod.sources[0].url, 'https://d.example.com/tv');
+  assert.equal(inline.vod.sources[0].mode, 'url', '锁定快照的内联源也要保留模式');
+
+  const app = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+  const page = await readFile(new URL('../edge-functions/_lib/editor.js', import.meta.url), 'utf8');
+  assert.match(app, /vod-source-mode/, '编辑器缺少下发模式切换入口');
+  assert.ok(page.includes('vod-source-mode'), '内联生成物缺少模式切换入口');
+  assert.match(app, /mode: 'parsed'/, '新建源未默认走云端解析');
+});
+
 test('IPTV 套餐：组成套餐、按设备选择下发、GET 轻量视图', async (t) => {
   const savedKv = globalThis.PURETV_KV;
   const fresh = new MemoryKV();

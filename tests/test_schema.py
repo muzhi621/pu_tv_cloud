@@ -499,6 +499,34 @@ class VodSectionTests(unittest.TestCase):
         self.assertEqual([site["id"] for site in vod["sites"]], ["vs_aaaaaaaa:a1"])
         self.assertEqual(vod["sites"][0]["ext"], "token-a1")
 
+    def test_vod_source_url_mode_roundtrip(self):
+        """双轨：url/mode 在设备内联源与资源库源里都不被规范化丢掉。"""
+        sections, _ = normalize_sections({
+            "vod": {
+                "sources": [
+                    {"id": "vs_aaaaaaaa", "url": "https://a.example.com/tv", "mode": "url"},
+                    {"id": "vs_bbbbbbbb", "url": "https://b.example.com/tv", "mode": "bogus"},
+                    {"id": "vs_cccccccc"},
+                ],
+                "sites": [],
+            },
+        })
+        sources = sections["vod"]["sources"]
+        self.assertEqual([s["mode"] for s in sources], ["url", "parsed", "parsed"])
+        self.assertEqual(sources[0]["url"], "https://a.example.com/tv")
+        self.assertEqual(sources[2]["url"], "")
+
+        library, _ = normalize_library({
+            "vod": {
+                "sources": [
+                    {"id": "vs_dddddddd", "url": "https://d.example.com/tv", "mode": "url"},
+                    {"id": "vs_eeeeeeee", "url": "https://e.example.com/tv"},
+                ],
+                "sites": [],
+            },
+        })
+        self.assertEqual([s["mode"] for s in library["vod"]["sources"]], ["url", "parsed"])
+
     def test_vod_defaults_and_old_document_compat(self):
         sections, warnings = normalize_sections({})
         vod = sections["vod"]

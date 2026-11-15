@@ -87,6 +87,16 @@ function vodFlavor(value) {
   return typeof value === 'string' && VOD_FLAVORS.has(value) ? value : 'fongmi';
 }
 
+/**
+ * TVBox 源的下发模式（双轨）：
+ *  parsed = 云端抓取并展开成 sites 后下发（默认，兼容所有老终端）；
+ *  url    = 云端只下发配置地址，终端自己拉取并解析，失败时回退到云端 sites。
+ * 未知值一律回退 parsed，避免脏数据让老客户端拿到空站点表。
+ */
+function vodSourceMode(value) {
+  return value === 'url' ? 'url' : 'parsed';
+}
+
 /* ---------------- 全局资源库（与设备文档解耦） ----------------
  * 库独立存在 library_current，设备只保存 id 引用：
  *   iptv.packageIds → library.iptv.packages[].id
@@ -809,12 +819,17 @@ function inlineVodSources(raw, warnings) {
     // 内联源通常已经由编辑器拆过，但手工填的仍可能是 "url;md5;hash"。
     const parsed = parseSpiderField(entry.jar, '');
     if (!id) continue;
+    const rawUrl = str(entry.url, '', 'vod.sources.url', 1000);
     out.push({
       id,
       name: name || id,
+      // 直连模式需要把配置地址一并下发；parsed 模式保留它也只是多几个字节，
+      // 却能让终端随时切模式而不用等下一次云端重新展开。
+      url: URL_RE.test(rawUrl) ? rawUrl : '',
       jar: parsed.jar,
       spiderMd5: str(entry.spiderMd5, parsed.md5, 'vod.sources.spiderMd5', 64),
       spiderFlavor: vodFlavor(entry.spiderFlavor),
+      mode: vodSourceMode(entry.mode),
     });
   }
   if (raw.length > MAX_VOD_SOURCES) {
@@ -917,6 +932,9 @@ export function expandVodSites(sections, library = null) {
   out.vod.sources = picked.map((item) => ({
     id: item.id,
     name: item.name,
+    // 双轨：url 模式下终端用这个地址自己拉配置；sites 仍随文档下发作为兜底。
+    url: item.url || '',
+    mode: vodSourceMode(item.mode),
     jar: item.jar || '',
     spiderMd5: item.spiderMd5 || '',
     spiderFlavor: vodFlavor(item.spiderFlavor),
@@ -1148,6 +1166,7 @@ function normalizeLibraryVod(part, warnings) {
         jar: parsed.jar,
         spiderMd5: str(item.spiderMd5, parsed.md5, 'library.vod.sources.spiderMd5', 64),
         spiderFlavor: vodFlavor(item.spiderFlavor),
+        mode: vodSourceMode(item.mode),
         siteCount: lenientInt(item.siteCount, 0, 0, MAX_VOD_SITES),
         addedAt: str(item.addedAt, nowIso(), 'library.vod.sources.addedAt', 40),
         note: str(item.note, '', 'library.vod.sources.note', 200),

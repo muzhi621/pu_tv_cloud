@@ -773,6 +773,13 @@ function renderVodLibrary() {
         ? '<br><span class="badge off">缺 jar</span>'
         : '') + '</td>'
       + '<td><code title="' + esc(src.url || '') + '">' + esc(src.url || '—') + '</code></td>'
+      + '<td><select class="lib-input" data-lib-input="vod-source-mode" data-id="' + esc(src.id) + '">'
+      + '<option value="parsed"' + (src.mode === 'url' ? '' : ' selected')
+      + '>云端解析（默认）</option>'
+      + '<option value="url"' + (src.mode === 'url' ? ' selected' : '')
+      + '>终端直连</option></select>'
+      + '<br><span class="meta">' + (src.mode === 'url'
+        ? '终端自行拉取配置，云端站点作兜底' : '下发已展开的站点列表') + '</span></td>'
       + '<td><input class="lib-input" data-lib-input="vod-source-jar" data-id="' + esc(src.id)
       + '" value="' + esc(src.jar || '') + '" placeholder="spider.jar 地址'
       + (needJar ? '（必填）' : '（可留空）') + '"></td>'
@@ -815,13 +822,16 @@ function renderVodLibrary() {
     + '同时兼容顶层数组，以及 <code>urls</code> 里指向多份子配置的写法（最多取 5 个子配置）。'
     + '<br>配置顶层的 <code>spider</code> 会自动记成该源的 <b>spider jar</b>；'
     + '站点的 <code>ext</code> 也会一并保存。'
-    + '<b>api 以 csp_ 开头的站点必须有 jar 才能播</b>，缺了会在列表里标红。</p>'
+    + '<b>api 以 csp_ 开头的站点必须有 jar 才能播</b>，缺了会在列表里标红。'
+    + '<br>下发模式：<b>云端解析（默认）</b>把站点展开后下发，兼容所有客户端；'
+    + '<b>终端直连</b>只把配置 URL 交给终端自行拉取解析（配置更新自动生效，'
+    + '可绕开云端代抓的反爬/编码问题），解析失败时自动回退到云端已展开的站点。</p>'
     + (state.tvboxSummary ? '<p class="hint">' + esc(state.tvboxSummary) + '</p>' : '')
 
     + '<h3>源列表（' + sources.length + '）</h3>'
     + (sources.length
       ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>配置 URL</th>'
-        + '<th>spider jar</th><th>站点数</th><th>添加时间</th><th></th></tr></thead>'
+        + '<th>下发模式</th><th>spider jar</th><th>站点数</th><th>添加时间</th><th></th></tr></thead>'
         + '<tbody>' + sourceRows + '</tbody></table>'
       : '<p class="muted">还没有 TVBox 源，先在上面添加。</p>')
 
@@ -1644,6 +1654,9 @@ async function addVodSource() {
     state.library.vod.sources.push({
       id: sourceId, name, url, jar: spiderJar,
       spiderMd5, spiderFlavor: 'fongmi',
+      // 新源默认走云端解析；切到「终端直连」后终端会自己拉这份配置，
+      // 云端已展开的站点仍随文档下发作为失败兜底。
+      mode: 'parsed',
       siteCount: sites.length, addedAt: nowIso(), note: '',
     });
     state.library.vod.sites.push(...sites);
@@ -1778,6 +1791,16 @@ function onLibraryInput(target) {
   if (kind === 'vod-source-jar') {
     const src = arr(state.library.vod.sources).find((item) => item.id === id);
     if (src) { src.jar = target.value.trim().slice(0, 1000); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'vod-source-mode') {
+    const src = arr(state.library.vod.sources).find((item) => item.id === id);
+    if (src) {
+      src.mode = target.value === 'url' ? 'url' : 'parsed';
+      markLibraryDirty();
+      // 下拉旁的说明文字要跟着变，重绘不会抢焦点（select 已失焦）。
+      renderPanel();
+    }
   }
 }
 

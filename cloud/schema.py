@@ -143,6 +143,11 @@ def parse_spider_field(raw: Any, base_url: str = "") -> tuple[str, str]:
 
 def _vod_flavor(value: Any) -> str:
     return value if isinstance(value, str) and value in _VOD_FLAVORS else "fongmi"
+
+
+def _vod_source_mode(value: Any) -> str:
+    """TVBox 源下发模式：parsed（云端展开站点，默认）| url（终端自己拉配置）。"""
+    return "url" if value == "url" else "parsed"
 MAX_PACKAGE_SOURCES = 20
 MAX_PACKAGE_ID_LEN = 64
 MAX_PACKAGE_NAME_LEN = 64
@@ -801,9 +806,13 @@ def _inline_vod_sources(raw: Any, warnings: list[str]) -> list[dict]:
         out.append({
             "id": source_id,
             "name": name or source_id,
+            # 直连模式下终端要用这个地址自己拉配置；两种模式都随文档下发，
+            # 便于随时切换而不必等云端重新展开（与 EdgeOne contract.js 对齐）。
+            "url": _str(entry.get("url"), "", "vod.sources.url", 1000),
             "jar": jar,
             "spiderMd5": _str(entry.get("spiderMd5"), parsed_md5, "vod.sources.spiderMd5", 64),
             "spiderFlavor": _vod_flavor(entry.get("spiderFlavor")),
+            "mode": _vod_source_mode(entry.get("mode")),
         })
     if len(raw) > MAX_VOD_SOURCES:
         warnings.append("vod.sources: 超过 %d 个上限，已截断" % MAX_VOD_SOURCES)
@@ -1095,6 +1104,7 @@ def _normalize_library_vod(part: Any, warnings: list[str]) -> dict:
                 "id": source_id,
                 "name": _str(item.get("name"), "", "library.vod.sources.name", 64) or url,
                 "url": url,
+                "mode": _vod_source_mode(item.get("mode")),
                 "siteCount": _lenient_int(item.get("siteCount"), 0, 0, MAX_VOD_SITES),
                 "addedAt": _str(item.get("addedAt"), now_iso(),
                                 "library.vod.sources.addedAt", 40),
