@@ -731,6 +731,71 @@ test('TVBox 源双轨：mode 规范化、URL 下发与解析站点兜底', async
   assert.match(app, /mode: 'parsed'/, '新建源未默认走云端解析');
 });
 
+test('TVBox 解析失败可降级：只下发配置 URL，零站点源仍能下发', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const app = await readFile(new URL('../editor/app.js', import.meta.url), 'utf8');
+  const page = await readFile(new URL('../edge-functions/_lib/editor.js', import.meta.url), 'utf8');
+
+  // 编辑器必须有「跳过解析」按钮、失败降级分支，且内联生成物同步。
+  for (const mark of [
+    'add-vod-source-url',
+    'function buildVodUrlOnlySource(',
+    'function addVodSourceUrlOnly(',
+    'function offerVodUrlOnlyFallback(',
+    'if (offerVodUrlOnlyFallback(why)) return;',
+  ]) {
+    assert.ok(app.includes(mark), `editor/app.js 缺少 ${mark}`);
+    assert.ok(page.includes(mark), `内联生成物缺少 ${mark}`);
+  }
+  assert.match(app, /不解析，只下发配置 URL/, '按钮文案缺失');
+
+  // 抽取纯构造函数实跑：中文域名 punycode、中文路径 percent-encode，
+  // 且必须是零站点的 url 模式（云端不解析）。
+  const start = app.indexOf('function normalizeHttpUrl(');
+  const end = app.indexOf('function readLibInput(');
+  assert.ok(start > 0 && end > start, 'app.js 里找不到 URL 规范化/构造函数');
+  const build = new Function(
+    'nowIso',
+    app.slice(start, end) + '; return buildVodUrlOnlySource;',
+  )(() => '2026-11-15T00:00:00.000Z');
+
+  const direct = build('http://www.饭太硬.net/tv', 'vs_deadbeef');
+  assert.equal(direct.mode, 'url');
+  assert.equal(direct.siteCount, 0, '云端没解析出站点就不能虚报');
+  assert.equal(direct.url, 'http://www.xn--sss604efuw.net/tv');
+  assert.equal(direct.jar, '');
+  assert.equal(direct.addedAt, '2026-11-15T00:00:00.000Z');
+
+  const cnPath = build('https://live.hacks.tools/tv/ipv4/categories/央视频道.m3u', 'vs_12345678');
+  assert.match(cnPath.url, /%E5%A4%AE%E8%A7%86%E9%A2%91%E9%81%93\.m3u/);
+  assert.equal(cnPath.mode, 'url');
+  assert.throws(() => build('ftp://x.example.com/tv', 'x'), /仅支持 http/);
+
+  // 端到端：零站点的 url 源经资源库规范化 + 设备展开后仍必须出现在下发文档里。
+  const [library, warnings] = normalizeLibrary({
+    vod: {
+      sources: [{
+        id: 'vs_deadbeef', name: '饭太硬', url: 'http://www.xn--sss604efuw.net/tv',
+        mode: 'url', siteCount: 0, jar: '', spiderMd5: '', spiderFlavor: 'fongmi',
+      }],
+      sites: [],
+    },
+  });
+  assert.equal(library.vod.sources.length, 1, '零站点 url 源不能被资源库规范化丢弃');
+  assert.equal(library.vod.sources[0].mode, 'url');
+  assert.equal(library.vod.sources[0].siteCount, 0);
+  assert.ok(!warnings.some((w) => w.includes('忽略非法接口地址')));
+
+  const [sections] = normalizeSections({
+    vod: { managed: true, sourceIds: ['vs_deadbeef'] },
+  });
+  const out = expandVodSites(sections, library);
+  assert.equal(out.vod.sources.length, 1, '按设备勾选后零站点 url 源必须下发');
+  assert.equal(out.vod.sources[0].url, 'http://www.xn--sss604efuw.net/tv');
+  assert.equal(out.vod.sources[0].mode, 'url');
+  assert.equal(out.vod.sites.length, 0, '云端解析失败时无兜底站点，由终端自行拉取');
+});
+
 test('IPTV 套餐：组成套餐、按设备选择下发、GET 轻量视图', async (t) => {
   const savedKv = globalThis.PURETV_KV;
   const fresh = new MemoryKV();

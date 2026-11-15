@@ -526,6 +526,11 @@ class VodSectionTests(unittest.TestCase):
             },
         })
         self.assertEqual([s["mode"] for s in library["vod"]["sources"]], ["url", "parsed"])
+        # 云端解析失败而降级成「只下发 URL」的源：零站点也必须留得下来，
+        # 否则设备按 sourceIds 勾选时会被当成无效源过滤掉。
+        self.assertEqual(library["vod"]["sites"], [])
+        self.assertEqual(library["vod"]["sources"][0]["siteCount"], 0)
+        self.assertEqual(library["vod"]["sources"][0]["url"], "https://d.example.com/tv")
 
     def test_vod_defaults_and_old_document_compat(self):
         sections, warnings = normalize_sections({})

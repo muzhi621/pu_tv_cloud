@@ -816,6 +816,7 @@ function renderVodLibrary() {
     + '<input class="pkg-name" data-lib-input="tvbox-url" placeholder="https://example.com/tvbox.json"'
     + ' value="' + esc(state.tvboxUrl) + '">'
     + '<button class="primary" data-lib="add-vod-source">云端抓取并解析</button>'
+    + '<button class="ghost" data-lib="add-vod-source-url">不解析，只下发配置 URL</button>'
     + '</div>'
     + '<p class="hint">从配置里取 <code>sites</code>，映射成库站点；'
     + '<code>api</code> 不是 http(s):// 或 csp_ 开头、<code>key</code> 缺失或重复的站点会被跳过并统计。'
@@ -825,7 +826,10 @@ function renderVodLibrary() {
     + '<b>api 以 csp_ 开头的站点必须有 jar 才能播</b>，缺了会在列表里标红。'
     + '<br>下发模式：<b>云端解析（默认）</b>把站点展开后下发，兼容所有客户端；'
     + '<b>终端直连</b>只把配置 URL 交给终端自行拉取解析（配置更新自动生效，'
-    + '可绕开云端代抓的反爬/编码问题），解析失败时自动回退到云端已展开的站点。</p>'
+    + '可绕开云端代抓的反爬/编码问题），解析失败时自动回退到云端已展开的站点。'
+    + '<br><b>云端抓不到 / 解析不了这个配置？</b>直接点「不解析，只下发配置 URL」，'
+    + '或抓取失败后在弹窗里选「终端直连」，地址照样入库并下发给终端自己解析；'
+    + '这类源没有云端站点，终端也拉不到时才会空，需设备能访问该地址且客户端支持 url 模式。</p>'
     + (state.tvboxSummary ? '<p class="hint">' + esc(state.tvboxSummary) + '</p>' : '')
 
     + '<h3>源列表（' + sources.length + '）</h3>'
@@ -1175,6 +1179,28 @@ function sourceNameFromUrl(url) {
   } catch (_) {
     return String(url || '').slice(0, 64);
   }
+}
+
+/**
+ * 构造「云端不解析、只下发配置 URL」的源记录。
+ * 云端代抓/解析失败（反爬、返回图片、非标准配置）时仍要保住这个地址：
+ * 终端拿到 mode=url 会自己拉配置解析。这里统一把中文域名转 punycode、
+ * 中文路径 percent-encode，避免终端 Uri.parse 与云端 URL_RE 校验踩坑。
+ */
+function buildVodUrlOnlySource(rawUrl, sourceId) {
+  const url = normalizeHttpUrl(rawUrl);
+  return {
+    id: sourceId,
+    name: sourceNameFromUrl(url).slice(0, 64),
+    url,
+    jar: '',
+    spiderMd5: '',
+    spiderFlavor: 'fongmi',
+    mode: 'url',
+    siteCount: 0,
+    addedAt: nowIso(),
+    note: '云端未解析，终端自行拉取配置',
+  };
 }
 
 function readLibInput(kind) {
@@ -1576,12 +1602,86 @@ function tvboxSitesFrom(list, sourceId, seen, seenIds) {
   return { sites, skipped };
 }
 
+/**
+ * 写入前的公共检查：地址已在库里则确认替换（连同旧站点一起清掉），
+ * 否则检查源数上限。「云端解析」与「只下发 URL」两条路径共用。
+ */
+function prepareVodSourceSlot(url) {
+  const existing = arr(state.library.vod.sources)
+    .find((src) => String(src.url || '') === url);
+  if (existing) {
+    if (!window.confirm('该地址已在资源库中，继续会替换它下面的所有站点与解析结果，继续？')) {
+      return false;
+    }
+    state.library.vod.sources = arr(state.library.vod.sources)
+      .filter((src) => src.id !== existing.id);
+    state.library.vod.sites = arr(state.library.vod.sites)
+      .filter((site) => site.sourceId !== existing.id);
+  } else if (arr(state.library.vod.sources).length >= MAX_VOD_SOURCES) {
+    message('资源库最多 ' + MAX_VOD_SOURCES + ' 个 TVBox 源，请先删除不用的源。', 'err');
+    return false;
+  }
+  return true;
+}
+
+/** 跳过云端抓取/解析，直接把配置地址以「终端直连」模式入库。 */
+function addVodSourceUrlOnly(reason) {
+  if (!state.library) { message('资源库尚未加载。', 'err'); return false; }
+  const box = document.querySelector('[data-lib-input="tvbox-url"]');
+  const raw = (box ? box.value : state.tvboxUrl).trim();
+  state.tvboxUrl = raw;
+  if (!/^https?:\/\//i.test(raw)) {
+    message('请填写 http(s) 开头的 TVBox 配置地址。', 'err');
+    return false;
+  }
+  let source;
+  try {
+    source = buildVodUrlOnlySource(raw, newLibraryId('vod'));
+  } catch (error) {
+    message('配置地址不合法：' + error.message, 'err');
+    return false;
+  }
+  if (!prepareVodSourceSlot(source.url)) return false;
+  state.library.vod.sources.push(source);
+  state.tvboxSummary = '已按「终端直连」保存「' + source.name + '」：云端不解析站点，'
+    + '只把配置地址下发给终端自行拉取（配置更新自动生效）。'
+    + '记得在设备里勾选这个源并点「保存资源库」；'
+    + '需客户端支持 url 模式且设备能访问该地址，终端也拉不到时该源不会有站点。'
+    + (reason ? ' 云端解析失败原因：' + reason : '');
+  markLibraryDirty();
+  render();
+  message(state.tvboxSummary, 'ok');
+  return true;
+}
+
+/** 云端抓取/解析失败（或解析出 0 站点）时，给用户一个「只下发配置 URL」的兜底选择。 */
+function offerVodUrlOnlyFallback(why) {
+  const prompt = '云端无法解析这个 TVBox 配置：\n' + why
+    + '\n\n是否改为「终端直连」，只把配置地址下发给终端？\n'
+    + '保存后终端会自己拉取并解析这份配置（可绕开云端代抓的反爬/编码问题，'
+    + '配置更新也会自动生效）。需要客户端支持 url 模式且设备能访问该地址。';
+  if (!window.confirm(prompt)) return false;
+  try {
+    return addVodSourceUrlOnly(why);
+  } catch (error) {
+    message('改为终端直连失败：' + (error && error.message ? error.message : error), 'err');
+    return false;
+  }
+}
+
 async function addVodSource() {
   if (!state.library) { message('资源库尚未加载。', 'err'); return; }
   const box = document.querySelector('[data-lib-input="tvbox-url"]');
-  const url = (box ? box.value : state.tvboxUrl).trim();
-  state.tvboxUrl = url;
-  if (!/^https?:\/\//i.test(url)) { message('请填写 http(s) 开头的 TVBox 配置地址。', 'err'); return; }
+  const raw = (box ? box.value : state.tvboxUrl).trim();
+  state.tvboxUrl = raw;
+  if (!/^https?:\/\//i.test(raw)) { message('请填写 http(s) 开头的 TVBox 配置地址。', 'err'); return; }
+  // 统一规范化（中文域名 punycode / 中文路径 percent-encode），
+  // 保证「解析入库」与「只下发 URL」两条路径得到同一个地址，不会存出两份源。
+  let url;
+  try { url = normalizeHttpUrl(raw); } catch (error) {
+    message('配置地址不合法：' + error.message, 'err');
+    return;
+  }
   statusText('正在抓取 TVBox 配置…');
   try {
     const text = await fetchRemoteText(url);
@@ -1630,21 +1730,13 @@ async function addVodSource() {
     }
     statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
     if (!sites.length) {
-      message('没有解析出可用站点（跳过 ' + skipped + ' 条）。'
-        + '请确认这是 TVBox 配置，且 sites 里 api 以 http(s):// 或 csp_ 开头。', 'err');
+      const why = '没有解析出可用站点（跳过 ' + skipped + ' 条），'
+        + '可能不是标准 TVBox 配置，或 sites 的 api 都不合法';
+      if (offerVodUrlOnlyFallback(why)) return;
+      message(why + '。请确认 sites 里 api 以 http(s):// 或 csp_ 开头。', 'err');
       return;
     }
-    const existing = arr(state.library.vod.sources).find((src) => String(src.url || '') === url);
-    if (existing) {
-      if (!window.confirm('该地址已在资源库中，重新导入会替换它下面的所有站点，继续？')) return;
-      state.library.vod.sources = arr(state.library.vod.sources)
-        .filter((src) => src.id !== existing.id);
-      state.library.vod.sites = arr(state.library.vod.sites)
-        .filter((site) => site.sourceId !== existing.id);
-    } else if (arr(state.library.vod.sources).length >= MAX_VOD_SOURCES) {
-      message('资源库最多 ' + MAX_VOD_SOURCES + ' 个 TVBox 源，请先删除不用的源。', 'err');
-      return;
-    }
+    if (!prepareVodSourceSlot(url)) return;
     const room = MAX_VOD_SITES - arr(state.library.vod.sites).length;
     if (room <= 0) { message('资源库站点已达 ' + MAX_VOD_SITES + ' 条上限，请先删除不用的源。', 'err'); return; }
     let dropped = 0;
@@ -1673,7 +1765,11 @@ async function addVodSource() {
     message(state.tvboxSummary, 'ok');
   } catch (error) {
     statusText(state.deviceId ? '已连接（' + deviceLabel() + '）' : '已连接');
-    message('添加 TVBox 源失败：' + error.message + hintOf(error), 'err');
+    const why = String(error.message || error) + hintOf(error);
+    // 最常见的「无法解析」就是云端代抓失败：给一条「不下发解析结果、
+    // 只下发配置地址」的退路，别让这个源直接丢失。
+    if (offerVodUrlOnlyFallback(why)) return;
+    message('添加 TVBox 源失败：' + why, 'err');
   }
 }
 
@@ -1746,6 +1842,7 @@ function onLibraryAction(button) {
   if (kind === 'delete-package') { deleteLibraryPackage(button.dataset.id); return; }
   if (kind === 'delete-source') { deleteLibrarySource(button.dataset.id); return; }
   if (kind === 'add-vod-source') { addVodSource(); return; }
+  if (kind === 'add-vod-source-url') { addVodSourceUrlOnly(); return; }
   if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
   if (kind === 'migrate-inline') { migrateInlinePackages(); return; }
 }
