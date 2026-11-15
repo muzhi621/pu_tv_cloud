@@ -2536,6 +2536,9 @@ async function load() {
  */
 function sectionsForSave() {
   const sections = clone(state.doc.sections);
+  // bundleStamp 是服务端渲染套餐时写进设备文档的标记，不是用户配置。
+  // 跟着 PUT 上去只会变成一条「忽略未知节」的警告。
+  delete sections.bundleStamp;
   const iptv = sections.iptv;
   if (isObj(iptv) && iptv.lockLibrary !== true && arr(iptv.packageIds).length) {
     const refIds = new Set(arr(iptv.packageIds));
