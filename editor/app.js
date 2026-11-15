@@ -931,11 +931,12 @@ function renderDevices() {
     + '<button class="tiny" data-device="unblock" data-id="' + esc(id) + '">解除拉黑</button></div>').join('');
 
   return '<h2>上线终端 · ' + online + ' 台在线 / ' + state.devices.length + ' 台已连接</h2>'
-    + '<p class="hint">所有连接过的设备都会登记在这里。客户端前台每 15 分钟同步一次配置，'
+    + '<p class="hint">所有连接过的设备都会登记在这里。'
     + '云端以「最后上线距今 ≤ ' + esc(state.onlineWindow) + ' 分钟」判定在线。'
     + '每台终端保存一份<b>完整独立</b>的配置：新设备首次上线复制全局模板，'
     + '之后改全局模板<b>不会</b>影响已登记设备。点「编辑设置」可单独改一台的全部设置，'
-    + '再点「配置下发」立即生成新 revision；终端下次同步（≤15 分钟）即生效。</p>'
+    + '再点「配置下发」立即生成新 revision；终端下次同步即生效'
+    + '（客户端 3.0.18 起每 3 分钟同步一次，旧版本约 15 分钟）。</p>'
     + '<div class="toolbar device-batch">'
     + '<label><input type="checkbox" data-batch="all"> 全选可见设备</label>'
     + '<button class="tiny" data-batch="push">批量下发</button>'
@@ -991,8 +992,10 @@ async function deviceAction(action, ids, extra = {}) {
       message('部分操作失败：' + failed.map((item) => item.deviceId + ' → ' + item.error).join('；'), 'err');
     } else if (action === 'push') {
       const first = (result.results || [])[0] || {};
-      toast('已下发：' + list.length + ' 台，终端下次同步（≤15 分钟）生效');
+      toast('已下发：' + list.length + ' 台，终端下次同步即生效');
       message('配置下发成功，revision ' + (first.revision || '—') + '。'
+        + '终端 3.0.18 起每 3 分钟同步一次，旧版本约 15 分钟；'
+        + '若电视上仍为空，请确认已升级到 3.0.18 并在影音页点「重新获取配置」。'
         + (first.note || ''), 'ok');
     } else {
       toast('操作成功：' + list.length + ' 台设备');
@@ -2035,7 +2038,8 @@ function renderDeviceEditor() {
   return '<h2>单终端配置 · ' + esc(device.alias || id) + '</h2>'
     + '<p class="hint">以下设置<b>只对 <code>' + esc(id) + '</code> 生效</b>，'
     + '不会影响其它终端或全局模板。改完点「下发配置」：先保存本页改动，再生成新 revision，'
-    + '终端前台约 15 分钟内的下一次同步即生效。</p>'
+    + '终端（3.0.18+）约 3 分钟内自动同步，旧版本约 15 分钟；影音页的'
+    + '「重新获取配置」可让终端立即重拉。</p>'
     + '<div class="df-grid">'
 
     + '<div class="df-block"><h3>导航（左侧三大类）</h3>'
