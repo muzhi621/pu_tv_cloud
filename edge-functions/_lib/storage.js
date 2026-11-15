@@ -559,6 +559,20 @@ export async function purgeDevice(env, deviceId) {
   return { id: deviceId, purged: true, blocked: true };
 }
 
+/**
+ * 只拉黑、不删记录。
+ *
+ * 与 purge 的区别：purge 是「彻底删除」顺带拉黑；这里保留注册表里的行，
+ * 用户还能看到这台设备曾经来过、再解除。拉黑后该终端的配置请求一律 403。
+ */
+export async function blockDevice(env, deviceId) {
+  const db = await backend(env);
+  const blocked = (await db.getJSON(KEY_BLOCKED)) || [];
+  if (!blocked.includes(deviceId)) blocked.push(deviceId);
+  await db.put(KEY_BLOCKED, JSON.stringify(blocked.slice(-MAX_DEVICES)));
+  return { id: deviceId, blocked: true };
+}
+
 export async function unblockDevice(env, deviceId) {
   const db = await backend(env);
   const blocked = (await db.getJSON(KEY_BLOCKED)) || [];
@@ -571,4 +585,33 @@ export async function resetDevice(env, deviceId) {
   const template = await read(env, null);
   const current = await read(env, deviceId);
   return write(env, clone(template.sections), current.revision, deviceId);
+}
+
+/* ================= 图片资源（退出弹窗二维码等） ================= */
+
+/**
+ * 图片存 KV，键 `asset_<id>`，值 `{id, contentType, data(base64), name, size, createdAt}`。
+ *
+ * 为什么不直接让用户填图片地址：电视上没法贴图，用户手里只有一张二维码截图。
+ * 编辑器上传 → 存 KV → 返回 `/api/assets?id=as_xxxxxxxx`，退出弹窗配置里只留这个 URL，
+ * 终端照常用 CachedNetworkImage 拉。id 是随机 8 位 hex，不可枚举。
+ */
+const KEY_ASSET = (id) => `asset_${id}`;
+export const ASSET_ID_RE = /^as_[0-9a-f]{8}$/;
+/** 单张图上限 512 KB：二维码 200×200 的 PNG 只有十几 KB，留足余量又不至于塞爆 KV。 */
+export const MAX_ASSET_BYTES = 512 * 1024;
+
+export async function readAsset(env, id) {
+  const key = String(id || '');
+  if (!ASSET_ID_RE.test(key)) return null;
+  const db = await backend(env);
+  const value = await db.getJSON(KEY_ASSET(key));
+  return value && typeof value === 'object' && typeof value.data === 'string' ? value : null;
+}
+
+export async function writeAsset(env, asset) {
+  if (!ASSET_ID_RE.test(String(asset.id || ''))) throw new Error('asset id 非法');
+  const db = await backend(env);
+  await db.put(KEY_ASSET(asset.id), JSON.stringify(asset));
+  return asset;
 }

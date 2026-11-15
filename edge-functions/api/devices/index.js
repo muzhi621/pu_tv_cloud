@@ -9,6 +9,7 @@
  *      delete    移除（软删除，仅隐藏，可 restore）
  *      restore   恢复显示
  *      purge     彻底删除 + 拉黑（终端再上线会被 403 拒绝）
+ *      block     只拉黑，保留注册记录，可 unblock 解除
  *      unblock   解除拉黑，允许重新登记
  *      reset     把该设备配置重置为当前全局模板，生成新 revision
  *      push      显式下发：即使内容没改也生成新 revision，触发终端下次心跳取新配置
@@ -22,7 +23,7 @@ import {
   deviceScope, handle, optionsHandler, readJsonBody, requireAuth, send,
 } from '../../_lib/http.js';
 import {
-  deleteDevice, isBlocked, listBlocked, listDevices, markPushed,
+  blockDevice, deleteDevice, isBlocked, listBlocked, listDevices, markPushed,
   normalizeDeviceId, onlineWindowMinutes, purgeDevice, read as readConfig,
   readDevice, resetDevice, restoreDevice, unblockDevice, updateDevice, write as writeConfig,
 } from '../../_lib/storage.js';
@@ -30,7 +31,7 @@ import {
 export const onRequestOptions = optionsHandler;
 
 const ACTIONS = new Set([
-  'rename', 'comment', 'delete', 'restore', 'purge', 'unblock', 'reset', 'push', 'bind',
+  'rename', 'comment', 'delete', 'restore', 'purge', 'block', 'unblock', 'reset', 'push', 'bind',
 ]);
 
 export async function onRequestGet(context) {
@@ -80,6 +81,9 @@ async function runAction(env, action, id, body) {
       return restoreDevice(env, id);
     case 'purge':
       return purgeDevice(env, id);
+    case 'block':
+      // 只拉黑：注册表保留这台设备，用户还能看到并解除。
+      return blockDevice(env, id);
     case 'unblock':
       return unblockDevice(env, id);
     case 'reset': {

@@ -67,6 +67,15 @@ function setPath(obj, path, value) {
     cursor = cursor[keys[i]];
   }
   cursor[keys[keys.length - 1]] = value;
+  // 终端只在 managed:true 时应用该节（导航 / IPTV / TVBox 都是）。
+  // 用户改了内容却忘了勾「云端接管本节」，保存后不生效——这里顺手打开，
+  // 少一个必踩的坑。显式取消 managed 的勾选不受影响（keys[1] === 'managed'）。
+  const section = keys[0];
+  if ((section === 'iptv' || section === 'vod' || section === 'navigation')
+      && keys.length > 1 && keys[1] !== 'managed'
+      && obj[section] && typeof obj[section] === 'object' && !Array.isArray(obj[section])) {
+    obj[section].managed = true;
+  }
 }
 
 function headers(extra, token) {
@@ -139,7 +148,8 @@ function hintOf(error) {
 function markDirty() {
   if (!state.doc || !state.original) return;
   state.dirty = JSON.stringify(state.doc.sections) !== JSON.stringify(state.original.sections);
-  $('btnSave').disabled = !state.dirty;
+  const saveButton = $('btnSave');
+  if (saveButton) saveButton.disabled = !state.dirty;
 }
 
 function statusText(text) { $('statusText').textContent = text; }
@@ -444,6 +454,44 @@ function syncConnection() {
   state.writeToken = $('apiWriteToken').value.trim();
 }
 
+/**
+ * 没有云端文档时的导航兜底。
+ *
+ * 套餐是「独立于终端」的对象：新建套餐时可能一个终端都没连、也还没加载过
+ * 全局模板，此时 sections.navigation.groups 是空的。直接渲染会让「导航栏」
+ * 一片空白（只剩一句「保存一次后服务端会补齐」），用户以为不能选。
+ * 这里按服务端 SEED 的同一套默认值补齐，界面与保存后的结果保持一致。
+ */
+const DEFAULT_NAV_GROUPS = [
+  { id: 'iptv', label: 'IPTV', icon: 'live_tv', children: ['iptv'] },
+  { id: 'vod', label: '影音', icon: 'movie', children: ['vodBrowse'] },
+  { id: 'settings', label: '设置', icon: 'settings', children: ['settings'] },
+];
+
+/** 二级菜单清单：优先用服务端 catalog，拿不到时退回内置三项。 */
+function menuItems() {
+  const menus = (state.catalog && state.catalog.menus) || [];
+  const list = menus.length ? menus : [
+    { id: 'iptv', name: 'IPTV' }, { id: 'vodBrowse', name: '影音' }, { id: 'settings', name: '设置' },
+  ];
+  // 'settings' 是合法二级项但不在站点 catalog 的 menus 里（它不是菜单页而是设置目录）。
+  return list.some((item) => item.id === 'settings')
+    ? list : list.concat([{ id: 'settings', name: '设置' }]);
+}
+
+/** 保证 sections.navigation.groups 有值（就地补默认三大类），返回分组数组。 */
+function ensureNavGroups() {
+  const sections = state.doc && state.doc.sections;
+  if (!sections) return clone(DEFAULT_NAV_GROUPS);
+  if (!isObj(sections.navigation)) {
+    sections.navigation = { managed: false, railMenuIds: [], groups: [], defaultGroupId: 'iptv' };
+  }
+  const nav = sections.navigation;
+  if (!arr(nav.groups).length) nav.groups = clone(DEFAULT_NAV_GROUPS);
+  if (!nav.defaultGroupId) nav.defaultGroupId = 'iptv';
+  return nav.groups;
+}
+
 /** 兼容老服务端/半成品数据：缺失的数组一律补空，避免渲染时到处判空。 */
 function ensureLibrary(raw) {
   const doc = isObj(raw) ? raw : {};
@@ -605,14 +653,14 @@ function renderIptvDispatch() {
       + (iptv.lockLibrary ? ' checked' : '') + '><span>锁定资源库</span>'
       + '<small>锁定后该终端不再跟随资源库变化，保持当前频道表</small></div>')
     + legacyIptvHtml(iptv)
-    + '<p class="hint">勾选变化会记下当时的资源库 revision；保存仍走顶部「保存到云端」，只影响这台终端。</p>';
+    + '<p class="hint">勾选变化会记下当时的资源库 revision，随套餐一起保存。</p>';
 }
 
 /* ---------------- IPTV 源页（库层） ---------------- */
 
 const LIBRARY_HEAD = '<h2>IPTV 源 · 频道套餐库</h2>'
   + '<p class="hint">资源库与终端无关：先导入 M3U / TXT 源、组成套餐，'
-  + '再到「IPTV 下发」或「终端管理」里给终端勾选套餐。终端没连也能编辑资源库。</p>';
+  + '再到「套餐管理」里勾选它们组成套餐。终端没连也能编辑资源库。</p>';
 
 function libraryToolbar(doc) {
   return '<div class="toolbar">'
@@ -1238,15 +1286,15 @@ function renderDevices() {
   const online = state.devices.filter((d) => d.online && !d.hidden).length;
   const rows = visible.map((d) => {
     const checked = state.checkedDevices.has(d.id);
+    // 终端只有一件事可配：绑哪个套餐。其余都是设备管理动作。
     const ops = [
       '<button class="tiny" data-device="rename" data-id="' + esc(d.id) + '">改名</button>',
-      '<button class="tiny primary" data-device="settings" data-id="' + esc(d.id) + '">编辑设置</button>',
-      '<button class="tiny primary" data-device="push" data-id="' + esc(d.id) + '">配置下发</button>',
-      '<button class="tiny" data-device="reset" data-id="' + esc(d.id) + '">重置为模板</button>',
+      '<button class="tiny primary" data-device="push" data-id="' + esc(d.id) + '">下发配置</button>',
+      '<button class="tiny" data-device="block" data-id="' + esc(d.id) + '">拉黑</button>',
       d.hidden
         ? '<button class="tiny" data-device="restore" data-id="' + esc(d.id) + '">恢复</button>'
         : '<button class="tiny" data-device="delete" data-id="' + esc(d.id) + '">移除</button>',
-      '<button class="tiny danger" data-device="purge" data-id="' + esc(d.id) + '">彻底删除</button>',
+      '<button class="tiny danger" data-device="purge" data-id="' + esc(d.id) + '">删除</button>',
     ].join(' ');
     return '<tr' + (d.hidden ? ' class="row-hidden"' : '') + '>'
       + '<td><input type="checkbox" data-device-check="' + esc(d.id) + '"'
@@ -2303,8 +2351,17 @@ function deviceIptvBlock() {
     ? state.doc.sections.iptv : { packages: [], selectedPackageIds: [], packageIds: [] };
   let html = dfCheck('iptv.managed', '云端接管本节');
   if (libPackages === null) {
-    html += '<p class="meta">资源库尚未加载成功（检查读令牌 / 服务端版本）。'
-      + '本节仍可保存已有的源引用，导入源请到「IPTV 源」页。</p>';
+    // 三种情况必须分开说，否则用户看到「尚未加载成功」会以为功能坏了：
+    // 加载中 / 读令牌或版本问题 / 服务端没这个接口。
+    if (state.libraryState === 'loading' || state.libraryState === 'idle') {
+      html += '<p class="meta">正在读取资源库…</p>';
+    } else if (state.libraryState === 'unsupported') {
+      html += '<p class="meta">当前服务端没有资源库接口，请先部署最新 Edge Functions；'
+        + '导入源请到「IPTV 源」页。</p>';
+    } else {
+      html += '<p class="meta">资源库读取失败：' + esc(state.libraryError || '检查「访问令牌（读）」')
+        + '。导入源请到「IPTV 源」页。</p>';
+    }
   } else {
     html += libPackages.length
       ? '<div class="df-multi">' + libPackages.map((pkg) =>
@@ -2327,7 +2384,14 @@ function deviceVodBlock() {
   const vod = isObj(state.doc.sections.vod) ? state.doc.sections.vod : {};
   let html = dfCheck('vod.managed', '云端接管本节');
   if (sources === null) {
-    return html + '<p class="meta">当前服务端不支持资源库，请先升级云端。</p>';
+    if (state.libraryState === 'loading' || state.libraryState === 'idle') {
+      return html + '<p class="meta">正在读取资源库…</p>';
+    }
+    if (state.libraryState === 'unsupported') {
+      return html + '<p class="meta">当前服务端没有资源库接口，请先部署最新 Edge Functions。</p>';
+    }
+    return html + '<p class="meta">资源库读取失败：'
+      + esc(state.libraryError || '检查「访问令牌（读）」') + '。</p>';
   }
   if (!sources.length) {
     return html + '<p class="meta">资源库里还没有 TVBox 源，请先到「TVBox 源」页添加。</p>';
@@ -2364,14 +2428,65 @@ function deviceVodBlock() {
  * 配置，终端只是绑定了某份套餐。两者共用同一套 data-df 路径，写入的都是
  * state.doc.sections，所以不存在「套餐能改但终端不支持」的字段。
  */
+/**
+ * 退出弹窗二维码：允许直接上传图片。
+ *
+ * 之前只有一个「二维码图片地址」输入框——用户手里是张截图，没有可填的 URL，
+ * 等于这个功能不可用。现在上传到云端（POST /api/assets）后自动回填成
+ * `/api/assets?id=as_xxx` 的绝对地址，终端照常用 CachedNetworkImage 拉。
+ */
+function qrImageField() {
+  const value = String(getPath(state.doc.sections, 'startup.exitDialog.qrImageUrl') || '');
+  const isImage = /^https?:\/\//i.test(value) || value.startsWith('data:');
+  return '<label class="df-field"><span>二维码图片</span>'
+    + '<input type="text" data-df="startup.exitDialog.qrImageUrl" value="' + esc(value)
+    + '" placeholder="留空 = 用内置图片；也可以直接上传">'
+    + '</label>'
+    + '<div class="qr-upload">'
+    + '<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-qr-upload>'
+    + '<span class="meta">PNG / JPG / WEBP / GIF，≤ 512 KB</span>'
+    + '</div>'
+    + '<div class="qr-preview-box">'
+    + (isImage
+      ? '<img class="qr-preview" src="' + esc(value) + '" alt="二维码">'
+      : '<span class="meta">未设置，终端使用内置二维码</span>')
+    + '</div>';
+}
+
+async function uploadQrImage(file) {
+  if (!state.doc || !file) return;
+  if (file.size > 512 * 1024) {
+    message('图片请小于 512 KB：二维码不需要大图，压缩后再传。', 'err');
+    return;
+  }
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+  try {
+    const res = await request('/api/assets', {
+      write: true, method: 'POST',
+      body: JSON.stringify({ data: dataUrl, name: file.name }),
+    });
+    const base = (state.base || window.location.origin).replace(/\/$/, '');
+    const url = /^https?:/i.test(res.url) ? res.url : base + res.url;
+    setPath(state.doc.sections, 'startup.exitDialog.qrImageUrl', url);
+    markDirty();
+    toast('二维码已上传');
+    render();
+  } catch (error) {
+    message('上传失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
 function sectionsFormHtml() {
-  const catalog = state.catalog || { sites: [], menus: [] };
-  const menus = catalog.menus || [];
-  const groups = (state.doc.sections.navigation && state.doc.sections.navigation.groups) || [];
-  // 'settings' 是合法的二级项但不在站点 catalog 的 menus 里（它不是菜单页，
-  // 而是设置目录）；补进来才能完整编辑 settings 一级块的 children。
-  const childItems = menus.some((item) => item.id === 'settings')
-    ? menus : menus.concat([{ id: 'settings', name: '设置' }]);
+  const menus = menuItems();
+  // 空分组就地补默认三大类：套餐与终端无关，界面不能因为「还没加载过文档」
+  // 就渲染成空白。保存时这些默认值随之落库，与终端内置默认一致。
+  const groups = ensureNavGroups();
+  const childItems = menus;
   const noticeModes = [
     { value: 'once_per_revision', label: '每个新版本弹一次' },
     { value: 'always', label: '每次都弹' },
@@ -2414,7 +2529,7 @@ function sectionsFormHtml() {
     + dfSelect('startup.exitDialog.mode', '显示频率', noticeModes)
     + dfText('startup.exitDialog.titleI18n.zh', '标题（中文）', 'text')
     + dfText('startup.exitDialog.bodyI18n.zh', '正文（中文）', 'text')
-    + dfText('startup.exitDialog.qrImageUrl', '二维码图片地址（http(s)，留空用内置图）', 'text')
+    + qrImageField()
     + dfText('startup.exitDialog.qrCaptionI18n.zh', '二维码下方标题（中文）', 'text')
     + dfText('startup.exitDialog.donateBodyI18n.zh', '捐赠说明（中文）', 'text')
     + dfText('startup.exitDialog.confirmTextI18n.zh', '确定按钮文案（中文）', 'text')
@@ -2492,32 +2607,21 @@ function renderExtra() {
   }
 }
 
+/**
+ * 顶栏只负责「状态」。
+ *
+ * 「当前编辑哪份文档」这个概念已经不存在了：云端只有 套餐 / 源 / 终端 三样东西，
+ * 每台终端的配置由套餐渲染。所以 dropdown、保存、原始 JSON、查看改动、历史回滚
+ * 这一整套按文档编辑的控件全部下线，顶栏只留连接状态、套餐库版本和在线数。
+ */
 function render() {
-  const editingBundle = state.editing === 'bundle';
-  $('revBadge').textContent = editingBundle
-    ? '套餐库 r' + state.bundleRevision
-    : 'revision ' + (state.doc ? state.revision : '—');
-  $('devBadge').hidden = !state.devMode;
-  $('btnSave').disabled = !state.doc || !state.dirty;
-  const pushButton = $('btnPush');
-  pushButton.disabled = editingBundle
-    ? !state.bundleId
-    : (!state.doc || !state.deviceId);
-  pushButton.textContent = editingBundle
-    ? '下发到终端'
-    : (state.deviceId ? '下发到该终端' : '配置下发');
-  // 编辑套餐时不希望「配置对象」下拉把人带走到某台终端的文档。
-  const devicePicker = $('deviceSelect');
-  if (devicePicker) {
-    devicePicker.disabled = editingBundle;
-    if (editingBundle) devicePicker.value = '';
+  const badge = $('bundleBadge');
+  if (badge) {
+    badge.textContent = '套餐库 r'
+      + (state.bundleState === 'ready' ? state.bundleRevision : '—');
   }
-  // 原始 JSON / 历史回滚是「设备文档」的概念（快照按设备 revision 存），
-  // 套餐走 /api/bundles，两者不通用，直接禁用避免误操作。
-  ['btnRaw', 'btnDiff', 'btnHistory'].forEach((id) => {
-    const node = $(id);
-    if (node) node.disabled = editingBundle;
-  });
+  const devBadge = $('devBadge');
+  if (devBadge) devBadge.hidden = !state.devMode;
   Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), (button) => {
     button.classList.toggle('active', button.dataset.tab === state.activeTab);
   });
@@ -2526,6 +2630,93 @@ function render() {
 }
 
 /* ---------------- 操作 ---------------- */
+
+/**
+ * 目录 / 设备 / 资源库 / 套餐库的独立加载。
+ *
+ * 这四份数据都**不属于某台终端**：套餐里要选 IPTV 源、TVBox 站点、导航二级项，
+ * 全都来自它们。以前只有点「连接并加载」才会拉取，于是没连设备时进套餐页，
+ * 导航栏和 IPTV/TVBox 选择区都是空的，看起来像「不能选」。
+ */
+async function loadCatalogOnly() {
+  if (!state.base) return null;
+  try {
+    state.catalog = await request('/api/config/catalog');
+    return state.catalog;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function loadDevicesOnly() {
+  if (!state.base) return;
+  try {
+    const data = await request('/api/devices');
+    state.devices = data.devices || [];
+    state.blocked = data.blocked || [];
+    state.onlineWindow = data.onlineWindowMinutes || 30;
+  } catch (_) {
+    // 设备列表拿不到不影响套餐编辑，静默降级。
+  }
+}
+
+/**
+ * 进入某个页签前，把该页依赖的远程数据补齐。
+ * 已经加载过的不会重复请求；加载完成后重绘一次，加载态才会被真实内容替换。
+ */
+async function ensureRemoteData(tab) {
+  if (!state.base || !state.token) return;
+  const jobs = [];
+  if (!state.catalog) jobs.push(loadCatalogOnly());
+  if (tab === 'bundles' || tab === 'iptv-lib' || tab === 'vod-lib') {
+    if (state.libraryState !== 'ready' && state.libraryState !== 'loading') {
+      jobs.push(loadLibrary(true));
+    }
+  }
+  if ((tab === 'bundles' || tab === 'devices') && state.bundleState !== 'ready'
+    && state.bundleState !== 'loading') {
+    jobs.push(loadBundles());
+  }
+  if ((tab === 'bundles' || tab === 'devices') && !arr(state.devices).length) {
+    jobs.push(loadDevicesOnly());
+  }
+  if (!jobs.length) return;
+  render();
+  await Promise.all(jobs);
+  render();
+}
+
+/**
+ * 顶部「连接 / 刷新数据」。
+ *
+ * 只拉四份与终端无关的数据：目录、设备表、资源库、套餐库。设备文档不再读——
+ * 它现在只是「套餐的渲染结果」，没有编辑入口。
+ */
+async function reloadAll() {
+  syncConnection();
+  if (!state.base) { message('请先填写 API 地址（留空表示同源部署）。', 'err'); return; }
+  localStorage.setItem('purelive_config_base', state.base);
+  localStorage.setItem('purelive_config_token', state.token);
+  localStorage.setItem('purelive_config_write_token', state.writeToken);
+  clearMessage();
+  statusText('正在连接…');
+  try {
+    const health = await request('/health');
+    state.devMode = !!health.devMode;
+    // 强制重拉：用户点「刷新数据」就是不信任缓存。
+    state.catalog = null;
+    state.bundleState = 'idle';
+    state.libraryState = 'idle';
+    await Promise.all([loadCatalogOnly(), loadDevicesOnly(), loadLibrary(true), loadBundles()]);
+    const online = arr(state.devices).filter((d) => d.online && !d.hidden).length;
+    statusText('已就绪 · 在线 ' + online + ' / 共 ' + arr(state.devices).length + ' 台');
+    render();
+    toast('数据已刷新');
+  } catch (error) {
+    statusText('连接失败');
+    message('连接失败：' + error.message + hintOf(error), 'err');
+  }
+}
 
 async function load() {
   clearMessage();
@@ -2608,7 +2799,8 @@ async function save() {
   }
   if (!state.doc || !state.dirty) return;
   clearMessage();
-  $('btnSave').disabled = true;
+  const saveButton = $('btnSave');
+  if (saveButton) saveButton.disabled = true;
   try {
     const result = await request('/api/config', {
       write: true,
@@ -2686,6 +2878,35 @@ function applyRaw() {
   }
 }
 
+/**
+ * 把 `data-df` / `data-df-multi` 控件写进当前文档（套餐与终端共用同一套表单）。
+ *
+ * 之前这两个属性只在「单终端设置抽屉」里被监听，套餐页渲染进 #panel 后
+ * 标题/正文/勾选框/下拉全都不生效——用户看到的是「填了没用」。
+ */
+function applyDfControl(target) {
+  if (!state.doc) return false;
+  if (target.dataset.df) {
+    let value;
+    if (target.type === 'checkbox') value = target.checked;
+    else if (target.type === 'number') value = Number(target.value) || 0;
+    else value = target.value;
+    setPath(state.doc.sections, target.dataset.df, value);
+    markDirty();
+    return true;
+  }
+  if (target.dataset.dfMulti) {
+    const path = target.dataset.dfMulti;
+    const current = new Set(getPath(state.doc.sections, path) || []);
+    if (target.checked) current.add(target.dataset.value);
+    else current.delete(target.dataset.value);
+    setPath(state.doc.sections, path, [...current]);
+    markDirty();
+    return true;
+  }
+  return false;
+}
+
 function onFieldChange(target) {
   if (!state.doc) return;
   const path = target.dataset.path;
@@ -2760,36 +2981,19 @@ document.addEventListener('DOMContentLoaded', () => {
     $('apiWriteToken').value = saved.writeToken || '';
   }
 
-  $('btnConnect').addEventListener('click', load);
-  $('btnSave').addEventListener('click', save);
-  $('btnRaw').addEventListener('click', () => {
-    if (!state.doc) return;
-    state.extraMode = state.extraMode === 'raw' ? null : 'raw';
-    renderExtra();
-  });
-  $('btnDiff').addEventListener('click', () => {
-    if (!state.doc) return;
-    state.extraMode = state.extraMode === 'diff' ? null : 'diff';
-    renderExtra();
-  });
-  $('btnHistory').addEventListener('click', showHistory);
-  $('btnPush').addEventListener('click', () => {
-    // 套餐编辑态：把当前套餐下发到套餐页里选中的终端。
-    if (state.editing === 'bundle') {
-      const select = $('bundleDispatchDevice');
-      if (!select || !select.value) { message('请先在套餐页选择要下发的终端。', 'err'); return; }
-      dispatchBundle(select.value, state.bundleId);
-      return;
-    }
-    if (!state.deviceId) { message('请先在「当前编辑」里选中一台终端。', 'err'); return; }
-    pushToDevice(state.deviceId, true);
-  });
+  // 「连接」现在只做一件事：把与终端无关的四份数据（目录 / 设备 / 资源库 / 套餐库）拉一次。
+  // 设备文档不再是编辑对象——每台终端的配置由它绑定的套餐渲染。
+  $('btnConnect').addEventListener('click', reloadAll);
+  $('btnReload').addEventListener('click', reloadAll);
 
   $('tabs').addEventListener('click', (event) => {
     const button = event.target.closest('button[data-tab]');
     if (!button) return;
     state.activeTab = button.dataset.tab;
     render();
+    // 套餐 / 源 / 终端页依赖的资源库、目录、设备表与「当前终端」无关，
+    // 切过去就补一次，不需要先点「连接并加载」。
+    ensureRemoteData(state.activeTab).catch(() => null);
   });
 
   // ---- 套餐管理 ----
@@ -2824,7 +3028,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const field = target.dataset.bundleField;
       bundle[field] = target.value.slice(0, field === 'name' ? 64 : 200);
       state.dirty = true;
-      $('btnSave').disabled = false;
+      const saveButton = $('btnSave');
+      if (saveButton) saveButton.disabled = false;
     }
   });
 
@@ -2836,12 +3041,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const field = target.dataset.bundleField;
     bundle[field] = target.value.slice(0, field === 'name' ? 64 : 200);
     state.dirty = true;
-    $('btnSave').disabled = false;
+    const saveButton = $('btnSave');
+    if (saveButton) saveButton.disabled = false;
   });
 
   $('panel').addEventListener('change', (event) => {
     const target = event.target;
+    if ('qrUpload' in target.dataset) {
+      const file = target.files && target.files[0];
+      if (file) uploadQrImage(file);
+      return;
+    }
     if (target.dataset.libInput) { onLibraryInput(target); return; }
+    // 套餐表单（#panel）的勾选框 / 下拉 / 数字框
+    if (applyDfControl(target)) return;
     if (target.dataset.menu) onMenuToggle(target);
     else onFieldChange(target);
   });
@@ -2852,6 +3065,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (target.type !== 'file') onLibraryInput(target);
       return;
     }
+    if (target.dataset.df) { applyDfControl(target); return; }
     if (target.tagName === 'TEXTAREA' || target.type === 'text' || target.type === 'number') onFieldChange(target);
   });
   $('panel').addEventListener('click', (event) => {
@@ -2874,39 +3088,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 单终端全设置面板：所有字段用 data-df 路径直接写进当前设备文档。
   $('extra').addEventListener('change', (event) => {
-    const target = event.target;
-    if (!state.doc) return;
-    if (target.dataset.df) {
-      let value;
-      if (target.type === 'checkbox') value = target.checked;
-      else if (target.type === 'number') value = Number(target.value) || 0;
-      else value = target.value;
-      setPath(state.doc.sections, target.dataset.df, value);
-      markDirty();
-      return;
-    }
-    if (target.dataset.dfMulti) {
-      const path = target.dataset.dfMulti;
-      const current = new Set(getPath(state.doc.sections, path) || []);
-      if (target.checked) current.add(target.dataset.value);
-      else current.delete(target.dataset.value);
-      setPath(state.doc.sections, path, [...current]);
-      markDirty();
-    }
+    applyDfControl(event.target);
   });
 
-
-  $('deviceSelect').addEventListener('change', async (event) => {
-    const next = event.target.value.trim();
-    if (next === state.deviceId) return;
-    if (state.dirty && !window.confirm('当前有未保存的改动，切换配置对象会丢弃，继续？')) {
-      renderDeviceSelect();
-      return;
-    }
-    state.deviceId = next;
-    if (state.doc) await load();
-    else renderDeviceSelect();
-  });
 
   $('panel').addEventListener('click', (event) => {
     const libButton = event.target.closest('button[data-lib]');
@@ -2917,7 +3101,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!deviceButton) return;
     const id = deviceButton.dataset.id;
     const action = deviceButton.dataset.device;
-    if (action === 'edit' || action === 'settings') { openDeviceEditor(id); return; }
     if (action === 'push') { pushToDevice(id, false); return; }
     if (action === 'unblock') { deviceAction('unblock', id); return; }
     deviceAction(action, id);
@@ -2925,8 +3108,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $('panel').addEventListener('change', (event) => {
     const target = event.target;
-    if (!state.doc) return;
-    if (target.dataset.pkg) {
+    if (target.dataset.pkg && state.doc) {
       // 勾选的是资源库套餐 id，写入 iptv.packageIds 并记录当时的资源库 revision。
       const iptv = iptvSection();
       const picked = new Set(arr(iptv.packageIds));
@@ -2972,5 +3154,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.visibilityState === 'visible') loadDeviceStatus();
   }, 60000);
   // 首次访问且服务端已注入连接信息时直接连上，省掉手动点一次按钮。
-  if (autoConnect) load();
+  // 手动填过令牌但没点「连接」的，也自动拉一次：套餐 / 源 / 终端页本来就不需要
+  // 先「加载设备文档」，让用户先点一次纯属多余。
+  if (autoConnect) {
+    reloadAll();
+  } else {
+    syncConnection();
+    if (state.base && state.token) reloadAll();
+  }
 });

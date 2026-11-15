@@ -22,6 +22,9 @@ import {
   onRequestGet as bundlesGet, onRequestPut as bundlesPut,
 } from '../edge-functions/api/bundles/index.js';
 import {
+  onRequestGet as assetsGet, onRequestPost as assetsPost,
+} from '../edge-functions/api/assets/index.js';
+import {
   onRequestGet as editorGet, preloadDefaults, injectDefaults,
 } from '../edge-functions/index.js';
 import {
@@ -1035,6 +1038,17 @@ test('退出弹窗与一级导航分组契约', async (t) => {
     assert.ok(!html.includes('data-tab="navigation"'), '导航栏页签应已并入套餐');
     assert.ok(!html.includes('data-tab="startup"'), '启动页签应已并入套餐');
 
+    // 顶栏不再有「按文档编辑」的入口：云端只有套餐 / 源 / 终端三样东西。
+    assert.ok(!html.includes('id="deviceSelect"'), '顶栏仍有「当前编辑」下拉');
+    assert.ok(!html.includes('id="btnSave"'), '顶栏仍有保存按钮');
+    assert.ok(!html.includes('id="btnPush"'), '顶栏仍有下发按钮');
+    assert.ok(!html.includes('id="btnRaw"'), '顶栏仍有原始 JSON');
+    assert.ok(!html.includes('id="btnHistory"'), '顶栏仍有历史回滚');
+    // 终端行只有：改名 / 下发配置 / 拉黑 / 移除 / 删除，没有逐台编辑。
+    assert.ok(!source.includes('data-device="settings"'), '终端行仍有「编辑设置」');
+    assert.ok(!source.includes('data-device="reset"'), '终端行仍有「重置为模板」');
+    assert.ok(source.includes('data-device="block"'), '终端行缺少「拉黑」');
+
     assert.ok(!('sites' in seed.sections), 'seed 仍带直播平台节');
     assert.deepEqual(catalog.sites, [], 'catalog 仍列出直播平台');
     assert.deepEqual(seed.sections.navigation.groups.map((g) => g.id),
@@ -1995,5 +2009,94 @@ test('默认套餐：新设备首次上线自动绑定', async (t) => {
     const devices = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
     const row = devices.devices.find((item) => item.id === 'tv-old');
     assert.equal(row.packageId, '');
+  });
+});
+
+/* ================= 二维码图片上传 ================= */
+
+test('二维码图片：上传后可公开读取，非法输入被拒', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  globalThis.PURETV_KV = new MemoryKV();
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {};
+  // 1×1 透明 PNG
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk'
+    + 'YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+
+  await t.test('上传 data URL 返回 id 与可读 url', async () => {
+    const res = await assetsPost(ctx('POST', '/api/assets', {
+      env, body: { data: 'data:image/png;base64,' + PNG, name: 'qr.png' },
+    }));
+    assert.equal(res.status, 200);
+    const data = await json(res);
+    assert.match(data.id, /^as_[0-9a-f]{8}$/);
+    assert.equal(data.url, '/api/assets?id=' + data.id);
+    assert.equal(data.contentType, 'image/png');
+
+    const img = await assetsGet(ctx('GET', '/api/assets?id=' + data.id, { env }));
+    assert.equal(img.status, 200);
+    assert.equal(img.headers.get('Content-Type'), 'image/png');
+    const bytes = new Uint8Array(await img.arrayBuffer());
+    assert.ok(bytes.length > 0);
+    // PNG magic
+    assert.deepEqual([...bytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  await t.test('裸 base64 + contentType 也能上传', async () => {
+    const res = await assetsPost(ctx('POST', '/api/assets', {
+      env, body: { data: PNG, contentType: 'image/png' },
+    }));
+    assert.equal(res.status, 200);
+  });
+
+  await t.test('非图片 MIME 被拒', async () => {
+    const res = await assetsPost(ctx('POST', '/api/assets', {
+      env, body: { data: 'data:text/html;base64,' + PNG },
+    }));
+    assert.equal(res.status, 400);
+  });
+
+  await t.test('空数据被拒', async () => {
+    const res = await assetsPost(ctx('POST', '/api/assets', { env, body: {} }));
+    assert.equal(res.status, 400);
+  });
+
+  await t.test('不存在的 id 返回 404，非法 id 也不报错', async () => {
+    assert.equal((await assetsGet(ctx('GET', '/api/assets?id=as_00000000', { env }))).status, 404);
+    assert.equal((await assetsGet(ctx('GET', '/api/assets?id=../../etc/passwd', { env }))).status, 404);
+  });
+});
+
+/* ================= 终端管理：拉黑 ================= */
+
+test('终端管理：拉黑保留记录并拒绝配置请求', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  globalThis.PURETV_KV = new MemoryKV();
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {};
+  await json(await configGet(ctx('GET', '/api/config?deviceId=tv-x', { env })));
+
+  await t.test('block 后设备仍在注册表里，blocked 列表包含它', async () => {
+    const res = await devicesPost(ctx('POST', '/api/devices', {
+      env, body: { action: 'block', deviceId: 'tv-x' },
+    }));
+    const data = await json(res);
+    assert.equal(data.results[0].ok, true);
+    const list = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
+    assert.ok(list.devices.some((item) => item.id === 'tv-x'), '注册记录应保留');
+    assert.ok(list.blocked.includes('tv-x'));
+  });
+
+  await t.test('拉黑后配置请求 403', async () => {
+    const res = await configGet(ctx('GET', '/api/config?deviceId=tv-x', { env }));
+    assert.equal(res.status, 403);
+  });
+
+  await t.test('解除拉黑后恢复', async () => {
+    await devicesPost(ctx('POST', '/api/devices', { env, body: { action: 'unblock', deviceId: 'tv-x' } }));
+    const res = await configGet(ctx('GET', '/api/config?deviceId=tv-x', { env }));
+    assert.equal(res.status, 200);
   });
 });

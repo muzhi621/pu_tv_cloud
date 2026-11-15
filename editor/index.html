@@ -25,19 +25,12 @@
 
   <main>
     <section class="statusbar">
-      <label class="device-pick">当前编辑
-        <select id="deviceSelect"><option value="">全局模板（新设备初始值）</option></select>
-      </label>
       <span id="statusText" class="muted">尚未连接</span>
-      <span id="revBadge" class="badge">revision —</span>
+      <span id="bundleBadge" class="badge">套餐库 r—</span>
       <span id="devBadge" class="badge warn" hidden>开发模式：接口未鉴权</span>
       <span id="deviceStatus" class="device-status" title="终端在线 / 离线状态，自动刷新"></span>
       <span class="spacer"></span>
-      <button id="btnRaw" class="ghost">原始 JSON</button>
-      <button id="btnDiff" class="ghost">查看改动</button>
-      <button id="btnHistory" class="ghost">历史 / 回滚</button>
-      <button id="btnSave" class="primary" disabled>保存</button>
-      <button id="btnPush" class="primary" disabled title="把当前内容立即下发给选中的终端">下发配置</button>
+      <button id="btnReload" class="ghost">刷新数据</button>
     </section>
 
     <nav class="tabs" id="tabs">

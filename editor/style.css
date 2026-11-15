@@ -273,6 +273,15 @@ p.meta { margin: 6px 0; }
 .bundle-card .toolbar { margin-top: 10px; }
 .device-table select { max-width: 180px; }
 
+/* ---- 退出弹窗二维码上传 ---- */
+.qr-upload { display: flex; align-items: center; gap: 10px; margin: 6px 0 10px; flex-wrap: wrap; }
+.qr-upload input[type="file"] { font-size: 12px; max-width: 240px; }
+.qr-preview-box { margin-bottom: 8px; }
+.qr-preview {
+  max-width: 132px; max-height: 132px; border: 1px solid var(--border);
+  border-radius: 8px; background: #fff; padding: 4px;
+}
+
 @media (max-width: 720px) {
   .conn input { width: 150px; }
   main { padding: 16px; }
