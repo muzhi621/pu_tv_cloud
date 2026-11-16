@@ -406,7 +406,8 @@ curl -X POST "$BASE/api/config/rollback" \
 | `comment` | 改备注（`comment`） |
 | `delete` | **软删除**：仅隐藏注册项（`hidden=true`），配置与快照保留，可 `restore` |
 | `restore` | 恢复显示 |
-| `purge` | **彻底删除 + 拉黑**：该设备再请求 `/api/config` 返回 `403 device_blocked` |
+| `purge` | **彻底删除**：只移除注册项，**不拉黑**；设备再次上线会重新登记 |
+| `block` | **拉黑**：保留注册项并把设备加入黑名单，之后请求 `/api/config` 返回 `403 device_blocked` |
 | `unblock` | 解除拉黑，允许重新登记 |
 | `reset` | 把该设备配置重置为当前全局模板，生成该设备新 revision |
 | `push` | **配置下发**：即使内容没改也生成新 revision 并记录 `pushedAt` / `pushedRevision`，触发终端下次心跳取新配置 |
@@ -491,7 +492,7 @@ curl -X POST "$BASE/api/devices" -H "Authorization: Bearer $WRITE_TOKEN" \
 |---|---|---|
 | 400 | `invalid_config` | 请求体/字段不合法、缺少 If-Match、快照不存在、设备动作非法 |
 | 401 | `unauthorized` | Token 缺失或无效 |
-| 403 | `device_blocked` | **仅 EdgeOne**：设备被 `purge` 拉黑后请求 `/api/config` 被拒 |
+| 403 | `device_blocked` | **仅 EdgeOne**：设备被 `block` 拉黑后请求 `/api/config` 被拒（`purge` 删除不会拉黑） |
 | 404 | `not_found` / `not_supported` | 未知接口或静态资源；FC 版请求 `/api/devices`、`/api/iptv/fetch`、`/api/library` 也返回此码（`/api/library` 带 `not_supported` 说明） |
 | 405 | `method_not_allowed` | 方法不支持 |
 | 409 | `revision_conflict` | 乐观锁冲突 |

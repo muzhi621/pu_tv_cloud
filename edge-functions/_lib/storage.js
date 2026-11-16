@@ -227,6 +227,14 @@ export async function write(env, sections, expectedRevision, deviceId = null, op
   const document = buildDocument(sections, expectedRevision + 1, nowIso());
   const payload = JSON.stringify(document);
   const withSnapshot = options.snapshot !== false;
+
+  // 并发边界：上面已按 revision 做乐观锁校验，但 OSS/EdgeOne KV/Blob 都不提供
+  // 跨节点原子 CAS，"读 current → 写 current"之间另一实例仍可能提交同 revision，
+  // 后写静默覆盖前写。这不是代码层能彻底解决的——部署必须把业务写并发限制为 1
+  // （见 docs/DEPLOY_EDGEONE.md）；彻底解决要迁移到支持条件写的存储。
+  // 不在这里加"写前二次读"：它同样非原子，只是把窗口挪位置，还会破坏单实例内
+  // 连续写入的正确性（同一请求内前一次 write 的结果会被后一次误判为冲突）。
+
   if (withSnapshot) {
     // 先写不可变快照，再切换 current，避免 current 指向不存在的历史。
     await db.put(keys.snapshot(document.revision), payload);
@@ -375,16 +383,21 @@ export async function countBundleDevices(env, bundleIds = []) {
 /**
  * 统计「引用了这些库 id 且未锁定」的设备台数。
  * 只读不写：写库不应该顺带改设备文档，真正的生效发生在设备下次 GET。
- */export async function countAffectedDevices(env, refs = {}) {
+ *
+ * 并发上限（2026-11-16）：人是管理操作，几百台设备时一次发几百个 KV 读会
+ * 瞬间打爆边缘连接池。改为分批串行、批内并行（CONCURRENCY 批），总 IO 次数
+ * 不变但峰值可控。真正消除 N+1 需要在注册表冗余设备引用的库 id，但那要改
+ * 写入路径且存在渲染快照与注册表不一致的风险，管理路径低频，暂不做。
+ */
+export async function countAffectedDevices(env, refs = {}) {
   const packageIds = new Set(refs.packageIds || []);
   const sourceIds = new Set(refs.sourceIds || []);
   const siteIds = new Set(refs.siteIds || []);
   if (!packageIds.size && !sourceIds.size && !siteIds.size) return 0;
 
   const db = await backend(env);
-  const devices = (await db.getJSON(KEY_DEVICES)) || [];
-  const hits = await Promise.all(devices.map(async (entry) => {
-    if (!entry || !entry.id) return false;
+  const devices = ((await db.getJSON(KEY_DEVICES)) || []).filter((entry) => entry && entry.id);
+  const check = async (entry) => {
     const document = await db.getJSON(scopeKeys(entry.id).current);
     const sections = document && document.sections;
     if (!sections) return false;
@@ -397,8 +410,15 @@ export async function countBundleDevices(env, bundleIds = []) {
       && ((Array.isArray(vod.sourceIds) && vod.sourceIds.some((id) => sourceIds.has(id)))
         || (Array.isArray(vod.siteIds) && vod.siteIds.some((id) => siteIds.has(id))));
     return iptvHit || vodHit;
-  }));
-  return hits.filter(Boolean).length;
+  };
+  const CONCURRENCY = 20;
+  let count = 0;
+  for (let i = 0; i < devices.length; i += CONCURRENCY) {
+    const batch = devices.slice(i, i + CONCURRENCY);
+    const hits = await Promise.all(batch.map(check));
+    count += hits.filter(Boolean).length;
+  }
+  return count;
 }
 
 /* ---------------- 设备注册表 ---------------- */
@@ -433,7 +453,8 @@ export async function listBlocked(env) {
 /**
  * 终端每次拉配置时登记/刷新上线信息。客户端 v3.0.14 起前台每 15 分钟同步一次，
  * 因此 lastSeen 既是「最后上线」也是在线判据；云端另有 30 分钟超时兜底。
- * 被彻底删除（拉黑）的设备不再登记，且 GET /api/config 会直接 403。
+ * 被拉黑的设备不再登记，且 GET /api/config 会直接 403。
+ * 被「删除」（purge）的设备不在注册表里，再次上线会重新登记为新记录。
  */
 export async function touchDevice(env, deviceId, meta = {}) {
   if (!deviceId) return null;
@@ -545,25 +566,29 @@ export async function restoreDevice(env, deviceId) {
 }
 
 /**
- * 彻底删除：移除注册项并拉黑。拉黑后终端 GET /api/config 返回 403、不再登记，
- * 除非管理员执行 unblock。旧配置文档本身不物理删除（Blob/KV 适配层没有 list/delete，
- * 且已不可访问），成本可忽略。
+ * 彻底删除：只移除注册项，不涉及拉黑。
+ *
+ * 「删除」和「拉黑」是两个独立动作：
+ * - purge（删除）：把设备从注册表抹掉。设备若再次上线会重新登记（是无害的新记录）。
+ * - block（拉黑）：只加黑名单、保留注册项，配置请求一律 403，直到管理员 unblock。
+ * 想让某台设备永远进不来，用 block；只是清理注册表，用 purge。
+ *
+ * 旧配置文档本身不物理删除（Blob/KV 适配层没有 list/delete），成本可忽略；
+ * 设备若重新登记会沿用原文档，符合「删除只是清理登记」的语义。
  */
 export async function purgeDevice(env, deviceId) {
   const db = await backend(env);
   const devices = (await db.getJSON(KEY_DEVICES)) || [];
   await db.put(KEY_DEVICES, JSON.stringify(devices.filter((entry) => entry.id !== deviceId)));
-  const blocked = (await db.getJSON(KEY_BLOCKED)) || [];
-  if (!blocked.includes(deviceId)) blocked.push(deviceId);
-  await db.put(KEY_BLOCKED, JSON.stringify(blocked.slice(-MAX_DEVICES)));
-  return { id: deviceId, purged: true, blocked: true };
+  return { id: deviceId, purged: true };
 }
 
 /**
  * 只拉黑、不删记录。
  *
- * 与 purge 的区别：purge 是「彻底删除」顺带拉黑；这里保留注册表里的行，
- * 用户还能看到这台设备曾经来过、再解除。拉黑后该终端的配置请求一律 403。
+ * 与 purge 的区别：purge 是「彻底删除」但不拉黑，设备还能重新登记；
+ * 这里保留注册表里的行并加黑名单，用户还能看到这台设备曾经来过、再解除。
+ * 拉黑后该终端的配置请求一律 403。
  */
 export async function blockDevice(env, deviceId) {
   const db = await backend(env);

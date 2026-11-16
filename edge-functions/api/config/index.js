@@ -15,7 +15,7 @@ export const onRequestOptions = optionsHandler;
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
-/** 被管理员彻底删除（拉黑）的设备不再接受任何配置请求。 */
+/** 被管理员拉黑的设备不再接受任何配置请求（「删除」purge 不会拉黑）。 */
 async function rejectBlocked(env, id) {
   if (!id) return;
   if (await isBlocked(env, id)) {
@@ -102,7 +102,10 @@ export async function onRequestGet(context) {
     requireAuth(request, env, 'read');
     const { id, meta } = deviceScope(request);
     await rejectBlocked(env, id);
-    const document0 = await read(env, id);
+    // 设备文档与全局资源库互不依赖，并发读：终端每 3 分钟心跳一次，两次 KV
+    // 往返串行会直接叠加到首屏延迟。library 读到后透传给 catchUp/viewDocument，
+    // 避免下游重复读取。
+    const [document0, library] = await Promise.all([read(env, id), safeReadLibrary(env)]);
     // 每次成功拉取即视为「上线」，不额外做心跳请求。
     let item = id ? await touchDevice(env, id, meta) : null;
     // 新设备首次上线：有默认套餐就直接绑定，终端首帧即拿到完整内容。
@@ -116,7 +119,7 @@ export async function onRequestGet(context) {
     document = bound.document;
 
     // 库有新版本时先追平设备 revision，再做 304 判定，终端才不会漏掉新频道。
-    const library = await safeReadLibrary(env);
+    // library 已在开头与 document 并发读好，这里直接复用。
     document = await catchUpLibrary(env, document, id, library);
 
     const url = new URL(request.url);

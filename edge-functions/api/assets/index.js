@@ -24,6 +24,23 @@ const EXT_BY_TYPE = {
   'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif',
 };
 
+/**
+ * 按文件头识别真实图片类型。只校验「声明的 MIME」不够——攻击者可以把 HTML/JS
+ * 以 image/png 名义上传，GET 是公开接口，一旦被浏览器当 HTML 解析即成存储型 XSS。
+ * 这里解码后核对魔数，声明类型与真实类型不一致直接拒绝。导出供离线测试。
+ */
+export function sniffImageType(bytes) {
+  const at = (i) => bytes[i];
+  if (bytes.length >= 8 && at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47
+      && at(4) === 0x0d && at(5) === 0x0a && at(6) === 0x1a && at(7) === 0x0a) return 'image/png';
+  if (bytes.length >= 3 && at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return 'image/jpeg';
+  if (bytes.length >= 12 && at(0) === 0x52 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x46
+      && at(8) === 0x57 && at(9) === 0x45 && at(10) === 0x42 && at(11) === 0x50) return 'image/webp';
+  if (bytes.length >= 6 && at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46
+      && (at(3) === 0x38 || at(3) === 0x39) && at(4) === 0x61) return 'image/gif';
+  return '';
+}
+
 function randomAssetId() {
   const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);
@@ -50,6 +67,10 @@ export async function onRequestGet(context) {
       headers: {
         'Content-Type': asset.contentType || 'image/png',
         'Content-Length': String(binary.length),
+        // 公开接口 + 不可枚举 id 不等于可以放松内容类型：即使有人绕过上传校验
+        // 塞进 HTML，nosniff + CSP 也保证浏览器只当图片解析，不会执行脚本。
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
         'Cache-Control': 'public, max-age=31536000, immutable',
       },
     });
@@ -91,6 +112,21 @@ export async function onRequestPost(context) {
       );
     }
     if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) throw new ConfigError('图片数据不是合法 base64');
+
+    // 解码后核对真实类型，拒绝「声明 image/png 实为 HTML/JS」的伪装上传。
+    let bytes;
+    try {
+      const binary = atob(base64.replace(/\s+/g, ''));
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    } catch (_) {
+      throw new ConfigError('图片数据不是合法 base64');
+    }
+    const sniffed = sniffImageType(bytes);
+    if (!sniffed || !ALLOWED.has(sniffed)) throw new ConfigError('文件内容不是有效的 PNG / JPG / WEBP / GIF 图片');
+    if (sniffed !== contentType) {
+      throw new ConfigError(`声明类型 ${contentType} 与实际图片 ${sniffed} 不符`);
+    }
 
     const asset = await writeAsset(env, {
       id: randomAssetId(),

@@ -73,13 +73,13 @@ EdgeOne 的硬约定是：`edge-functions/` 与 `edgeone.json` 必须位于**项
 | `CONFIG_WRITE_TOKEN` | 写 Token，编辑器「保存令牌（写）」与 `PUT` / `rollback` / `/api/devices` / `/api/iptv/fetch` 用；与读 Token 必须分开填 |
 | `CONFIG_KV_BINDING` | 可选，默认 `PURETV_KV` |
 | `CONFIG_CORS_ORIGINS` | 可选，编辑器同源部署留空 |
-| `CONFIG_EDITOR_PRELOAD` | 可选，默认 `1`。打开编辑器时注入 `{base, readToken, writeToken, autoConnect:true}`，自动预填并自动连接；设 `0` 关闭 |
+| `CONFIG_EDITOR_PRELOAD` | 可选，**默认 `0`（关闭）**。设 `1` 才注入 `{base, readToken, writeToken, autoConnect:true}` 自动预填并自动连接 |
 | `CONFIG_ONLINE_WINDOW_MINUTES` | 可选，默认 `30`。终端在线判定窗口（分钟） |
 
-> **令牌预填的安全边界**：`CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 在响应页面时把
+> **令牌预填的安全边界**：预填默认关闭；仅显式 `CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 在响应页面时把
 > 读写令牌与当前域名注入为 `window.__PURETV_DEFAULTS__`（令牌不写进公开仓库，
 > 响应带 `Cache-Control: no-store`）。**能打开编辑器页面的人可在源码里看到写令牌**：
-> 不要把编辑器域名公开传播，公开站点请配合访问控制，或设 `CONFIG_EDITOR_PRELOAD=0`
+> 不要把编辑器域名公开传播，公开站点请配合访问控制并保持默认 `CONFIG_EDITOR_PRELOAD=0`
 > 恢复手动填写。连接信息优先级为「本机 localStorage > 注入默认值 > 空白」。
 
 > 环境变量改动**只对之后的部署生效**；先填后部署，可省一次重部署。
@@ -116,7 +116,7 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
   -d '{"revision":1}'
 ```
 
-浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器：默认 `CONFIG_EDITOR_PRELOAD=1` 时，
+浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器：设 `CONFIG_EDITOR_PRELOAD=1` 时，
 连接框（API 地址 / 读令牌 / 写令牌）**已自动预填且页面加载后自动连接**，通常无需手动填写。
 关闭预填或本机改过连接信息时，再手动填写并点「连接并加载」。安全边界见上文环境变量说明。
 
@@ -131,8 +131,8 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
   整文档 900 KB、请求体 2 MiB。云端仍只保存解析结果，不定时抓取、不转发直播流。
 - **终端管理**：显示在线 / 离线（`CONFIG_ONLINE_WINDOW_MINUTES`，默认 30 分钟）、
   批量勾选操作、编辑单台终端完整配置，以及「配置下发」按钮（先保存再 `push`）。
-  8 种动作：`rename` / `comment` / `delete`（软删除）/ `restore` / `purge`（彻底删除 +
-  拉黑）/ `unblock` / `reset` / `push`；被拉黑设备请求 `/api/config` 返回
+  动作：`rename` / `comment` / `delete`（软删除）/ `restore` / `purge`（彻底删除，
+  不拉黑）/ `block`（拉黑）/ `unblock` / `reset` / `push`；被拉黑设备请求 `/api/config` 返回
   `403 device_blocked`。右上角「配置对象」下拉切换编辑目标，每台设备保存**完整独立**
   的配置，改全局模板不会覆盖已有设备。
 
@@ -219,10 +219,10 @@ flutter build apk --release \
 
 | 类别 | 新增 | 说明 |
 |---|---|---|
-| 环境变量 | `CONFIG_EDITOR_PRELOAD=1` / `CONFIG_ONLINE_WINDOW_MINUTES=30` | 编辑器令牌预填 + 自动连接、终端在线判定窗口；样例见 [edgeone.env.example](edgeone.env.example) |
+| 环境变量 | `CONFIG_EDITOR_PRELOAD=0`（默认）/ `CONFIG_ONLINE_WINDOW_MINUTES=30` | 编辑器令牌预填默认关闭、终端在线判定窗口；样例见 [edgeone.env.example](edgeone.env.example) |
 | 接口 | `POST /api/iptv/fetch` | **写令牌**、最多 10 个公网 http(s) 地址、单源 2 MiB / 10s、最多 3 跳重定向逐跳复核 SSRF、UTF-8 / GBK 自动识别；仅 EdgeOne |
 | 接口 | `GET/POST /api/devices` | GET 返回在线离线与 `pushedAt` 等；POST 8 种动作、单台或批量（≤50）、`{action,total,failed,results}`，单台失败不影响其它 |
-| 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备被拒绝下发配置 |
+| 错误码 | `403 device_blocked` | 被 `block` 拉黑的设备被拒绝下发配置（删除不会拉黑） |
 | 契约 | `navigation.groups` / `defaultGroupId` / `startup.exitDialog` | 三大类一级栏（IPTV / 影音 / 设置）+ 右侧二级菜单、退出 App 弹窗云端下发；直播平台节 `sites` 已下线 |
 | 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 3000 |
 | 接口 | `GET/PUT /api/library` | 全局资源库（IPTV 源/套餐 + TVBox 源/站点）；无库返回空库 revision 0；PUT 需 `If-Match`，返回 `affectedDevices` |

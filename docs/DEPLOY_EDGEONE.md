@@ -55,6 +55,14 @@ EdgeOne Pages / Makers 目前提供**免费版，无需信用卡**，官方说�
 2. **KV 只能在 Edge Functions 中使用**，且是「中心存储 + 边缘缓存」的**最终一致性**：
    写入节点立即生效，其他边缘节点最长 60 秒后读到新值。单人编辑 + `If-Match`
    乐观锁完全够用；若要求全局强一致，需要改用 Blob 强一致模式并重写存储层。
+
+   > **并发约束（强制，2026-11-16）**：`If-Match` 乐观锁是「读 revision → 比较 → 写」，
+   > KV/Blob 都没有跨节点的原子 CAS。两个管理员若在同一秒内用同一 revision 保存，
+   > 理论上可双写成功、后写覆盖前写（409 只是概率结果）。因此**写接口只允许单人操作**：
+   > 编辑器一次只开一个会话；不要写脚本并发 PUT；自动化下发用 `POST /api/devices`
+   > 的 `push` 动作串行执行。若要支持多人并发编辑，必须迁移到支持条件更新/原子计数
+   > 的存储（如 Tablestore 条件写、带版本号的 KV）并重写 `edge-functions/_lib/storage.js`
+   > 的 `write()`——这不是配置层能解决的，不要在业务代码里加"写前二次读"假装 CAS。
 3. **无状态、无文件系统**：配置和快照全部放 KV；编辑器 HTML/CSS/JS 由构建脚本
    内联成一个字符串常量，因此部署不需要 npm 构建，也不需要把编辑器源码放进静态产物
    （`public/` 里只放 `robots.txt` 让输出目录非空）。
@@ -154,16 +162,16 @@ Blob 是 EdgeOne 的分布式对象存储，**免申请**：首次调用 `getSto
 | `CONFIG_STORAGE` | 可选，`auto`（默认，有 KV 用 KV，否则 Blob）/ `kv` / `blob`。KV 审批期间建议显式写 `blob`，避免日志里反复出现探测失败 |
 | `CONFIG_BLOB_NAMESPACE` | 可选，Blob 命名空间名，默认 `pu_tv_cloud`；不存在时首次写入自动创建 |
 | `CONFIG_CORS_ORIGINS` | 可选；编辑器同源部署留空，跨域时填精确域名（逗号分隔），**不要用 `*`** |
-| `CONFIG_EDITOR_PRELOAD` | 可选，默认 `1`。打开编辑器时把读写令牌与当前域名注入页面，自动预填并自动连接；设 `0`（或 `false` / `off` / `no` / `disabled`）关闭，恢复手动填写 |
+| `CONFIG_EDITOR_PRELOAD` | 可选，**默认 `0`（关闭）**。打开编辑器为手动填写；仅当确认域名不对外传播时才设 `1` 注入读写令牌与域名并自动连接（`false` / `off` / `no` / `disabled` 同为关闭） |
 | `CONFIG_ONLINE_WINDOW_MINUTES` | 可选，默认 `30`。终端在线判定窗口（分钟）；客户端前台约每 15 分钟同步一次配置 |
 
-> **令牌预填的安全边界（务必阅读）**：`CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 在
+> **令牌预填的安全边界（务必阅读）**：预填**默认关闭**，打开编辑器即手动填写，令牌不出现在页面源码。仅显式设 `CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 在
 > 响应编辑器 HTML 时把 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` / 当前域名写成
 > `window.__PURETV_DEFAULTS__` 注入页面（令牌**不写进公开仓库**，响应带
 > `Cache-Control: no-store`）。代价是：**能打开编辑器页面的人可在页面源码里看到写令牌**。
 > 因此不要把编辑器域名公开传播；公开站点请配合访问控制（或反向代理鉴权），
-> 或直接设 `CONFIG_EDITOR_PRELOAD=0` 让使用者手动填写。连接信息的优先级为
-> 「本机 localStorage 改过的值 > 注入默认值 > 空白」，用户改过之后不再被覆盖。
+> 这是公开站点的推荐配置（保持默认关闭）。连接信息的优先级为
+> 「本机改过的值 > 注入默认值 > 空白」；其中写令牌只存 sessionStorage（关闭标签页即失效），读令牌/域名存 localStorage，用户改过之后不再被覆盖。
 
 样例见 [edgeone.env.example](edgeone.env.example)。生成随机 Token：`openssl rand -hex 24`。
 
@@ -219,7 +227,7 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
   -d '{"revision":1}'
 ```
 
-浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器。默认 `CONFIG_EDITOR_PRELOAD=1` 时，
+浏览器打开 `https://YOUR_DOMAIN/` 即在线编辑器。默认需手动填写连接信息；设 `CONFIG_EDITOR_PRELOAD=1` 时，
 右上角三个框**已由服务端预填，且页面加载后自动连接**，通常无需手动操作
 （关闭预填、或本机 localStorage 里改过连接信息时，按下表手动填写并点「连接并加载」）：
 
@@ -251,8 +259,9 @@ curl -X POST https://YOUR_DOMAIN/api/config/rollback \
 - **终端管理**：显示在线 / 离线（`CONFIG_ONLINE_WINDOW_MINUTES`，默认 30 分钟）、
   批量勾选操作、编辑单台终端的完整配置，以及「配置下发」按钮（先保存，再对目标设备
   执行 `push` 生成新 revision）。管理动作共 8 种：`rename` / `comment` / `delete`
-  （软删除，可 `restore`）/ `restore` / `purge`（彻底删除 + 拉黑）/ `unblock` /
-  `reset` / `push`。被 `purge` 拉黑的设备再请求 `/api/config` 返回 `403 device_blocked`。
+  （软删除，可 `restore`）/ `restore` / `purge`（彻底删除注册项，**不拉黑**）/ `block`（拉黑）/
+  `unblock` / `reset` / `push`。被 `block` 拉黑的设备再请求 `/api/config` 返回 `403 device_blocked`；
+  `purge` 删除后设备再次上线会重新登记。
 
 ### 5. 全局资源库：「IPTV 源」「TVBox 源」两个页签（设备没上线也能先建）
 
@@ -372,12 +381,12 @@ python scripts/build_fc_package.py
 
 | 类别 | 新增 | 说明 |
 |---|---|---|
-| 环境变量 | `CONFIG_EDITOR_PRELOAD=1` | 编辑器连接信息自动预填 + 自动连接；设 `0` 关闭。安全边界见第 2 步 |
+| 环境变量 | `CONFIG_EDITOR_PRELOAD=0`（默认） | 编辑器连接信息默认手动填写；设 `1` 才预填 + 自动连接。安全边界见第 2 步 |
 | 环境变量 | `CONFIG_ONLINE_WINDOW_MINUTES=30` | 终端在线判定窗口（分钟） |
 | 接口 | `POST /api/iptv/fetch` | **写令牌**；一次最多 10 个公网 http(s) 订阅地址，单源 2 MiB / 10s，手动跟随最多 3 跳重定向且逐跳复核 SSRF，UTF-8 / GBK 自动识别。仅 EdgeOne，FC 版无此接口 |
 | 接口 | `GET /api/devices` | 返回 `{devices,total,online,blocked,onlineWindowMinutes}`；每台带 `online` / `status` / `lastSeenAgo` / `hidden` / `blocked` / `comment` / `pushedAt` / `pushedRevision` |
-| 接口 | `POST /api/devices` | 8 种动作 `rename` / `comment` / `delete` / `restore` / `purge` / `unblock` / `reset` / `push`；单台或批量（去重≤50）；响应 `{action,total,failed,results}`，单台失败不影响其它台 |
-| 错误码 | `403 device_blocked` | 被 `purge` 拉黑的设备请求 `/api/config` 被拒 |
+| 接口 | `POST /api/devices` | 动作 `rename` / `comment` / `delete` / `restore` / `purge`（删除不拉黑）/ `block`（拉黑）/ `unblock` / `reset` / `push`；单台或批量（去重≤50）；响应 `{action,total,failed,results}`，单台失败不影响其它台 |
+| 错误码 | `403 device_blocked` | 被 `block` 拉黑的设备请求 `/api/config` 被拒（删除不会拉黑） |
 | 契约 | `navigation.groups` / `defaultGroupId` | 三大类一级栏（`iptv` / `vod` / `settings`）+ 右侧二级菜单（`iptv` / `vodBrowse` / `moviePlayback`）；最多 8 组，默认 `iptv`；直播平台节 `sites` 已下线 |
 | 契约 | `startup.exitDialog` | 退出 App 弹窗，云端下发；`enabled=false` 时终端沿用本地原弹窗 |
 | 契约 | `iptv.packages` / `selectedPackageIds` | 最多 12 个套餐、频道总预算 5000、展开后 `channels` 上限 3000 |

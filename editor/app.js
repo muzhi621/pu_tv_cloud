@@ -7,7 +7,7 @@ const state = {
   writeToken: '',     // 写令牌：PUT /api/config、POST rollback；留空时回退读令牌
   deviceId: '',       // 空 = 全局模板；非空 = 某台终端的独立配置
   devices: [],        // 上线终端注册表
-  blocked: [],        // 已拉黑（彻底删除）的设备 id
+  blocked: [],        // 已拉黑的设备 id（与「删除」无关，需单独 block/unblock）
   onlineWindow: 30,   // 云端在线判定窗口（分钟）
   deviceStatusError: '', // 顶部常驻状态条的最近一次读取错误
   showHiddenDevices: false,
@@ -1323,6 +1323,9 @@ function renderDevices() {
 
   return '<h2>上线终端 · ' + online + ' 台在线 / ' + state.devices.length + ' 台已连接</h2>'
     + '<p class="hint">所有连接过的设备都会登记在这里。'
+    + '<b>「删除」只移除注册项，不会拉黑</b>，设备再次上线会重新出现；'
+    + '<b>「拉黑」才会拒绝它上线</b>（终端请求配置返回 403），可随时解除。'
+    + '「移除」只是暂时隐藏，用「恢复」找回来。'
     + '云端以「最后上线距今 ≤ ' + esc(state.onlineWindow) + ' 分钟」判定在线。'
     + '<b>日常只需要在「套餐」列里选一个套餐</b>：选完立即下发，终端约 3 分钟内同步生效。'
     + '没绑套餐的终端沿用「全局模板」的独立配置，改模板不会影响已登记设备。'
@@ -1370,7 +1373,8 @@ async function deviceAction(action, ids, extra = {}) {
     body.alias = input ? input.value.trim() : '';
   }
   if (action === 'purge' && !window.confirm(
-    '彻底删除 ' + list.length + ' 台设备？会移除注册项并拉黑，终端再上线将被拒绝。可在下方「已拉黑」里解除。')) return;
+    '删除 ' + list.length + ' 台设备？只会移除注册项，不会拉黑；终端再次上线会重新登记。'
+    + '若想让它无法再上线，请点「拉黑」。')) return;
   if (action === 'reset' && !window.confirm(
     '把 ' + list.length + ' 台设备的配置重置为当前全局模板？会各生成一个新 revision。')) return;
   try {
@@ -2787,7 +2791,10 @@ async function reloadAll() {
   if (!state.base) { message('请先填写 API 地址（留空表示同源部署）。', 'err'); return; }
   localStorage.setItem('purelive_config_base', state.base);
   localStorage.setItem('purelive_config_token', state.token);
-  localStorage.setItem('purelive_config_write_token', state.writeToken);
+  // 写令牌只存会话：关闭标签页即失效，缩小 XSS / 恶意扩展的窃取窗口。
+  // 同时清理历史版本遗留在 localStorage 的写令牌（键名保持不变，见项目约定）。
+  sessionStorage.setItem('purelive_config_write_token', state.writeToken);
+  localStorage.removeItem('purelive_config_write_token');
   clearMessage();
   statusText('正在连接…');
   try {
@@ -2813,7 +2820,8 @@ async function load() {
   syncConnection();
   localStorage.setItem('purelive_config_base', state.base);
   localStorage.setItem('purelive_config_token', state.token);
-  localStorage.setItem('purelive_config_write_token', state.writeToken);
+  sessionStorage.setItem('purelive_config_write_token', state.writeToken);
+  localStorage.removeItem('purelive_config_write_token');
   statusText('正在连接…');
   try {
     const health = await request('/health');
@@ -3055,10 +3063,17 @@ document.addEventListener('DOMContentLoaded', () => {
   // 连接信息优先级：本机改过（localStorage）> 服务端注入的默认值 > 空白。
   // 默认值由 EdgeOne 环境变量在响应页面时注入，不写进公开仓库。
   const injected = window.__PURETV_DEFAULTS__ || null;
+  // 历史版本把写令牌落在 localStorage；这里一次性迁到 sessionStorage 并清除旧值，
+  // 之后所有写令牌只读会话存储，避免长期驻留浏览器。
+  const legacyWriteToken = localStorage.getItem('purelive_config_write_token');
+  if (legacyWriteToken !== null) {
+    sessionStorage.setItem('purelive_config_write_token', legacyWriteToken);
+    localStorage.removeItem('purelive_config_write_token');
+  }
   const saved = {
     base: localStorage.getItem('purelive_config_base'),
     token: localStorage.getItem('purelive_config_token'),
-    writeToken: localStorage.getItem('purelive_config_write_token'),
+    writeToken: sessionStorage.getItem('purelive_config_write_token'),
   };
   const hasSaved = saved.base !== null || saved.token !== null || saved.writeToken !== null;
   let autoConnect = false;

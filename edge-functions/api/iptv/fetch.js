@@ -48,10 +48,11 @@ function blockedIpv6(host) {
   if (value === '::1' || value === '::') return true;
   if (/^f[cd]/.test(value)) return true;                   // fc00::/7
   if (/^fe[89ab]/.test(value)) return true;                // fe80::/10
-  if (value.startsWith('::ffff:')) {
-    const tail = value.slice(7);
-    return blockedIpv4(tail) || tail.startsWith('127.') || tail.startsWith('10.');
-  }
+  // IPv4-mapped（::ffff:a.b.c.d）经 new URL() 后会被规范化成十六进制压缩形式：
+  // ::ffff:127.0.0.1 → ::ffff:7f00:1，::ffff:169.254.169.254 → ::ffff:a9fe:a9fe。
+  // 原来的点分十进制判断对这两种形式完全失效，等于给云元数据地址开了后门。
+  // 订阅业务没有访问映射地址的正当理由，直接整体拒绝（含未压缩的 0:0:0:0:0:ffff: 前缀）。
+  if (/^(::ffff:|0+:0+:0+:0+:0+:ffff:)/.test(value)) return true;
   return false;
 }
 
@@ -69,8 +70,13 @@ export function checkFetchUrl(raw) {
   if (parsed.username || parsed.password) {
     return { ok: false, reason: '不允许带账号密码的 URL' };
   }
-  const host = parsed.hostname.toLowerCase();
-  if (PRIVATE_HOST_RE.test(host) || blockedIpv4(host) || blockedIpv6(host)) {
+  // FQDN 尾点会让 "$" 锚定的正则与「无点号短主机名」兜底双双失效：
+  // new URL('http://localhost./').hostname === 'localhost.'。必须先去尾点再判。
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  // 显式拒绝 localhost 与 *.localhost（RFC 6761 规定二者都解析到环回），
+  // 不依赖正则的 /\./ 分支，避免后续调整正则时再漏。
+  if (host === 'localhost' || host.endsWith('.localhost')
+      || PRIVATE_HOST_RE.test(host) || blockedIpv4(host) || blockedIpv6(host)) {
     return { ok: false, reason: '禁止访问内网 / 环回地址' };
   }
   if (parsed.port && DANGEROUS_PORTS.has(Number(parsed.port))) {

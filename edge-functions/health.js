@@ -4,7 +4,12 @@ import { describeStorage, read } from './_lib/storage.js';
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
-    const devMode = !(env.CONFIG_READ_TOKEN || '').trim();
+    // devMode 保留兼容字段（读令牌缺失即开发模式）；另分别暴露两侧是否已受保护，
+    // 避免"只配了写令牌"时被误报成 devMode:true 误导运维判断。
+    const readProtected = !!(env.CONFIG_READ_TOKEN || '').trim();
+    const writeProtected = !!(env.CONFIG_WRITE_TOKEN || '').trim();
+    const devMode = !readProtected;
+    const auth = { devMode, readProtected, writeProtected };
     const storage = await describeStorage(env);
 
     if (!storage.ok) {
@@ -14,7 +19,7 @@ export async function onRequestGet(context) {
           status: 'degraded',
           revision: null,
           backend: 'none',
-          devMode,
+          ...auth,
           storageError: storage.error,
         },
       });
@@ -27,7 +32,7 @@ export async function onRequestGet(context) {
         status: 'ok',
         revision: document.revision,
         backend: storage.backend,
-        devMode,
+        ...auth,
       },
     });
   });

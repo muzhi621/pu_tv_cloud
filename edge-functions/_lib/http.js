@@ -84,9 +84,40 @@ export function requireAuth(request, env, scope) {
 }
 
 export async function readJsonBody(request) {
-  const raw = await request.text();
+  const MAX = 2 * 1024 * 1024;
+  // 先看声明长度，超限时在物化请求体之前就拒绝，避免超大 body 在边缘运行时
+  // 内存里驻留（FC 版 cloud/app.py 也是先查 CONTENT_LENGTH，两端对齐）。
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > MAX) throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
+
+  let raw = '';
+  // 流式累加：每块都检查，超阈值立即中断读取，不把整个超大 body 读进内存。
+  // 某些运行时请求体是空流（见 fetch.js 的 readLimited 注释），流读取拿不到
+  // 内容时回退到 text()——此时 declared 已校验过，兜底路径仍有上限保护。
+  let streamed = false;
+  if (request.body && typeof request.body.getReader === 'function') {
+    const reader = request.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || !value.length) continue;
+        bytes += value.length;
+        if (bytes > MAX) throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
+        raw += decoder.decode(value, { stream: true });
+      }
+      raw += decoder.decode();
+      streamed = raw.length > 0;
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      raw = ''; // 触发下面的 text() 兜底
+    }
+  }
+  if (!streamed) raw = await request.text();
   if (!raw) throw new ConfigError('请求体不能为空');
-  if (new TextEncoder().encode(raw).length > 2 * 1024 * 1024) {
+  if (new TextEncoder().encode(raw).length > MAX) {
     throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
   }
   let value;

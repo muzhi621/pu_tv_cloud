@@ -47,6 +47,9 @@ jobs:
       - name: 配置 JSON 可解析性
         run: python -c "import json,pathlib; [json.loads(p.read_text(encoding='utf-8')) for p in pathlib.Path('config').glob('*.json')]"
 
+      - name: FC / EdgeOne 契约常量一致性
+        run: python scripts/check_contract_parity.py
+
       - name: 单元测试（Python / FC 实现）
         run: python -m unittest discover -s tests -v
 

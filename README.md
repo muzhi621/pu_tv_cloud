@@ -40,7 +40,7 @@ edge-functions/         ★ Edge Functions（ES2023+，唯一运行时依赖 @ed
   api/config/           GET/PUT config、catalog、revisions、rollback（均支持 deviceId 隔离）
   api/library/          GET/PUT 全局资源库（IPTV 源/套餐 + TVBox 源/站点，独立于设备文档）
   api/devices/          GET 注册表（在线/离线）；POST 改名 / 重置 / 软删 / 恢复 /
-                        彻底删除并拉黑 / 解绑 / 显式下发，支持 deviceIds 批量
+                        彻底删除（不拉黑）/ 拉黑 / 解绑 / 显式下发，支持 deviceIds 批量
   api/iptv/fetch.js     POST 云端代抓订阅（SSRF 防护、UTF-8/GBK 自动识别）
   _lib/                 contract.js（六节契约 + 套餐/库展开 + GET 轻量视图）/ storage.js
                         （KV/Blob 双后端 + 全局模板 + 每设备独立文档 + 全局资源库 +
@@ -99,7 +99,7 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
      默认命名空间 `pu_tv_cloud` 自动创建。KV 未绑定时服务**自动走 Blob**，不用改代码。
 2. 创建项目页展开「**环境变量**」，填 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN`
    （**必须先填再点开始部署**，环境变量变更只对之后的部署生效）。
-   可选：`CONFIG_EDITOR_PRELOAD=1`（默认，自动预填编辑器三个连接框）、
+   可选：`CONFIG_EDITOR_PRELOAD=1`（默认关闭；设 1 才自动预填编辑器连接框）、
    `CONFIG_ONLINE_WINDOW_MINUTES=30`（在线判定窗口）、`CONFIG_CORS_ORIGINS`（跨域时）。
 3. 「从 Git 导入」选 `muzhi621/pu_tv_cloud`、生产分支 `main` → 开始部署。
    安装命令由 `edgeone.json` 设为 `npm install`，用于装 Blob SDK（部署因此多花十几秒）。
@@ -113,10 +113,11 @@ sh scripts/run_local.sh                       # Python 版，默认 http://127.0
 完整步骤、验证 curl、终端接入与排错见 [docs/DEPLOY_EDGEONE.md](docs/DEPLOY_EDGEONE.md)，
 目录约定见 [docs/EDGEONE_LAYOUT.md](docs/EDGEONE_LAYOUT.md)。
 
-浏览器打开项目域名根路径即编辑器，**三个连接框会自动填好并直接连上**：API 地址取当前
-域名，两个令牌由 Edge Function 从 `CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` 注入，
-**不写进公开仓库**。设 `CONFIG_EDITOR_PRELOAD=0` 可恢复手动填写；注意能访问该页面的人
-可在源码里看到写令牌，请勿公开传播编辑器域名。右上「配置对象」下拉可选**全局模板**或
+浏览器打开项目域名根路径即编辑器，**默认手动填写**连接信息（API 地址取当前域名，
+令牌自行填入）。仅显式设 `CONFIG_EDITOR_PRELOAD=1` 时，Edge Function 才会从
+`CONFIG_READ_TOKEN` / `CONFIG_WRITE_TOKEN` 注入预填并自动连接（令牌**不写进公开仓库**）；
+此时能打开该页面的人可在源码里看到写令牌，请勿公开传播编辑器域名。写令牌在前端只存
+sessionStorage（关闭标签页即失效）。右上「配置对象」下拉可选**全局模板**或
 **任意已上线终端**；首次访问自动写入 `seed.json` 的副本（revision 0，六节全部
 `managed:false`）。**生产环境务必配置两个 Token**；都为空时服务处于开发模式，接口不鉴权。
 

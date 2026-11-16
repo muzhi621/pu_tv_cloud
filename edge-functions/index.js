@@ -9,8 +9,10 @@
  * CONFIG_READ_TOKEN / CONFIG_WRITE_TOKEN 本来就是部署时必填的环境变量，
  * 这里复用来预填编辑器的三个输入框，打开页面即可直接「连接并加载」。
  *
- * 安全边界：能访问本页的人可在源码里看到写令牌。请不要把编辑器域名公开传播；
- * 如需关闭预填，在控制台设置 CONFIG_EDITOR_PRELOAD=0（页面恢复为手动填写）。
+ * 安全边界（2026-11-16 收紧）：能访问本页的人会在源码里看到令牌，因此预填
+ * **默认关闭**——打开页面是空白输入框，需手动填写。仅当运营确认编辑器域名
+ * 不对外传播时，才显式设置 CONFIG_EDITOR_PRELOAD=1 开启预填（兼容旧部署）。
+ * 前端另把写令牌存进 sessionStorage（关闭标签页即失效），不落 localStorage。
  * 响应带 Cache-Control: no-store，避免 CDN 把带令牌的页面缓存给其他访客。
  */
 import { EDITOR_HTML } from './_lib/editor.js';
@@ -20,7 +22,9 @@ const OFF_VALUES = ['0', 'false', 'off', 'no', 'disabled'];
 
 /** 返回要预填的连接信息；关闭开关或未配置令牌时返回 null。 */
 export function preloadDefaults(env, request) {
-  const flag = String(env.CONFIG_EDITOR_PRELOAD ?? '1').trim().toLowerCase();
+  // 默认关闭：安全优先，避免编辑器域名被打开即泄露写令牌。
+  // 旧部署若依赖预填，需显式配置 CONFIG_EDITOR_PRELOAD=1。
+  const flag = String(env.CONFIG_EDITOR_PRELOAD ?? '0').trim().toLowerCase();
   if (OFF_VALUES.includes(flag)) return null;
   const readToken = String(env.CONFIG_READ_TOKEN || '').trim();
   const writeToken = String(env.CONFIG_WRITE_TOKEN || '').trim();

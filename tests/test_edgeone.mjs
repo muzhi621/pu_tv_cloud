@@ -22,7 +22,7 @@ import {
   onRequestGet as bundlesGet, onRequestPut as bundlesPut,
 } from '../edge-functions/api/bundles/index.js';
 import {
-  onRequestGet as assetsGet, onRequestPost as assetsPost,
+  onRequestGet as assetsGet, onRequestPost as assetsPost, sniffImageType,
 } from '../edge-functions/api/assets/index.js';
 import {
   onRequestGet as editorGet, preloadDefaults, injectDefaults,
@@ -73,6 +73,20 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(data.status, 'ok');
     assert.equal(data.backend, 'edgeone-kv');
     assert.equal(data.revision, 0);
+    assert.equal(data.devMode, true);
+    assert.equal(data.readProtected, false);
+    assert.equal(data.writeProtected, false);
+  });
+
+  // 回归（2026-11-16 审查 #3 细节）：只配写令牌时 devMode 曾误报 true。
+  await t.test('health 分别暴露读写令牌保护状态', async () => {
+    const res = await healthGet(ctx('GET', '/health', {
+      env: { CONFIG_WRITE_TOKEN: 'w' },
+    }));
+    const data = await json(res);
+    assert.equal(data.readProtected, false);
+    assert.equal(data.writeProtected, true);
+    // devMode 兼容字段仍表示"读接口未保护"，写令牌状态看 writeProtected。
     assert.equal(data.devMode, true);
   });
 
@@ -468,10 +482,15 @@ test('IPTV 节：解析结果校验、去重与协议白名单', async (t) => {
 });
 
 test('编辑器连接信息由环境变量注入，且不写进仓库文件', async (t) => {
-  const env = { CONFIG_READ_TOKEN: 'READ-TOKEN', CONFIG_WRITE_TOKEN: 'WRITE-TOKEN' };
+  // 2026-11-16 起预填默认关闭：必须显式 CONFIG_EDITOR_PRELOAD=1 才注入令牌，
+  // 避免「打开编辑器域名即在源码看到写令牌」。旧部署需显式开启。
+  const env = {
+    CONFIG_READ_TOKEN: 'READ-TOKEN', CONFIG_WRITE_TOKEN: 'WRITE-TOKEN',
+    CONFIG_EDITOR_PRELOAD: '1',
+  };
   const req = new Request('https://tv.example.com/');
 
-  await t.test('预填值与自动连接开关', () => {
+  await t.test('预填值与自动连接开关（显式开启后）', () => {
     const defaults = preloadDefaults(env, req);
     assert.equal(defaults.base, 'https://tv.example.com');
     assert.equal(defaults.readToken, 'READ-TOKEN');
@@ -479,6 +498,11 @@ test('编辑器连接信息由环境变量注入，且不写进仓库文件', as
     assert.equal(defaults.autoConnect, true);
     assert.equal(preloadDefaults({ ...env, CONFIG_EDITOR_PRELOAD: '0' }, req), null);
     assert.equal(preloadDefaults({}, req), null);
+  });
+
+  await t.test('预填默认关闭：仅配置令牌不注入', () => {
+    const tokenOnly = { CONFIG_READ_TOKEN: 'READ-TOKEN', CONFIG_WRITE_TOKEN: 'WRITE-TOKEN' };
+    assert.equal(preloadDefaults(tokenOnly, req), null);
   });
 
   await t.test('注入脚本转义 < ，不会闭合 script 标签', () => {
@@ -516,6 +540,40 @@ test('IPTV 云端代理：SSRF 防护、编码识别与失败隔离', async (t) 
     }
     assert.equal(checkFetchUrl('https://example.com/list.m3u').ok, true);
     assert.equal(checkFetchUrl('http://example.com:8080/a.txt').ok, true);
+  });
+
+  // 回归（2026-11-16 审查 #1）：FQDN 尾点与 *.localhost 曾绕过 "$" 锚定的正则。
+  // new URL() 会保留尾点（hostname === 'localhost.'），而兜底的「无点号即拒绝」
+  // 对含点的 localhost. 不生效，导致 http://localhost./ 被判为公网地址。
+  await t.test('拒绝 FQDN 尾点与 *.localhost 变体', () => {
+    const blocked = [
+      'http://localhost./x', 'http://LOCALHOST./x', 'http://localhost../x',
+      'http://a.localhost./x', 'http://foo.localhost/x', 'http://nas.local./list.m3u',
+      'http://internal./x',
+    ];
+    for (const url of blocked) {
+      assert.equal(checkFetchUrl(url).ok, false, `${url} 应被拒绝`);
+    }
+    // 正常带尾点的公网域名不应被误伤。
+    assert.equal(checkFetchUrl('http://example.com./list.m3u').ok, true);
+  });
+
+  // 回归（2026-11-16 审查 #2）：IPv4-mapped IPv6 的十六进制压缩形式。
+  // new URL() 把 ::ffff:127.0.0.1 规范化成 ::ffff:7f00:1，把云元数据地址
+  // ::ffff:169.254.169.254 规范化成 ::ffff:a9fe:a9fe，原点分十进制判断全部漏掉。
+  await t.test('拒绝 IPv4-mapped IPv6 的十六进制形式', () => {
+    const blocked = [
+      'http://[::ffff:127.0.0.1]/x', 'http://[::ffff:10.0.0.1]/x',
+      'http://[::ffff:192.168.1.1]/x', 'http://[::ffff:169.254.169.254]/x',
+      'http://[0:0:0:0:0:ffff:7f00:1]/x', 'http://[::ffff:7f00:1]/x',
+      'http://[::ffff:a9fe:a9fe]/x',
+    ];
+    for (const url of blocked) {
+      assert.equal(checkFetchUrl(url).ok, false, `${url} 应被拒绝`);
+    }
+    // 字面量 IPv6 本地地址原本就在拦截列表，确认没被本次改动影响。
+    assert.equal(checkFetchUrl('http://[::1]/x').ok, false);
+    assert.equal(checkFetchUrl('http://[2606:4700:4700::1111]/x').ok, true);
   });
 
   await t.test('UTF-8 与 GBK 自动识别', () => {
@@ -968,17 +1026,16 @@ test('终端在线状态、软删除 / 拉黑 / 解绑与显式下发', async (t
     assert.equal(restored.results[0].hidden, false);
   });
 
-  await t.test('彻底删除并拉黑：终端 403，解绑后恢复', async () => {
+  await t.test('彻底删除只移除注册项，不拉黑；终端可重新登记', async () => {
     const purged = await json(await post({ action: 'purge', deviceId: 'tv-a' }));
     assert.equal(purged.results[0].purged, true);
+    assert.notEqual(purged.results[0].blocked, true, '删除不应写黑名单');
     const data = await list();
     assert.equal(data.total, 0);
-    assert.deepEqual(data.blocked, ['tv-a']);
-    const denied = await configGet(ctx('GET', '/api/config?deviceId=tv-a', { env }));
-    assert.equal(denied.status, 403);
-    assert.equal((await json(denied)).error, 'device_blocked');
-    await post({ action: 'unblock', deviceId: 'tv-a' });
-    assert.equal((await configGet(ctx('GET', '/api/config?deviceId=tv-a', { env }))).status, 200);
+    assert.deepEqual(data.blocked, [], '删除不应把设备拉黑');
+    // 没被拉黑 → 终端再拉配置会重新登记，且不再 403。
+    const again = await configGet(ctx('GET', '/api/config?deviceId=tv-a', { env }));
+    assert.equal(again.status, 200);
     assert.equal((await list()).total, 1);
   });
 
@@ -2091,6 +2148,22 @@ test('二维码图片：上传后可公开读取，非法输入被拒', async (t
     assert.ok(bytes.length > 0);
     // PNG magic
     assert.deepEqual([...bytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+    // 公开读取接口必须带 nosniff + CSP，防止伪装内容被当 HTML/JS 执行。
+    assert.equal(img.headers.get('X-Content-Type-Options'), 'nosniff');
+    assert.match(img.headers.get('Content-Security-Policy'), /default-src 'none'/);
+  });
+
+  // 回归（2026-11-16 审查 #5）：只校验声明 MIME 可被绕过——把 HTML 以
+  // image/png 名义上传即成存储型 XSS。现在按解码后文件头核对真实类型。
+  await t.test('魔数与声明类型不符的伪装图片被拒', () => {
+    const html = new TextEncoder().encode('<script>alert(1)</script>');
+    assert.equal(sniffImageType(html), '');
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    assert.equal(sniffImageType(png), 'image/png');
+    const htmlB64 = Buffer.from(html).toString('base64');
+    return assetsPost(ctx('POST', '/api/assets', {
+      env, body: { data: 'data:image/png;base64,' + htmlB64 },
+    })).then((res) => assert.equal(res.status, 400));
   });
 
   await t.test('裸 base64 + contentType 也能上传', async () => {
@@ -2115,6 +2188,27 @@ test('二维码图片：上传后可公开读取，非法输入被拒', async (t
   await t.test('不存在的 id 返回 404，非法 id 也不报错', async () => {
     assert.equal((await assetsGet(ctx('GET', '/api/assets?id=as_00000000', { env }))).status, 404);
     assert.equal((await assetsGet(ctx('GET', '/api/assets?id=../../etc/passwd', { env }))).status, 404);
+  });
+
+  // 回归（2026-11-16 审查缺口 B）：此前上传用例全走 devMode，没有真正验证写鉴权。
+  await t.test('配置令牌后缺写令牌的上传返回 401', async () => {
+    const guardedEnv = { CONFIG_READ_TOKEN: 'read', CONFIG_WRITE_TOKEN: 'write-secret' };
+    const noAuth = await assetsPost(ctx('POST', '/api/assets', {
+      env: guardedEnv, body: { data: 'data:image/png;base64,' + PNG },
+    }));
+    assert.equal(noAuth.status, 401);
+    const wrongAuth = await assetsPost(ctx('POST', '/api/assets', {
+      env: guardedEnv,
+      headers: { Authorization: 'Bearer wrong' },
+      body: { data: 'data:image/png;base64,' + PNG },
+    }));
+    assert.equal(wrongAuth.status, 401);
+    const okAuth = await assetsPost(ctx('POST', '/api/assets', {
+      env: guardedEnv,
+      headers: { Authorization: 'Bearer write-secret' },
+      body: { data: 'data:image/png;base64,' + PNG },
+    }));
+    assert.equal(okAuth.status, 200);
   });
 });
 
@@ -2148,5 +2242,19 @@ test('终端管理：拉黑保留记录并拒绝配置请求', async (t) => {
     await devicesPost(ctx('POST', '/api/devices', { env, body: { action: 'unblock', deviceId: 'tv-x' } }));
     const res = await configGet(ctx('GET', '/api/config?deviceId=tv-x', { env }));
     assert.equal(res.status, 200);
+  });
+
+  await t.test('删除已拉黑设备：记录移除，黑名单仍在（两件事独立）', async () => {
+    await devicesPost(ctx('POST', '/api/devices', { env, body: { action: 'block', deviceId: 'tv-x' } }));
+    const res = await devicesPost(ctx('POST', '/api/devices', {
+      env, body: { action: 'purge', deviceId: 'tv-x' },
+    }));
+    const data = await json(res);
+    assert.equal(data.results[0].purged, true);
+    const list = await json(await devicesGet(ctx('GET', '/api/devices', { env })));
+    assert.ok(!list.devices.some((item) => item.id === 'tv-x'), '注册项应移除');
+    assert.ok(list.blocked.includes('tv-x'), '黑名单应保留，删除不解除拉黑');
+    assert.equal((await configGet(ctx('GET', '/api/config?deviceId=tv-x', { env }))).status, 403);
+    await devicesPost(ctx('POST', '/api/devices', { env, body: { action: 'unblock', deviceId: 'tv-x' } }));
   });
 });
