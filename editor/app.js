@@ -2356,6 +2356,41 @@ function dfText(path, label, type) {
     + esc(value == null ? '' : value) + '"></label>';
 }
 
+function dfTextArea(path, label, rows) {
+  const value = getPath(state.doc.sections, path);
+  return '<label class="df-field"><span>' + esc(label) + '</span>'
+    + '<textarea rows="' + (rows || 3) + '" data-df="' + esc(path) + '">'
+    + esc(value == null ? '' : value) + '</textarea></label>';
+}
+
+/**
+ * 开机公告的终端弹窗实时预览：只展示中文文案，终端实际按系统 locale 选 zh/en。
+ * 用 aria-live 让读屏软件在编辑时也能感知内容变化。
+ */
+function noticePreviewHtml() {
+  const title = String(getPath(state.doc.sections, 'startup.notice.titleI18n.zh') || '').trim();
+  const body = String(getPath(state.doc.sections, 'startup.notice.bodyI18n.zh') || '').trim();
+  return '<div class="notice-preview" aria-live="polite">'
+    + '<div class="np-label">终端弹窗预览（中文）</div>'
+    + '<div class="np-dialog">'
+    + '<div class="np-title" id="npTitle">'
+    + (title ? esc(title) : '<span class="muted">公告（默认标题）</span>') + '</div>'
+    + '<div class="np-body" id="npBody">'
+    + (body ? esc(body) : '<span class="muted">标题与正文都留空时，终端不会弹出公告。</span>') + '</div>'
+    + '<div class="np-actions"><span>知道了</span></div>'
+    + '</div></div>';
+}
+
+function syncNoticePreview() {
+  const title = $('npTitle');
+  const body = $('npBody');
+  if (!title || !body) return;
+  const t = String(getPath(state.doc.sections, 'startup.notice.titleI18n.zh') || '').trim();
+  const b = String(getPath(state.doc.sections, 'startup.notice.bodyI18n.zh') || '').trim();
+  title.innerHTML = t ? esc(t) : '<span class="muted">公告（默认标题）</span>';
+  body.innerHTML = b ? esc(b) : '<span class="muted">标题与正文都留空时，终端不会弹出公告。</span>';
+}
+
 function dfSelect(path, label, options) {
   const current = String(getPath(state.doc.sections, path) == null
     ? '' : getPath(state.doc.sections, path));
@@ -2567,6 +2602,12 @@ function sectionsFormHtml() {
     + dfCheck('startup.notice.enabled', '启用公告')
     + dfCheck('startup.notice.dismissible', '允许关闭')
     + dfSelect('startup.notice.mode', '显示频率', noticeModes)
+    + dfText('startup.notice.titleI18n.zh', '公告标题（中文）')
+    + dfText('startup.notice.titleI18n.en', '公告标题（英文）')
+    + dfTextArea('startup.notice.bodyI18n.zh', '公告正文（中文）')
+    + dfTextArea('startup.notice.bodyI18n.en', '公告正文（英文）')
+    + '<p class="meta">终端按系统语言选择中文/英文文案；标题与正文都留空时不弹公告。</p>'
+    + noticePreviewHtml()
     + '</div>'
 
     + '<div class="df-block"><h3>退出 App 弹窗</h3>'
@@ -2575,7 +2616,7 @@ function sectionsFormHtml() {
     + dfCheck('startup.exitDialog.showDonate', '显示捐赠二维码')
     + dfSelect('startup.exitDialog.mode', '显示频率', noticeModes)
     + dfText('startup.exitDialog.titleI18n.zh', '标题（中文）', 'text')
-    + dfText('startup.exitDialog.bodyI18n.zh', '正文（中文）', 'text')
+    + dfTextArea('startup.exitDialog.bodyI18n.zh', '正文（中文）', 3)
     + qrImageField()
     + dfText('startup.exitDialog.qrCaptionI18n.zh', '二维码下方标题（中文）', 'text')
     + dfText('startup.exitDialog.donateBodyI18n.zh', '捐赠说明（中文）', 'text')
@@ -2670,7 +2711,9 @@ function render() {
   const devBadge = $('devBadge');
   if (devBadge) devBadge.hidden = !state.devMode;
   Array.prototype.forEach.call(document.querySelectorAll('#tabs button'), (button) => {
-    button.classList.toggle('active', button.dataset.tab === state.activeTab);
+    const active = button.dataset.tab === state.activeTab;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
   });
   renderPanel();
   renderExtra();
@@ -2940,6 +2983,8 @@ function applyDfControl(target) {
     else value = target.value;
     setPath(state.doc.sections, target.dataset.df, value);
     markDirty();
+    // 公告文案改动即时反映到预览，不整页重绘（避免输入框失焦）。
+    if (target.dataset.df.indexOf('startup.notice.') === 0) syncNoticePreview();
     return true;
   }
   if (target.dataset.dfMulti) {

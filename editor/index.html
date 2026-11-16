@@ -33,21 +33,21 @@
       <button id="btnReload" class="ghost">刷新数据</button>
     </section>
 
-    <nav class="tabs" id="tabs">
-      <button data-tab="bundles" class="active">套餐管理</button>
-      <button data-tab="iptv-lib">IPTV 源</button>
-      <button data-tab="vod-lib">TVBox 源</button>
-      <button data-tab="devices">终端管理</button>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="配置分区">
+      <button data-tab="bundles" class="active" role="tab" aria-selected="true">套餐管理</button>
+      <button data-tab="iptv-lib" role="tab" aria-selected="false">IPTV 源</button>
+      <button data-tab="vod-lib" role="tab" aria-selected="false">TVBox 源</button>
+      <button data-tab="devices" role="tab" aria-selected="false">终端管理</button>
     </nav>
 
-    <section id="panel" class="panel"></section>
+    <section id="panel" class="panel" role="tabpanel"></section>
 
     <section id="extra" class="extra" hidden></section>
 
-    <section id="message" class="message" hidden></section>
+    <section id="message" class="message" role="status" aria-live="polite" hidden></section>
   </main>
 
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/app.js"></script>
 </body>
 </html>
