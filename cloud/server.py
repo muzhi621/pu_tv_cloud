@@ -24,7 +24,7 @@ class QuietHandler:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="纯粹直播 TV 云端配置服务")
+    parser = argparse.ArgumentParser(description="SUTV 云端配置服务")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("FC_SERVER_PORT")
