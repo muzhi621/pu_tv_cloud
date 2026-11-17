@@ -3090,3 +3090,155 @@ test('在线更新：APK 直传 Blob、完工校验、公开下载', async (t) =
     assert.equal(gone.status, 404);
   });
 });
+
+/**
+ * IPTV 套餐两级结构：分组（引用源）→ 频道。
+ *
+ * 这是终端频道列表的唯一来源，几条不变量必须守住：
+ *   - 库里的套餐只存分组，不再重复存一份扁平 channels（900 KB 上限）；
+ *   - 分组引用的源被删掉时保留频道，只把来源置空（删源不该掏空套餐）；
+ *   - 展开给终端的频道顺序 = 分组顺序 + 组内顺序，channel.group = 分组名。
+ */
+test('IPTV 套餐分组：两级结构的校验、展开与容错', async (t) => {
+  const source = { id: 's_11112222', name: '央视源', url: 'https://a.example/cctv.m3u' };
+
+  await t.test('库套餐：分组保留、扁平 channels 清空、来源由分组推导', () => {
+    const [library, warnings] = normalizeLibrary({
+      iptv: {
+        sources: [source],
+        packages: [{
+          id: 'pkg_aaaabbbb',
+          name: '家庭版',
+          groups: [
+            {
+              id: 'g_00000001',
+              name: '央视',
+              sourceId: 's_11112222',
+              channels: [
+                { name: 'CCTV1', url: 'http://a.example/1.ts' },
+                { name: 'CCTV1', url: 'http://a.example/1.ts' },
+              ],
+            },
+            {
+              id: 'g_00000002',
+              name: '卫视',
+              sourceId: '',
+              channels: [{ name: '湖南卫视', url: 'http://a.example/hn.ts', group: '随便写的' }],
+            },
+          ],
+        }],
+      },
+    });
+    const pkg = library.iptv.packages[0];
+    assert.equal(pkg.groups.length, 2);
+    // 组内去重 + 强制把 group 写成分组名
+    assert.deepEqual(pkg.groups[0].channels.map((c) => c.url), ['http://a.example/1.ts']);
+    assert.equal(pkg.groups[0].channels[0].group, '央视');
+    assert.equal(pkg.groups[1].channels[0].group, '卫视');
+    // 扁平 channels 不再重复存一份
+    assert.deepEqual(pkg.channels, []);
+    // 来源由分组推导，不用用户再勾
+    assert.deepEqual(pkg.sources, ['s_11112222']);
+  });
+
+  await t.test('分组引用的源不存在：保留频道、来源置空并记 warning', () => {
+    const [library, warnings] = normalizeLibrary({
+      iptv: {
+        sources: [source],
+        packages: [{
+          id: 'pkg_aaaabbbb',
+          name: '孤儿源',
+          groups: [{
+            id: 'g_00000001', name: '地方台', sourceId: 's_99999999',
+            channels: [{ name: 'BTV', url: 'http://a.example/btv.ts' }],
+          }],
+        }],
+      },
+    });
+    const group = library.iptv.packages[0].groups[0];
+    assert.equal(group.sourceId, '');
+    assert.equal(group.channels.length, 1, '删源不能把频道一起丢掉');
+    assert.ok(warnings.some((line) => line.includes('不在资源库里')));
+  });
+
+  await t.test('非法/重复分组 id 就地补发，组名有默认值', () => {
+    const [library] = normalizeLibrary({
+      iptv: {
+        sources: [source],
+        packages: [{
+          id: 'pkg_aaaabbbb',
+          groups: [
+            { id: 'bad-id', name: '', channels: [] },
+            { id: 'bad-id', name: '卫视', channels: [] },
+          ],
+        }],
+      },
+    });
+    const groups = library.iptv.packages[0].groups;
+    assert.equal(groups.length, 2);
+    for (const group of groups) assert.match(group.id, /^g_[0-9a-f]{8}$/);
+    assert.notEqual(groups[0].id, groups[1].id);
+    assert.equal(groups[0].name, '分组 1');
+  });
+
+  await t.test('设备引用套餐：展开顺序 = 分组顺序 + 组内顺序', () => {
+    const library = {
+      iptv: {
+        sources: [source],
+        packages: [{
+          id: 'pkg_aaaabbbb',
+          name: '家庭版',
+          sources: ['s_11112222'],
+          channels: [],
+          groups: [
+            {
+              id: 'g_00000001', name: '央视', sourceId: 's_11112222',
+              channels: [
+                { name: 'CCTV1', url: 'http://a.example/1.ts', group: '央视', logo: '' },
+                { name: 'CCTV2', url: 'http://a.example/2.ts', group: '央视', logo: '' },
+              ],
+            },
+            {
+              id: 'g_00000002', name: '卫视', sourceId: '',
+              channels: [{ name: '湖南', url: 'http://a.example/hn.ts', group: '卫视', logo: '' }],
+            },
+          ],
+        }],
+      },
+    };
+    const [sections] = normalizeSections({
+      iptv: { managed: true, packageIds: ['pkg_aaaabbbb'], channels: [] },
+    });
+    const expanded = expandIptvChannels(sections, library);
+    assert.deepEqual(expanded.iptv.channels.map((c) => c.name), ['CCTV1', 'CCTV2', '湖南']);
+    assert.deepEqual(expanded.iptv.groups, ['央视', '卫视']);
+    // 轻量视图的套餐摘要要按分组算频道数
+    const view = viewDocument(
+      { schemaVersion: 1, revision: 1, sections: { iptv: { managed: true, packageIds: ['pkg_aaaabbbb'] } } },
+      false, library,
+    );
+    assert.equal(view.sections.iptv.packages[0].channelCount, 3);
+    assert.equal(view.sections.iptv.packages[0].groupCount, 2);
+  });
+
+  await t.test('设备内联套餐也支持分组（锁定快照场景）', () => {
+    const [sections] = normalizeSections({
+      iptv: {
+        selectedPackageIds: ['p1'],
+        packages: [{
+          id: 'p1',
+          name: '锁定快照',
+          groups: [{
+            id: 'g_00000003', name: '国际', sourceId: '',
+            channels: [{ name: 'CNN', url: 'http://a.example/cnn.ts' }],
+          }],
+        }],
+      },
+    });
+    const pkg = sections.iptv.packages[0];
+    assert.deepEqual(pkg.channels, []);
+    const expanded = expandIptvChannels(sections);
+    assert.deepEqual(expanded.iptv.channels.map((c) => c.name), ['CNN']);
+    assert.deepEqual(expanded.iptv.groups, ['国际']);
+  });
+});

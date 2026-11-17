@@ -22,7 +22,12 @@ export const MAX_DOCUMENT_BYTES = 900 * 1024;
 /** 套餐库上限：套餐里的频道是「频道库」，只在 GET 时展开到 channels，不重复存两份。 */
 export const MAX_IPTV_PACKAGES = 12;
 export const MAX_PACKAGE_CHANNELS_TOTAL = 5000;
+/** 套餐内的分组上限：两级结构「分组 → 频道」，分组就是终端频道列表的一级。 */
+export const MAX_IPTV_GROUPS = 24;
+export const MAX_GROUP_CHANNELS = 800;
 const PACKAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/** 套餐分组 id 与资源库的源 id 一样是引用目标，格式固定才好在界面上搬运。 */
+const GROUP_ID_RE = /^g_[0-9a-f]{8}$/;
 const VERSION_RE = /^\d+(?:\.\d+){0,3}$/;
 const URL_RE = /^https?:\/\/[^\s]+$/i;
 const IPTV_HEADER_LIMITS = [['userAgent', 500], ['referer', 500], ['cookie', 2000]];
@@ -651,6 +656,89 @@ function normalizeChannelList(raw, field, warnings) {
 }
 
 /**
+ * 套餐 = 命名的频道库，两级结构：「分组 → 频道」。
+ *
+ * 分组（groups[]）是终端频道列表的一级，每个分组固定引用资源库里的一条
+ * IPTV 源（sourceId，可为空=手工整理），组内 channels 是真正要下发的频道，
+ * 顺序即终端看到的顺序；分组的 group 字段一律等于分组名，这样终端拿到的
+ * 频道列表天然带着一级分类，不需要再下发一份分组表。
+ *
+ * 老套餐只有扁平 channels（没有 groups），继续按原样下发——两级结构是
+ * 增量字段，不迁移也不会丢频道。
+ */
+
+/** 套餐真正会被下发的频道：有分组用分组展开，否则用扁平列表（老套餐）。 */
+export function packageChannels(pkg) {
+  if (!pkg || typeof pkg !== 'object') return [];
+  const groups = Array.isArray(pkg.groups) ? pkg.groups : [];
+  if (!groups.length) return Array.isArray(pkg.channels) ? pkg.channels : [];
+  const out = [];
+  for (const group of groups) {
+    const name = String(group && group.name != null ? group.name : '').trim();
+    const list = Array.isArray(group && group.channels) ? group.channels : [];
+    for (const channel of list) {
+      if (!channel || typeof channel !== 'object') continue;
+      out.push({ ...channel, group: name || String(channel.group || '') });
+    }
+  }
+  return out;
+}
+
+/**
+ * 校验并规整套餐分组。
+ *
+ * - 分组 id 由编辑器生成（g_ + 8 位十六进制），缺失/非法/重复就地补一个，
+ *   免得同一份 JSON 里出现两个 id 相同的分组；
+ * - sourceId 只允许指向资源库里的源；源被删掉时**保留频道**、只把来源置空——
+ *   用户真正要下发的是频道，删源不该顺手把套餐掏空；
+ * - 每组组内按 url 去重，并强制把频道的 group 写成分组名。
+ */
+function normalizePackageGroups(raw, field, warnings, budget, sourceIds) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new ConfigError(`${field} 必须是数组`);
+  if (raw.length > MAX_IPTV_GROUPS) {
+    warnings.push(`${field}: 超过 ${MAX_IPTV_GROUPS} 个分组上限，已截断`);
+  }
+  const groups = [];
+  const taken = new Set();
+  let total = 0;
+  for (const entry of raw.slice(0, MAX_IPTV_GROUPS)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      warnings.push(`${field}: 忽略非对象分组`);
+      continue;
+    }
+    let id = String(entry.id == null ? '' : entry.id).trim();
+    if (!GROUP_ID_RE.test(id) || taken.has(id)) id = randomLibraryId('g_', taken);
+    const name = String(entry.name == null ? '' : entry.name).trim().slice(0, 32)
+      || `分组 ${groups.length + 1}`;
+    let sourceId = String(entry.sourceId == null ? '' : entry.sourceId).trim();
+    if (sourceId && !LIB_SOURCE_ID_RE.test(sourceId)) {
+      warnings.push(`${field}[${name}]: 忽略非法来源 id ${sourceId}`);
+      sourceId = '';
+    }
+    if (sourceId && sourceIds && !sourceIds.has(sourceId)) {
+      warnings.push(`${field}[${name}]: 来源 ${sourceId} 不在资源库里，已置空（频道保留）`);
+      sourceId = '';
+    }
+    const room = Math.min(budget - total, MAX_GROUP_CHANNELS);
+    if (room <= 0) {
+      warnings.push(`${field}: 频道数达到上限，已截断`);
+      break;
+    }
+    const rawChannels = Array.isArray(entry.channels) ? entry.channels : [];
+    const channels = normalizeChannelList(
+      rawChannels.map((channel) => (channel && typeof channel === 'object'
+        ? { ...channel, group: name } : channel)),
+      `${field}[${name}].channels`, warnings,
+    ).slice(0, room);
+    total += channels.length;
+    taken.add(id);
+    groups.push({ id, name, sourceId, channels });
+  }
+  return groups;
+}
+
+/**
  * 套餐 = 命名的频道库。编辑器把一次或多次 M3U/TXT 解析结果存进 packages，
  * 每台设备只在 selectedPackageIds 里勾选要下发的套餐；GET /api/config 时由
  * expandIptvChannels 展开成终端认识的 channels 字段，终端无需任何改动。
@@ -730,15 +818,24 @@ function normalizeIptv(part, warnings) {
         warnings.push(`iptv.packages: 频道总数达到 ${MAX_PACKAGE_CHANNELS_TOTAL} 上限，已截断`);
         break;
       }
-      const channels = normalizeChannelList(item.channels || [],
+      const groups = normalizePackageGroups(item.groups,
+        `iptv.packages[${id}].groups`, warnings, room, null);
+      // 有分组时频道只存在分组里：再存一份扁平 channels 会让同一批频道在
+      // 文档里出现两次（设备文档有 900 KB 上限）。
+      const channels = groups.length ? [] : normalizeChannelList(item.channels || [],
         `iptv.packages[${id}].channels`, warnings).slice(0, room);
       const pkgSources = strList(item.sources, `iptv.packages[${id}].sources`) || [];
-      total += channels.length;
+      const fromGroups = groups.map((group) => group.sourceId).filter(Boolean);
+      total += groups.length
+        ? packageChannels({ groups }).length
+        : channels.length;
       ids.add(id);
       base.packages.push({
         id,
         name: str(item.name, id, `iptv.packages[${id}].name`, 64),
-        sources: pkgSources.filter((url) => URL_RE.test(url)).slice(0, 20),
+        sources: [...new Set(fromGroups.concat(pkgSources.filter((url) => URL_RE.test(url))))]
+          .slice(0, 20),
+        groups,
         channels,
       });
     }
@@ -827,8 +924,8 @@ export function expandIptvChannels(sections, library = null) {
   const channels = [];
   for (const id of ids) {
     const pkg = byId.get(id);
-    if (!pkg || !Array.isArray(pkg.channels)) continue;
-    for (const channel of pkg.channels) {
+    if (!pkg) continue;
+    for (const channel of packageChannels(pkg)) {
       const key = String(channel.url || '').toLowerCase();
       if (!key || seen.has(key)) continue;
       seen.add(key);
@@ -893,7 +990,8 @@ export function viewDocument(document, withPackages = false, library = null) {
     id: pkg.id,
     name: pkg.name,
     sources: pkg.sources || [],
-    channelCount: Array.isArray(pkg.channels) ? pkg.channels.length : 0,
+    channelCount: packageChannels(pkg).length,
+    groupCount: Array.isArray(pkg.groups) ? pkg.groups.length : 0,
   });
   iptv.packages = [...inline.map(summarize), ...referenced.map(summarize)];
   return out;
@@ -1281,11 +1379,21 @@ function normalizeLibraryIptv(part, warnings) {
         warnings.push(`library.iptv.packages: 频道总数达到 ${MAX_PACKAGE_CHANNELS_TOTAL} 上限，已截断`);
         break;
       }
-      const channels = normalizeChannelList(item.channels === undefined || item.channels === null
-        ? [] : item.channels, `library.iptv.packages[${id}].channels`, warnings).slice(0, room);
+      const groups = normalizePackageGroups(item.groups,
+        `library.iptv.packages[${id}].groups`, warnings, room, sourceIds);
+      // 有分组时频道只留在分组里，扁平 channels 清空：同一批频道存两份会
+      // 把 900 KB 的库上限吃掉一大半，而且两份数据迟早对不上。
+      const channels = groups.length ? [] : normalizeChannelList(
+        item.channels === undefined || item.channels === null ? [] : item.channels,
+        `library.iptv.packages[${id}].channels`, warnings,
+      ).slice(0, room);
       const refs = stringArray(item.sources, `library.iptv.packages[${id}].sources`,
         MAX_LIBRARY_SOURCES) || [];
       const sources = [];
+      // 分组引用的源本身就是套餐的来源，不必让用户再勾一遍。
+      for (const group of groups) {
+        if (group.sourceId && !sources.includes(group.sourceId)) sources.push(group.sourceId);
+      }
       for (const ref of refs) {
         // 编辑器历史版本存的是订阅 URL，这里兼容成 sourceId，避免来源信息丢失。
         let sourceId = ref;
@@ -1299,12 +1407,13 @@ function normalizeLibraryIptv(part, warnings) {
         }
         if (!sources.includes(sourceId)) sources.push(sourceId);
       }
-      total += channels.length;
+      total += groups.length ? packageChannels({ groups }).length : channels.length;
       taken.add(id);
       out.packages.push({
         id,
         name: str(item.name, '', `library.iptv.packages[${id}].name`, 64) || id,
         sources,
+        groups,
         channels,
       });
     }

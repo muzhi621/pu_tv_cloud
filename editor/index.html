@@ -36,6 +36,7 @@
     <nav class="tabs" id="tabs" role="tablist" aria-label="配置分区">
       <button data-tab="bundles" class="active" role="tab" aria-selected="true">套餐管理</button>
       <button data-tab="iptv-lib" role="tab" aria-selected="false">IPTV 源</button>
+      <button data-tab="iptv-plan" role="tab" aria-selected="false">IPTV 套餐</button>
       <button data-tab="vod-lib" role="tab" aria-selected="false">TVBox 源</button>
       <button data-tab="update-lib" role="tab" aria-selected="false">在线更新</button>
       <button data-tab="devices" role="tab" aria-selected="false">终端管理</button>
@@ -70,6 +71,14 @@
         <button type="button" class="ghost" id="btnTokenConnect">用令牌连接并加载</button>
       </details>
     </form>
+  </div>
+
+  <!--
+    IPTV 分组下钻：从选中的 IPTV 源里勾选频道。
+    勾选状态只在「确定」时读，避免每点一次就重绘列表（会丢焦点与滚动位置）。
+  -->
+  <div id="planPicker" class="login-mask" hidden>
+    <div id="planPickerCard" class="plan-picker-card"></div>
   </div>
 
   <!-- 修改密码：改完所有会话失效，需要重新登录 -->

@@ -29,6 +29,12 @@ const state = {
   libSourcesUsed: [],     // 本次解析涉及的 URL 源 [{name,url,channelCount}]
   libPreviewId: '',       // 展开预览的套餐 id
   libAppendTo: '',        // 「追加到已有套餐」当前选择
+  // ---- IPTV 套餐（两级分组：分组 → 频道） ----
+  planPkgId: '',          // 当前编辑的套餐 id
+  planPickerPkg: '',      // 频道选择器正在编辑的套餐
+  planPickerGroup: '',    // 频道选择器正在编辑的分组
+  planPickerSource: null, // 该分组绑定的源（对象）
+  planSourceChannels: {}, // sourceId → {busy, channels, at, error}：源频道缓存
   tvboxUrl: '',           // TVBox 配置地址输入
   tvboxSummary: '',       // TVBox 最近一次导入摘要
   // ---- 在线更新版本库（与 IPTV 源 / TVBox 源并列的第三类资源） ----
@@ -803,11 +809,14 @@ function hexId(prefix) {
 
 function newLibraryId(kind) {
   const prefix = kind === 'src' ? 's_' : (kind === 'vod' ? 'vs_'
-    : (kind === 'upd' ? 'up_' : 'pkg_'));
+    : (kind === 'upd' ? 'up_' : (kind === 'grp' ? 'g_' : 'pkg_')));
   const lib = state.library;
   const taken = new Set();
   if (lib) {
     if (kind === 'pkg') for (const pkg of arr(lib.iptv.packages)) taken.add(pkg.id);
+    if (kind === 'grp') {
+      for (const pkg of arr(lib.iptv.packages)) for (const group of arr(pkg.groups)) taken.add(group.id);
+    }
     if (kind === 'src') for (const src of arr(lib.iptv.sources)) taken.add(src.id);
     if (kind === 'vod') for (const src of arr(lib.vod.sources)) taken.add(src.id);
     if (kind === 'upd') for (const item of arr(lib.updates)) taken.add(item.id);
@@ -1023,18 +1032,23 @@ function renderIptvDispatch() {
     ? libraryUnsupportedHtml()
     : (pkgs.length
       ? '<div class="df-multi">' + pkgs.map((pkg) => {
-        const count = arr(pkg.channels).length;
+        const stats = packageGroupStats(pkg);
         return '<label><input type="checkbox" data-pkg="' + esc(pkg.id) + '"'
           + (picked.has(pkg.id) ? ' checked' : '') + '> ' + esc(pkg.name)
-          + '（' + count + ' 个频道）</label>';
+          + '（' + (stats.groups ? stats.groups + ' 个分组 · ' : '')
+          + stats.channels + ' 个频道）</label>';
       }).join('') + '</div>'
-      : '<p class="meta">资源库里还没有套餐，请先到「IPTV 源」页导入源并创建套餐。</p>');
+      : '<p class="meta">资源库里还没有套餐：先到「IPTV 源」导入订阅，'
+        + '再到「IPTV 套餐」里按分组挑频道。</p>');
 
   return head
     + '<p class="hint">当前对象：<strong>' + esc(deviceLabel()) + '</strong>。'
     + '这里只勾选这台终端要下发的资源库套餐，套餐内容统一在「IPTV 源」页维护。</p>'
     + managedHtml('iptv', ' IPTV 频道')
-    + '<h3>资源库套餐</h3>' + picker
+    + '<h3>资源库套餐</h3>'
+    + '<p class="meta">套餐的「分组 → 频道」在「IPTV 套餐」页维护；这里只勾选下发哪几个套餐，'
+    + '勾选顺序决定终端频道列表里套餐的先后。</p>'
+    + picker
     + (pkgs === null ? '' :
       '<div class="checkline"><input class="switch" type="checkbox" data-path="iptv.lockLibrary"'
       + (iptv.lockLibrary ? ' checked' : '') + '><span>锁定资源库</span>'
@@ -1154,8 +1168,10 @@ function renderIptvLibrary() {
         + '<button class="ghost" data-lib="append-package">追加到已有套餐（合并去重）</button>'
         + '</div>'
       : '')
-    + '<p class="hint">「存为新套餐」把本次解析出的频道写成新套餐，并把本次用到的 URL 记入上面的订阅源列表。'
-    + '套餐名和订阅源名称都可以直接在上面/下面的输入框里改（改完记得保存资源库）。</p>'
+    + '<p class="hint">「存为新套餐」把本次解析出的频道写成一个<b>扁平套餐</b>（旧模型），'
+    + '并把本次用到的 URL 记入上面的订阅源列表。'
+    + '要给终端做两级频道列表（分组 → 频道），到「IPTV 套餐」页新建套餐、按分组挑频道即可；'
+    + '扁平套餐也能在那里一键按分组拆分。</p>'
 
     + '<h3>频道套餐（' + packages.length + '）</h3>'
     + (packages.length
@@ -1164,6 +1180,368 @@ function renderIptvLibrary() {
 
     + '<div class="field" style="margin-top:18px"><span>EPG 地址（可选，http/https）</span>'
     + '<input type="text" data-lib-input="epg-url" value="' + esc(iptv.epgUrl || '') + '"></div>';
+}
+
+/* ---------------- IPTV 套餐页（库层，两级分组） ---------------- */
+
+const PLAN_HEAD = '<h2>IPTV 套餐</h2>'
+  + '<p class="hint">套餐就是终端看到的频道列表：<b>分组 → 频道</b> 两级。'
+  + '每个分组引用一条「IPTV 源」里导入的订阅，再从里面挑出要下发的频道；'
+  + '终端按这里的分组与顺序展示。到「套餐管理 → IPTV」勾选套餐即完成下发。</p>';
+
+/** 可用时返回套餐数组；null 表示服务端不支持资源库。 */
+function planPackages() {
+  if (state.libraryState !== 'ready' || !state.library) return null;
+  return arr(state.library.iptv.packages);
+}
+
+function planPackageById(id) {
+  return arr(planPackages()).find((pkg) => pkg && pkg.id === id) || null;
+}
+
+/** 当前编辑的套餐：选中的那个，否则第一个。 */
+function planCurrentPackage() {
+  const list = planPackages();
+  if (!list || !list.length) return null;
+  return planPackageById(state.planPkgId) || list[0];
+}
+
+/**
+ * 套餐真正要下发的频道：有分组就按分组顺序展开，并把分组名写进 channel.group。
+ * 与云端 contract.js 的 packageChannels 同一套规则，编辑器这里的预览才不会
+ * 和终端拿到的内容不一致。
+ */
+function packageChannelList(pkg) {
+  const groups = arr(pkg && pkg.groups);
+  if (!groups.length) return arr(pkg && pkg.channels);
+  const out = [];
+  for (const group of groups) {
+    for (const channel of arr(group.channels)) {
+      out.push(Object.assign({}, channel, { group: group.name || channel.group || '' }));
+    }
+  }
+  return out;
+}
+
+function packageGroupStats(pkg) {
+  const groups = arr(pkg && pkg.groups);
+  return {
+    groups: groups.length,
+    channels: packageChannelList(pkg).length,
+  };
+}
+
+function planSourceOptions(selectedId) {
+  const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
+  return '<option value="">— 不绑定来源 —</option>' + sources.map((src) =>
+    '<option value="' + esc(src.id) + '"' + (src.id === selectedId ? ' selected' : '') + '>'
+    + esc(src.name || src.url) + '</option>').join('');
+}
+
+/** 一个分组一行：序号 / 名称 / 来源 / 频道数 / 操作。 */
+function planGroupRowHtml(pkg, group, index) {
+  const src = findLibrarySource(group.sourceId);
+  const count = arr(group.channels).length;
+  const idAttr = ' data-plan="' + esc(pkg.id) + '" data-id="' + esc(group.id) + '"';
+  return '<div class="plan-group">'
+    + '<span class="plan-group-index">' + (index + 1) + '</span>'
+    + '<input class="lib-input plan-group-name" data-lib-input="group-name"' + idAttr
+    + ' value="' + esc(group.name || '') + '" placeholder="分组名，如 央视 / 卫视 / 地方台">'
+    + '<select class="lib-input plan-group-source" data-lib-input="group-source"' + idAttr + '>'
+    + planSourceOptions(group.sourceId) + '</select>'
+    + '<span class="meta plan-group-count">' + count + ' 个频道</span>'
+    + '<span class="lib-row-ops">'
+    + '<button class="tiny primary" data-lib="pick-channels"' + idAttr + '>选择频道</button>'
+    + '<button class="tiny" data-lib="group-up"' + idAttr + ' title="上移">↑</button>'
+    + '<button class="tiny" data-lib="group-down"' + idAttr + ' title="下移">↓</button>'
+    + '<button class="tiny danger" data-lib="delete-group"' + idAttr + '>删除</button>'
+    + '</span></div>'
+    + (src ? '' : '<p class="meta plan-warn">这个分组还没绑定来源：先选来源，再点「选择频道」。</p>');
+}
+
+function renderIptvPlans() {
+  if (state.libraryState === 'unsupported') return PLAN_HEAD + libraryUnsupportedHtml();
+  if (!state.library) {
+    return PLAN_HEAD + libraryLoadFailedHtml()
+      + '<p class="muted">资源库尚未加载。登录后会自动加载，也可以点下面的按钮单独加载。</p>'
+      + '<div class="toolbar"><button class="ghost" data-lib="reload-library">加载资源库</button></div>';
+  }
+  const packages = planPackages() || [];
+  const sources = arr(state.library.iptv.sources);
+  const current = planCurrentPackage();
+
+  const pkgRows = packages.map((pkg) => {
+    const stats = packageGroupStats(pkg);
+    const active = current && current.id === pkg.id;
+    return '<div class="lib-row' + (active ? ' plan-row-active' : '') + '">'
+      + '<button class="tiny' + (active ? ' primary' : '') + '" data-lib="select-plan" data-id="'
+      + esc(pkg.id) + '">' + (active ? '编辑中' : '编辑') + '</button>'
+      + '<strong>' + esc(pkg.name || pkg.id) + '</strong>'
+      + '<span class="meta">' + stats.groups + ' 个分组 · ' + stats.channels + ' 个频道</span>'
+      + '<span class="lib-row-ops">'
+      + '<button class="tiny danger" data-lib="delete-package" data-id="' + esc(pkg.id) + '">删除</button>'
+      + '</span></div>';
+  }).join('');
+
+  let editor = '';
+  if (current) {
+    const groups = arr(current.groups);
+    const stats = packageGroupStats(current);
+    const legacy = !groups.length && arr(current.channels).length > 0;
+    const groupRows = groups.map((group, index) => planGroupRowHtml(current, group, index)).join('');
+    const preview = groups.length
+      ? '<div class="plan-preview">' + groups.map((group) =>
+        '<div class="plan-preview-group"><strong>' + esc(group.name || '未命名分组') + '</strong>'
+        + '<span class="meta">' + arr(group.channels).length + ' 个频道</span>'
+        + '<div class="plan-preview-chips">'
+        + (arr(group.channels).slice(0, 12).map((channel) =>
+          '<span class="chip">' + esc(channel.name) + '</span>').join('')
+          || '<span class="muted">还没有频道</span>')
+        + (arr(group.channels).length > 12
+          ? '<span class="meta">…等 ' + arr(group.channels).length + ' 个</span>' : '')
+        + '</div></div>').join('') + '</div>'
+      : '';
+
+    editor = '<h3>分组（' + stats.groups + '）· 共 ' + stats.channels + ' 个频道</h3>'
+      + '<div class="toolbar">'
+      + '<label class="plan-name-field">套餐名称'
+      + '<input class="lib-input" data-lib-input="plan-name" data-id="' + esc(current.id)
+      + '" value="' + esc(current.name || '') + '"></label>'
+      + '<button class="primary" data-lib="add-group" data-plan="' + esc(current.id) + '">新增分组</button>'
+      + (legacy
+        ? '<button class="ghost" data-lib="split-plan" data-plan="' + esc(current.id)
+          + '">把旧频道按分组拆成两级</button>'
+        : '')
+      + '</div>'
+      + (legacy
+        ? '<p class="hint">这个套餐还是旧的一层结构（只有频道，没有分组）：'
+          + '点「按分组拆成两级」会按频道自带的分组名自动切成多个分组，再逐个绑定来源即可。</p>'
+        : '')
+      + (groups.length
+        ? '<div class="plan-groups">' + groupRows + '</div>'
+        : '<p class="muted">还没有分组。点「新增分组」，给它起个名字（如 央视 / 卫视）并选择来源。</p>')
+      + (groups.length ? '<h3>下发预览</h3>' + preview : '');
+  }
+
+  return PLAN_HEAD
+    + libraryToolbar(state.library)
+    + '<h3>套餐（' + packages.length + '）</h3>'
+    + (packages.length ? '<div class="lib-list">' + pkgRows + '</div>' : '<p class="muted">还没有套餐。</p>')
+    + '<div class="toolbar">'
+    + '<input class="pkg-name" data-lib-input="new-plan-name" placeholder="新套餐名称，例如：家庭版">'
+    + '<button class="primary" data-lib="create-plan">新建套餐</button>'
+    + '</div>'
+    + (sources.length ? '' : '<p class="hint">资源库里还没有 IPTV 源：先到「IPTV 源」导入订阅，再回来建分组。</p>')
+    + editor;
+}
+
+/* ---------------- 频道选择器（分组下钻） ---------------- */
+
+function planGroupById(pkgId, groupId) {
+  const pkg = planPackageById(pkgId);
+  const group = arr(pkg && pkg.groups).find((item) => item.id === groupId);
+  return group ? { pkg, group } : null;
+}
+
+/** 打开某个分组的频道选择器：来源频道先看缓存，没有就云端抓一次。 */
+async function openChannelPicker(pkgId, groupId) {
+  const hit = planGroupById(pkgId, groupId);
+  if (!hit) { message('找不到这个分组，请重新加载资源库。', 'err'); return; }
+  state.planPickerPkg = pkgId;
+  state.planPickerGroup = groupId;
+  state.planPickerError = '';
+  const src = findLibrarySource(hit.group.sourceId);
+  if (!src) {
+    state.planPickerSource = null;
+    renderPlanPicker();
+    $('planPicker').hidden = false;
+    return;
+  }
+  state.planPickerSource = src;
+  renderPlanPicker();
+  $('planPicker').hidden = false;
+  if (!planSourceCached(src.id)) await loadPlanSourceChannels(src.id);
+}
+
+function planSourceCached(sourceId) {
+  const cache = state.planSourceChannels[sourceId];
+  return !!(cache && cache.channels && cache.channels.length);
+}
+
+async function loadPlanSourceChannels(sourceId) {
+  const src = findLibrarySource(sourceId);
+  if (!src) return;
+  state.planSourceChannels[sourceId] = { busy: true, channels: [], at: 0, error: '' };
+  renderPlanPicker();
+  try {
+    const text = await fetchRemoteText(src.url);
+    const parsed = parsePlaylist(text);
+    state.planSourceChannels[sourceId] = {
+      busy: false,
+      channels: parsed.channels,
+      groups: parsed.groups || [],
+      at: Date.now(),
+      error: parsed.channels.length ? '' : '这个地址没有解析出频道',
+    };
+    // 顺手把源上的频道数刷新成最新一次解析结果。
+    if (src.channelCount !== parsed.channels.length) {
+      src.channelCount = parsed.channels.length;
+      markLibraryDirty();
+    }
+  } catch (error) {
+    state.planSourceChannels[sourceId] = {
+      busy: false, channels: [], at: 0, error: error.message || String(error),
+    };
+  }
+  renderPlanPicker();
+}
+
+function renderPlanPicker() {
+  const host = $('planPickerCard');
+  if (!host) return;
+  const hit = planGroupById(state.planPickerPkg, state.planPickerGroup);
+  if (!hit) { host.innerHTML = ''; return; }
+  const { group } = hit;
+  const src = state.planPickerSource;
+  const head = '<div class="picker-head"><div><h2>' + esc(group.name || '未命名分组') + '</h2>'
+    + '<p class="meta">' + (src ? '来源：' + esc(src.name || src.url) : '这个分组还没有绑定 IPTV 源') + '</p></div>'
+    + '<button class="ghost" data-picker="close">关闭</button></div>';
+
+  if (!src) {
+    host.innerHTML = head + '<p class="muted">先在分组行里选一条来源，再回来挑频道。</p>';
+    return;
+  }
+
+  const cache = state.planSourceChannels[src.id] || { busy: true, channels: [] };
+  if (cache.busy) {
+    host.innerHTML = head + '<p class="muted">正在云端抓取并解析这个来源的频道…</p>';
+    return;
+  }
+  if (cache.error && !cache.channels.length) {
+    host.innerHTML = head + '<div class="lib-notice">抓取失败：' + esc(cache.error) + '</div>'
+      + '<div class="toolbar"><button class="primary" data-picker="retry">重试</button></div>';
+    return;
+  }
+
+  const picked = new Set(arr(group.channels).map((channel) => String(channel.url).toLowerCase()));
+  const byGroup = new Map();
+  for (const channel of cache.channels) {
+    const key = channel.group || '未分组';
+    if (!byGroup.has(key)) byGroup.set(key, []);
+    byGroup.get(key).push(channel);
+  }
+  const sections = [...byGroup.entries()].map(([name, list]) =>
+    '<div class="picker-section" data-picker-section>'
+    + '<div class="picker-section-head"><strong>' + esc(name) + '</strong>'
+    + '<span class="meta">' + list.length + '</span></div>'
+    + list.map((channel) => {
+      const url = String(channel.url || '');
+      return '<label class="picker-row" data-picker-row>'
+        + '<input type="checkbox" value="' + esc(url) + '" data-name="' + esc(channel.name)
+        + '" data-logo="' + esc(channel.logo || '') + '"'
+        + (picked.has(url.toLowerCase()) ? ' checked' : '') + '>'
+        + '<span class="picker-name">' + esc(channel.name) + '</span>'
+        + '</label>';
+    }).join('')
+    + '</div>').join('');
+
+  host.innerHTML = head
+    + '<div class="picker-tools">'
+    + '<input class="picker-filter" data-picker-filter placeholder="搜索频道名 / 分组">'
+    + '<button class="tiny" data-picker="select-visible">全选可见</button>'
+    + '<button class="tiny" data-picker="clear-all">全部清空</button>'
+    + '<span class="meta" id="pickerCount">已选 ' + arr(group.channels).length
+    + ' / 共 ' + cache.channels.length + '</span>'
+    + '</div>'
+    + '<div class="picker-list">' + (sections || '<p class="muted">这个来源没有解析出频道。</p>') + '</div>'
+    + '<div class="picker-foot">'
+    + '<span class="meta">最多 800 个频道/分组；保存资源库后终端按此下发。</span>'
+    + '<button class="primary" data-picker="apply">确定</button>'
+    + '</div>';
+  syncPickerCount();
+}
+
+/** 计数字样随勾选变化，不必重绘整个列表（重绘会丢掉键盘焦点）。 */
+function syncPickerCount() {
+  const label = $('pickerCount');
+  if (!label) return;
+  const boxes = document.querySelectorAll('#planPicker .picker-row input[type=checkbox]');
+  const total = boxes.length;
+  let checked = 0;
+  boxes.forEach((box) => { if (box.checked) checked += 1; });
+  label.textContent = '已选 ' + checked + ' / 共 ' + total;
+}
+
+function filterPlanPicker(keyword) {
+  const needle = String(keyword || '').trim().toLowerCase();
+  document.querySelectorAll('#planPicker [data-picker-section]').forEach((section) => {
+    let visible = 0;
+    section.querySelectorAll('[data-picker-row]').forEach((row) => {
+      const text = row.textContent.toLowerCase();
+      const show = !needle || text.includes(needle);
+      row.hidden = !show;
+      if (show) visible += 1;
+    });
+    section.hidden = visible === 0;
+  });
+}
+
+function closePlanPicker() {
+  const mask = $('planPicker');
+  if (mask) mask.hidden = true;
+  state.planPickerPkg = '';
+  state.planPickerGroup = '';
+  renderPlanPicker();
+}
+
+function onPlanPickerAction(kind) {
+  if (kind === 'close') { closePlanPicker(); return; }
+  if (kind === 'retry') {
+    if (state.planPickerSource) loadPlanSourceChannels(state.planPickerSource.id);
+    return;
+  }
+  if (kind === 'select-visible') {
+    document.querySelectorAll('#planPicker [data-picker-row]').forEach((row) => {
+      if (row.hidden) return;
+      const box = row.querySelector('input[type=checkbox]');
+      if (box) box.checked = true;
+    });
+    syncPickerCount();
+    return;
+  }
+  if (kind === 'clear-all') {
+    document.querySelectorAll('#planPicker .picker-row input[type=checkbox]')
+      .forEach((box) => { box.checked = false; });
+    syncPickerCount();
+    return;
+  }
+  if (kind === 'apply') applyChannelPicker();
+}
+
+/** 把勾选结果写回分组：频道顺序就是源里的顺序，组名随分组名。 */
+function applyChannelPicker() {
+  const hit = planGroupById(state.planPickerPkg, state.planPickerGroup);
+  if (!hit) { closePlanPicker(); return; }
+  const { group } = hit;
+  const channels = [];
+  document.querySelectorAll('#planPicker .picker-row input[type=checkbox]').forEach((box) => {
+    if (!box.checked) return;
+    channels.push({
+      name: box.dataset.name || '',
+      url: box.value,
+      group: group.name || '',
+      logo: box.dataset.logo || '',
+    });
+  });
+  if (channels.length > 800) {
+    channels.length = 800;
+    message('单个分组最多 800 个频道，超出的已被截断。', 'err');
+  }
+  group.channels = channels;
+  markLibraryDirty();
+  closePlanPicker();
+  render();
+  message('「' + (group.name || '分组') + '」已选 ' + channels.length + ' 个频道，记得点「保存资源库」。', 'ok');
 }
 
 /* ---------------- TVBox 源页（库层） ---------------- */
@@ -2651,6 +3029,9 @@ const MAX_VOD_SITES_PER_SOURCE = 200;
 const MAX_VOD_SITES = 500;
 const MAX_VOD_SOURCES = 20;
 const MAX_IPTV_PACKAGES = 12;
+/** 与 contract.js / schema.py 的 MAX_IPTV_GROUPS、MAX_GROUP_CHANNELS 对齐。 */
+const MAX_IPTV_GROUPS = 24;
+const MAX_GROUP_CHANNELS = 800;
 
 /** 站点 id 必须满足 [A-Za-z0-9_:-]，key 里的点号/斜杠等统一换成下划线。 */
 function tvboxSiteId(sourceId, key) {
@@ -2942,6 +3323,130 @@ function migrateInlinePackages() {
     + ' 个、合并 ' + merged + ' 个）。请先点「保存资源库」，再保存本终端配置。', 'ok');
 }
 
+/* ---------------- IPTV 套餐（两级分组）交互 ---------------- */
+
+/** 新建套餐：默认带一个分组，来源取资源库第一条，省掉「先建空壳再点新增」。 */
+function createPlanPackage(nameInput) {
+  if (!state.library) { message('资源库尚未加载。', 'err'); return; }
+  const packages = arr(state.library.iptv.packages);
+  if (packages.length >= MAX_IPTV_PACKAGES) {
+    message('资源库最多 ' + MAX_IPTV_PACKAGES + ' 个套餐，请先删除不用的套餐。', 'err');
+    return;
+  }
+  const sources = arr(state.library.iptv.sources);
+  const name = String(nameInput || '').trim().slice(0, 64) || ('套餐 ' + (packages.length + 1));
+  const firstSource = sources.length ? sources[0].id : '';
+  const pkg = {
+    id: newLibraryId('pkg'),
+    name,
+    sources: firstSource ? [firstSource] : [],
+    groups: [{
+      id: newLibraryId('grp'),
+      name: '分组 1',
+      sourceId: firstSource,
+      channels: [],
+    }],
+    channels: [],
+  };
+  packages.push(pkg);
+  state.planPkgId = pkg.id;
+  markLibraryDirty();
+  render();
+  message('已新建套餐「' + name + '」：先改分组名、选来源，再点「选择频道」。'
+    + '完成后记得保存资源库。', 'ok');
+}
+
+function addPlanGroup(pkgId) {
+  const pkg = planPackageById(pkgId);
+  if (!pkg) return;
+  if (!Array.isArray(pkg.groups)) pkg.groups = [];
+  if (pkg.groups.length >= MAX_IPTV_GROUPS) {
+    message('一个套餐最多 ' + MAX_IPTV_GROUPS + ' 个分组。', 'err');
+    return;
+  }
+  const sources = arr(state.library.iptv.sources);
+  pkg.groups.push({
+    id: newLibraryId('grp'),
+    name: '分组 ' + (pkg.groups.length + 1),
+    sourceId: sources.length ? sources[0].id : '',
+    channels: [],
+  });
+  syncPlanPackageSources(pkg);
+  markLibraryDirty();
+  render();
+}
+
+/** 分组的来源即套餐的来源：勾掉分组后自动收敛，不留悬空引用。 */
+function syncPlanPackageSources(pkg) {
+  const ids = [];
+  for (const group of arr(pkg && pkg.groups)) {
+    if (group.sourceId && !ids.includes(group.sourceId)) ids.push(group.sourceId);
+  }
+  pkg.sources = ids;
+}
+
+function deletePlanGroup(pkgId, groupId) {
+  const pkg = planPackageById(pkgId);
+  if (!pkg) return;
+  const group = arr(pkg.groups).find((item) => item.id === groupId);
+  if (!group) return;
+  const count = arr(group.channels).length;
+  if (!window.confirm('删除分组「' + (group.name || '未命名') + '」？'
+    + (count ? '它下面的 ' + count + ' 个频道也会一起移除（源本身不受影响）。' : ''))) return;
+  pkg.groups = arr(pkg.groups).filter((item) => item.id !== groupId);
+  syncPlanPackageSources(pkg);
+  markLibraryDirty();
+  render();
+}
+
+/** 上移/下移：分组的次序就是终端频道列表里分组条的次序。 */
+function movePlanGroup(pkgId, groupId, delta) {
+  const pkg = planPackageById(pkgId);
+  if (!pkg) return;
+  const groups = arr(pkg.groups);
+  const index = groups.findIndex((item) => item.id === groupId);
+  const target = index + delta;
+  if (index < 0 || target < 0 || target >= groups.length) return;
+  const [moved] = groups.splice(index, 1);
+  groups.splice(target, 0, moved);
+  pkg.groups = groups;
+  markLibraryDirty();
+  render();
+}
+
+/**
+ * 旧的一层结构 → 两级：按频道自带的分组名切。
+ *
+ * 老套餐的频道带着 M3U 的 group-title（导入时写进去的），所以能无损拆开；
+ * 分组名重复的合并到一起，顺序沿用第一次出现的次序。来源只能挂第一个
+ * （老数据没有「频道属于哪个源」的信息），用户可以逐组改。
+ */
+function splitPlanPackage(pkgId) {
+  const pkg = planPackageById(pkgId);
+  if (!pkg) return;
+  const channels = arr(pkg.channels);
+  if (!channels.length) { message('这个套餐没有可拆的频道。', 'err'); return; }
+  const order = [];
+  const buckets = new Map();
+  for (const channel of channels) {
+    const name = String(channel.group || '').trim() || '未分组';
+    if (!buckets.has(name)) { buckets.set(name, []); order.push(name); }
+    buckets.get(name).push(channel);
+  }
+  const sourceId = arr(pkg.sources).find((id) => findLibrarySource(id)) || '';
+  pkg.groups = order.map((name) => ({
+    id: newLibraryId('grp'),
+    name: name.slice(0, 32),
+    sourceId,
+    channels: buckets.get(name),
+  }));
+  pkg.channels = [];
+  syncPlanPackageSources(pkg);
+  markLibraryDirty();
+  render();
+  message('已拆成 ' + pkg.groups.length + ' 个分组。逐个确认来源与频道后保存资源库。', 'ok');
+}
+
 function onLibraryAction(button) {
   const kind = button.dataset.lib;
   if (kind === 'save-library') { saveLibrary(); return; }
@@ -2958,6 +3463,19 @@ function onLibraryAction(button) {
   }
   if (kind === 'delete-package') { deleteLibraryPackage(button.dataset.id); return; }
   if (kind === 'delete-source') { deleteLibrarySource(button.dataset.id); return; }
+  // ---- IPTV 套餐（两级分组） ----
+  if (kind === 'create-plan') { createPlanPackage(readLibInput('new-plan-name')); return; }
+  if (kind === 'select-plan') {
+    state.planPkgId = button.dataset.id;
+    renderPanel();
+    return;
+  }
+  if (kind === 'add-group') { addPlanGroup(button.dataset.plan); return; }
+  if (kind === 'delete-group') { deletePlanGroup(button.dataset.plan, button.dataset.id); return; }
+  if (kind === 'group-up') { movePlanGroup(button.dataset.plan, button.dataset.id, -1); return; }
+  if (kind === 'group-down') { movePlanGroup(button.dataset.plan, button.dataset.id, 1); return; }
+  if (kind === 'split-plan') { splitPlanPackage(button.dataset.plan); return; }
+  if (kind === 'pick-channels') { openChannelPicker(button.dataset.plan, button.dataset.id); return; }
   if (kind === 'add-vod-source') { addVodSource(); return; }
   if (kind === 'add-vod-source-url') { addVodSourceUrlOnly(); return; }
   if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
@@ -3020,6 +3538,35 @@ function onLibraryInput(target) {
     if (pkg) { pkg.name = target.value.slice(0, 64); markLibraryDirty(); }
     return;
   }
+  if (kind === 'new-plan-name') return;
+  if (kind === 'plan-name') {
+    const pkg = planPackageById(id);
+    if (pkg) { pkg.name = target.value.slice(0, 64); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'group-name') {
+    const pkg = planPackageById(target.dataset.plan);
+    const group = arr(pkg && pkg.groups).find((item) => item.id === id);
+    if (group) {
+      group.name = target.value.slice(0, 32);
+      // 组内频道带着分组名（终端靠它归组），改名要一起改，否则预览与下发不一致。
+      for (const channel of arr(group.channels)) channel.group = group.name;
+      markLibraryDirty();
+    }
+    return;
+  }
+  if (kind === 'group-source') {
+    const pkg = planPackageById(target.dataset.plan);
+    const group = arr(pkg && pkg.groups).find((item) => item.id === id);
+    if (group) {
+      group.sourceId = target.value;
+      syncPlanPackageSources(pkg);
+      markLibraryDirty();
+      // 说明文字要跟着变（没绑来源的提示），重绘一次；select 已失焦，不会抢输入。
+      renderPanel();
+    }
+    return;
+  }
   if (kind === 'source-name') {
     const src = arr(state.library.iptv.sources).find((item) => item.id === id);
     if (src) { src.name = target.value.slice(0, 64); markLibraryDirty(); }
@@ -3059,7 +3606,7 @@ function onLibraryInput(target) {
 function renderPanel() {
   // 资源库、终端管理页签都不依赖配置文档：前者单独加载资源库，后者只读
   // /api/devices。这样即使没点「连接并加载」，终端在线/离线也能日常显示。
-  const standaloneTab = state.activeTab === 'iptv-lib'
+  const standaloneTab = state.activeTab === 'iptv-lib' || state.activeTab === 'iptv-plan'
     || state.activeTab === 'vod-lib' || state.activeTab === 'devices'
     || state.activeTab === 'update-lib'
     || state.activeTab === 'bundles';
@@ -3071,6 +3618,7 @@ function renderPanel() {
     navigation: renderNavigation,
     startup: renderStartup, update: renderUpdate,
     iptv: renderIptvDispatch, 'iptv-lib': renderIptvLibrary,
+    'iptv-plan': renderIptvPlans,
     'vod-lib': renderVodLibrary, 'update-lib': renderUpdateLibrary,
     devices: renderDevices };
   const renderer = renderers[state.activeTab] || renderBundles;
@@ -3662,7 +4210,7 @@ async function ensureRemoteData(tab) {
   if (!state.base || !state.token) return;
   const jobs = [];
   if (!state.catalog) jobs.push(loadCatalogOnly());
-  if (tab === 'bundles' || tab === 'iptv-lib' || tab === 'vod-lib'
+  if (tab === 'bundles' || tab === 'iptv-lib' || tab === 'iptv-plan' || tab === 'vod-lib'
     || tab === 'update-lib') {
     if (state.libraryState !== 'ready' && state.libraryState !== 'loading') {
       jobs.push(loadLibrary(true));
@@ -4024,6 +4572,25 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btnChangePassword').addEventListener('click', openPasswordDialog);
   $('pwdForm').addEventListener('submit', onPasswordSubmit);
   $('btnPwdCancel').addEventListener('click', () => { $('pwdMask').hidden = true; });
+
+  // ---- IPTV 分组频道选择器 ----
+  // 勾选状态只在「确定」时读 DOM，所以这里只需要按钮与搜索框两个入口；
+  // 每次点击重绘列表会丢焦点与滚动位置。
+  const picker = $('planPicker');
+  if (picker) {
+    picker.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-picker]');
+      if (button) { onPlanPickerAction(button.dataset.picker); return; }
+      if (event.target === picker) closePlanPicker();
+    });
+    picker.addEventListener('input', (event) => {
+      const box = event.target.closest('input[data-picker-filter]');
+      if (box) filterPlanPicker(box.value);
+    });
+    picker.addEventListener('change', (event) => {
+      if (event.target && event.target.type === 'checkbox') syncPickerCount();
+    });
+  }
 
   $('tabs').addEventListener('click', (event) => {
     const button = event.target.closest('button[data-tab]');

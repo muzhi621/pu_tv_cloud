@@ -1177,5 +1177,120 @@ class PinnedUpdateVersionTests(unittest.TestCase):
         self.assertEqual(sections["update"]["updateId"], "")
 
 
+class IptvPackageGroupsTests(unittest.TestCase):
+    """IPTV 套餐两级结构：分组（引用源）→ 频道，与 contract.js 逐条对齐。"""
+
+    SOURCE = {"id": "s_11112222", "name": "央视源", "url": "https://a.example/cctv.m3u"}
+
+    def test_library_package_keeps_groups_and_clears_flat_channels(self):
+        library, _ = normalize_library({
+            "iptv": {
+                "sources": [self.SOURCE],
+                "packages": [{
+                    "id": "pkg_aaaabbbb",
+                    "name": "家庭版",
+                    "groups": [
+                        {"id": "g_00000001", "name": "央视", "sourceId": "s_11112222",
+                         "channels": [{"name": "CCTV1", "url": "http://a/1.ts"},
+                                      {"name": "CCTV1", "url": "http://a/1.ts"}]},
+                        {"id": "g_00000002", "name": "卫视", "sourceId": "",
+                         "channels": [{"name": "湖南", "url": "http://a/hn.ts",
+                                       "group": "随便写的"}]},
+                    ],
+                }],
+            },
+        })
+        pkg = library["iptv"]["packages"][0]
+        self.assertEqual(len(pkg["groups"]), 2)
+        # 组内按 url 去重，且 group 强制写成分组名
+        self.assertEqual([c["url"] for c in pkg["groups"][0]["channels"]],
+                         ["http://a/1.ts"])
+        self.assertEqual(pkg["groups"][0]["channels"][0]["group"], "央视")
+        self.assertEqual(pkg["groups"][1]["channels"][0]["group"], "卫视")
+        # 有分组就不再存扁平 channels（库有 900 KB 上限）
+        self.assertEqual(pkg["channels"], [])
+        # 来源由分组推导
+        self.assertEqual(pkg["sources"], ["s_11112222"])
+
+    def test_unknown_source_keeps_channels(self):
+        library, warnings = normalize_library({
+            "iptv": {
+                "sources": [self.SOURCE],
+                "packages": [{
+                    "id": "pkg_aaaabbbb",
+                    "groups": [{"id": "g_00000001", "name": "地方台",
+                                "sourceId": "s_99999999",
+                                "channels": [{"name": "BTV", "url": "http://a/btv.ts"}]}],
+                }],
+            },
+        })
+        group = library["iptv"]["packages"][0]["groups"][0]
+        self.assertEqual(group["sourceId"], "")
+        self.assertEqual(len(group["channels"]), 1)
+        self.assertTrue(any("不在资源库里" in item for item in warnings))
+
+    def test_group_ids_are_reissued(self):
+        library, _ = normalize_library({
+            "iptv": {
+                "sources": [self.SOURCE],
+                "packages": [{
+                    "id": "pkg_aaaabbbb",
+                    "groups": [
+                        {"id": "bad-id", "name": "", "channels": []},
+                        {"id": "bad-id", "name": "卫视", "channels": []},
+                    ],
+                }],
+            },
+        })
+        groups = library["iptv"]["packages"][0]["groups"]
+        self.assertEqual(len(groups), 2)
+        for group in groups:
+            self.assertRegex(group["id"], r"^g_[0-9a-f]{8}$")
+        self.assertNotEqual(groups[0]["id"], groups[1]["id"])
+        self.assertEqual(groups[0]["name"], "分组 1")
+
+    def test_expand_keeps_group_order(self):
+        library = {
+            "iptv": {
+                "sources": [self.SOURCE],
+                "packages": [{
+                    "id": "pkg_aaaabbbb", "name": "家庭版", "sources": ["s_11112222"],
+                    "channels": [],
+                    "groups": [
+                        {"id": "g_00000001", "name": "央视", "sourceId": "s_11112222",
+                         "channels": [{"name": "CCTV1", "url": "http://a/1.ts"},
+                                      {"name": "CCTV2", "url": "http://a/2.ts"}]},
+                        {"id": "g_00000002", "name": "卫视", "sourceId": "",
+                         "channels": [{"name": "湖南", "url": "http://a/hn.ts"}]},
+                    ],
+                }],
+            },
+        }
+        sections, _ = normalize_sections({
+            "iptv": {"managed": True, "packageIds": ["pkg_aaaabbbb"], "channels": []},
+        })
+        out = expand_iptv_channels(sections, library)
+        self.assertEqual([c["name"] for c in out["iptv"]["channels"]],
+                         ["CCTV1", "CCTV2", "湖南"])
+        self.assertEqual(out["iptv"]["groups"], ["央视", "卫视"])
+
+    def test_inline_package_groups(self):
+        sections, _ = normalize_sections({
+            "iptv": {
+                "selectedPackageIds": ["p1"],
+                "packages": [{
+                    "id": "p1", "name": "锁定快照",
+                    "groups": [{"id": "g_00000003", "name": "国际", "sourceId": "",
+                                "channels": [{"name": "CNN", "url": "http://a/cnn.ts"}]}],
+                }],
+            },
+        })
+        pkg = sections["iptv"]["packages"][0]
+        self.assertEqual(pkg["channels"], [])
+        out = expand_iptv_channels(sections)
+        self.assertEqual([c["name"] for c in out["iptv"]["channels"]], ["CNN"])
+        self.assertEqual(out["iptv"]["groups"], ["国际"])
+
+
 if __name__ == "__main__":
     unittest.main()

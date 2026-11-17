@@ -37,6 +37,7 @@ from .schema import (
     etag_for,
     expand_iptv_channels,
     normalize_sections,
+    package_channels,
 )
 from .storage import Conflict, Storage, create_storage
 
@@ -265,7 +266,8 @@ def create_app(env: dict[str, str] | None = None, storage: Storage | None = None
                 iptv["packages"] = [
                     {"id": pkg.get("id", ""), "name": pkg.get("name", ""),
                      "sources": pkg.get("sources", []),
-                     "channelCount": len(pkg.get("channels") or [])}
+                     "channelCount": len(package_channels(pkg)),
+                     "groupCount": len(pkg.get("groups") or [])}
                     for pkg in packages
                 ]
             view["sections"] = sections_view

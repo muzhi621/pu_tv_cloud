@@ -286,10 +286,19 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
     "sources": [{"id": "s_1a2b3c4d", "name": "央视源",
                  "url": "https://.../list.m3u", "type": "m3u",
                  "channelCount": 128, "addedAt": "2026-11-10T09:00:00+08:00", "note": ""}],
-    "packages": [{"id": "pkg_1a2b3c4d", "name": "央视+卫视",
-                  "sources": ["s_1a2b3c4d"],
-                  "channels": [{"name": "CCTV-1", "url": "http://.../1.m3u8",
-                                "group": "央视", "logo": ""}]}],
+    "packages": [{
+      "id": "pkg_1a2b3c4d", "name": "家庭版",
+      "sources": ["s_1a2b3c4d", "s_1a2b3c4e"],
+      "groups": [
+        {"id": "g_1a2b3c4d", "name": "央视", "sourceId": "s_1a2b3c4d",
+         "channels": [{"name": "CCTV-1", "url": "http://.../1.m3u8",
+                       "group": "央视", "logo": ""}]},
+        {"id": "g_1a2b3c4e", "name": "卫视", "sourceId": "s_1a2b3c4e",
+         "channels": [{"name": "湖南卫视", "url": "http://.../hn.m3u8",
+                       "group": "卫视", "logo": ""}]}
+      ],
+      "channels": []
+    }],
     "epgUrl": ""
   },
   "vod": {
@@ -329,12 +338,29 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
   路径：它会拼进对象存储的键路径。
 - `versionNum` 缺省按 `3.0.43 → 130043` 推导（与 `version.json` 同一套带产品位的规则）。
 
+### IPTV 套餐：两级结构「分组 → 频道」
+
+终端看到的频道列表就是这一份结构，**分组是列表的一级**，组内频道是二级：
+
+- `packages[].groups[]` 每项 `{id, name, sourceId, channels}`：
+  - `name` ≤ 32 字，就是终端分组条上的文字；
+  - `sourceId` 指向 `iptv.sources[].id`，表示这个分组从哪条订阅里挑的频道
+    （可为空 = 手工整理）。**源被删掉时只把来源置空，频道保留**——删源不该掏空套餐；
+  - `channels` 是真正下发的频道，组内按 url 去重，`group` 一律写成分组名。
+- **有分组时 `packages[].channels` 必须为空**：同一批频道存两份会吃掉 900 KB 的库上限，
+  而且两份数据迟早对不上。展开时由 `packageChannels()` 按分组顺序拼出频道列表。
+- 老套餐只有扁平 `channels`（没有 `groups`），行为不变；编辑器可一键按频道自带的
+  分组名拆成两级。
+- 设备侧无感：`GET /api/config` 的 `iptv.channels` 依然是一条扁平列表，`group`
+  字段承载分组名，顺序 = 套餐顺序 + 分组顺序 + 组内顺序。
+
 ### id 规则
 
 | 对象 | 格式 | 说明 |
 |---|---|---|
 | IPTV 源 | `s_` + 8 位十六进制 | 编辑器缺省时由服务端补发 |
 | IPTV 套餐 | `pkg_` + 8 位十六进制 | 同上 |
+| IPTV 套餐分组 | `g_` + 8 位十六进制 | 缺省/重复时服务端补发 |
 | TVBox 源 | `vs_` + 8 位十六进制 | 同上 |
 | 在线更新版本 | `up_` + 8 位十六进制 | 同上；设备侧 `sections.update.updateId` 引用它 |
 | TVBox 站点 | `${sourceId}:${key}`，须匹配 `^[A-Za-z0-9_:-]{1,96}$` | 由 `sourceId` + 站点 key 派生；传入的 id 合法且属于同一源时沿用 |
@@ -370,6 +396,8 @@ TVBox 配置顶层的 `spider` 常见写法是 `"./fty.jar;md5;<hash>"`（FongMi
 |---|---|---|
 | `iptv.sources` | 30 | warning + 截断 |
 | `iptv.packages` | 12 | warning + 截断 |
+| 每个套餐的分组 | 24 | warning + 截断 |
+| 单个分组的频道 | 800 | warning + 截断 |
 | 所有套餐频道数之和 | 5000 | warning + 按剩余额度截断 |
 | 单个套餐展开后的频道 | 3000 | 展开时截断 |
 | `vod.sources` | 20 | warning + 截断 |

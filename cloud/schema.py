@@ -87,6 +87,9 @@ MAX_DOCUMENT_BYTES = 900 * 1024
 # 所有套餐频道数之和的硬上限，用于稳在 MAX_DOCUMENT_BYTES=900KB 内。
 MAX_IPTV_PACKAGES = 12
 MAX_PACKAGE_CHANNELS_TOTAL = 5000
+# 套餐两级结构「分组 → 频道」：分组是终端频道列表的一级，每组可引用一条 IPTV 源。
+MAX_IPTV_GROUPS = 24
+MAX_GROUP_CHANNELS = 800
 
 MAX_IPTV_HEADER_LIMITS: tuple[tuple[str, int], ...] = (
     ("userAgent", 500),
@@ -185,6 +188,8 @@ MAX_APK_BYTES = 200 * 1024 * 1024
 # 库内 id 由编辑器生成，格式固定，便于设备侧引用时做正则校验。
 _LIB_SOURCE_ID_RE = re.compile(r"^s_[0-9a-f]{8}$")
 _LIB_PACKAGE_ID_RE = re.compile(r"^pkg_[0-9a-f]{8}$")
+# 套餐分组 id，与 contract.js 的 GROUP_ID_RE 对齐。
+_GROUP_ID_RE = re.compile(r"^g_[0-9a-f]{8}$")
 _LIB_VOD_SOURCE_ID_RE = re.compile(r"^vs_[0-9a-f]{8}$")
 # 「在线更新版本」id，设备侧 sections.update.updateId 引用它。
 _LIB_UPDATE_ID_RE = re.compile(r"^up_[0-9a-f]{8}$")
@@ -713,6 +718,88 @@ def _normalize_channels(raw: Any, field: str, warnings: list[str]) -> list[dict]
     return channels
 
 
+def package_channels(pkg: dict) -> list[dict]:
+    """套餐真正会被下发的频道：有分组按分组顺序展开，否则用扁平列表（老套餐）。"""
+    groups = pkg.get("groups") if isinstance(pkg.get("groups"), list) else []
+    if not groups:
+        raw = pkg.get("channels")
+        return raw if isinstance(raw, list) else []
+    out: list[dict] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("name") or "").strip()
+        for channel in group.get("channels") or []:
+            if not isinstance(channel, dict):
+                continue
+            item = dict(channel)
+            item["group"] = name or str(channel.get("group") or "")
+            out.append(item)
+    return out
+
+
+def _normalize_package_groups(raw: Any, field: str, warnings: list[str],
+                              budget: int, source_ids: set[str] | None) -> list[dict]:
+    """校验并规整套餐分组（两级结构的一级）。
+
+    - 分组 id 缺失/非法/重复就地补发，避免同一份 JSON 出现两个同 id 分组；
+    - sourceId 只允许指向资源库里的源；源被删掉时保留频道、只把来源置空——
+      用户要下发的是频道，删源不该顺手把套餐掏空；
+    - 组内按 url 去重，并把频道的 group 强制写成分组名。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError("%s 必须是数组" % field)
+    if len(raw) > MAX_IPTV_GROUPS:
+        warnings.append("%s: 超过 %d 个分组上限，已截断" % (field, MAX_IPTV_GROUPS))
+    groups: list[dict] = []
+    taken: set[str] = set()
+    total = 0
+    for entry in raw[:MAX_IPTV_GROUPS]:
+        if not isinstance(entry, dict):
+            warnings.append("%s: 忽略非对象分组" % field)
+            continue
+        group_id = str(entry.get("id") or "").strip()
+        if not _GROUP_ID_RE.match(group_id) or group_id in taken:
+            group_id = _new_library_id("g_", taken)
+        name = str(entry.get("name") or "").strip()[:32] or ("分组 %d" % (len(groups) + 1))
+        source_id = str(entry.get("sourceId") or "").strip()
+        if source_id and not _LIB_SOURCE_ID_RE.match(source_id):
+            warnings.append("%s[%s]: 忽略非法来源 id %s" % (field, name, source_id))
+            source_id = ""
+        if source_id and source_ids is not None and source_id not in source_ids:
+            warnings.append("%s[%s]: 来源 %s 不在资源库里，已置空（频道保留）"
+                            % (field, name, source_id))
+            source_id = ""
+        room = min(budget - total, MAX_GROUP_CHANNELS)
+        if room <= 0:
+            warnings.append("%s: 频道数达到上限，已截断" % field)
+            break
+        raw_channels = entry.get("channels") or []
+        if not isinstance(raw_channels, list):
+            raise ConfigError("%s[%s].channels 必须是数组" % (field, name))
+        decorated = []
+        for channel in raw_channels:
+            if isinstance(channel, dict):
+                item = dict(channel)
+                item["group"] = name
+                decorated.append(item)
+            else:
+                decorated.append(channel)
+        channels = (_normalize_channels(decorated, "%s[%s].channels" % (field, name), warnings)
+                    or [])[:room]
+        total += len(channels)
+        taken.add(group_id)
+        groups.append({
+            "id": group_id,
+            "name": name,
+            "sourceId": source_id,
+            "channels": channels,
+        })
+    return groups
+
+
 def _normalize_packages(raw: Any, warnings: list[str]) -> list[dict] | None:
     """规范化套餐库；raw 为 None 表示未提供，调用方保留 seed 值。"""
     if raw is None:
@@ -741,8 +828,12 @@ def _normalize_packages(raw: Any, warnings: list[str]) -> list[dict] | None:
             warnings.append("iptv.packages: 频道总数达到 %d 上限，已截断"
                             % MAX_PACKAGE_CHANNELS_TOTAL)
             break
-        channels = _normalize_channels(item.get("channels") or [],
-                                       field + ".channels", warnings)[:room]
+        groups = _normalize_package_groups(item.get("groups"),
+                                          field + ".groups", warnings, room, None)
+        # 有分组时频道只留在分组里：再存一份扁平 channels 会让同一批频道在
+        # 文档里出现两次（设备文档有 900 KB 上限）。
+        channels = [] if groups else _normalize_channels(
+            item.get("channels") or [], field + ".channels", warnings)[:room]
         sources = _str_list(item.get("sources"), field + ".sources")
         if sources is None:
             pkg_sources: list[str] = []
@@ -750,12 +841,17 @@ def _normalize_packages(raw: Any, warnings: list[str]) -> list[dict] | None:
             pkg_sources = [src for src in sources if _URL_RE.match(src)][:MAX_PACKAGE_SOURCES]
             if len(pkg_sources) < len(sources):
                 warnings.append("%s.sources: 已忽略非 http(s) 地址" % field)
-        total_channels += len(channels)
+        if groups:
+            for group in groups:
+                if group["sourceId"] and group["sourceId"] not in pkg_sources:
+                    pkg_sources.append(group["sourceId"])
+        total_channels += len(package_channels({"groups": groups})) if groups else len(channels)
         seen_ids.add(pkg_id)
         packages.append({
             "id": pkg_id,
             "name": _str(item.get("name"), pkg_id, field + ".name", MAX_PACKAGE_NAME_LEN),
             "sources": pkg_sources,
+            "groups": groups,
             "channels": channels,
         })
     return packages
@@ -1063,9 +1159,7 @@ def expand_iptv_channels(sections: dict, library: dict | None = None) -> dict:
         pkg = by_id.get(pid)
         if not isinstance(pkg, dict):
             continue
-        chans = pkg.get("channels")
-        if isinstance(chans, list):
-            merged.extend(chans)
+        merged.extend(package_channels(pkg))
     # 第 4 档：引用库时把设备自有的内联频道接在后面（库频道优先）。
     if use_library:
         merged.extend(inline_channels)
@@ -1195,13 +1289,22 @@ def _normalize_library_iptv(part: Any, warnings: list[str]) -> dict:
                 warnings.append("library.iptv.packages: 频道总数达到 %d 上限，已截断"
                                 % MAX_PACKAGE_CHANNELS_TOTAL)
                 break
+            groups = _normalize_package_groups(item.get("groups"),
+                                               "library.iptv.packages[%s].groups" % pkg_id,
+                                               warnings, room, source_ids)
+            # 有分组时频道只留在分组里，扁平 channels 清空：同一批频道存两份
+            # 会把 900 KB 的库上限吃掉一大半，而且两份数据迟早对不上。
             channel_field = "library.iptv.packages[%s].channels" % pkg_id
-            channels = _normalize_channels(item.get("channels") or [], channel_field,
-                                           warnings)[:room]
+            channels = [] if groups else _normalize_channels(
+                item.get("channels") or [], channel_field, warnings)[:room]
             refs = _string_array(item.get("sources"),
                                  "library.iptv.packages[%s].sources" % pkg_id,
                                  MAX_LIBRARY_SOURCES) or []
             sources: list[str] = []
+            # 分组引用的源本身就是套餐的来源，不必让用户再勾一遍。
+            for group in groups:
+                if group["sourceId"] and group["sourceId"] not in sources:
+                    sources.append(group["sourceId"])
             for ref in refs:
                 # 编辑器历史版本存的是订阅 URL，这里兼容成 sourceId，避免来源信息丢失。
                 source_id = ref
@@ -1213,13 +1316,15 @@ def _normalize_library_iptv(part: Any, warnings: list[str]) -> dict:
                     continue
                 if source_id not in sources:
                     sources.append(source_id)
-            total_channels += len(channels)
+            total_channels += (len(package_channels({"groups": groups}))
+                               if groups else len(channels))
             taken.add(pkg_id)
             out["packages"].append({
                 "id": pkg_id,
                 "name": _str(item.get("name"), "", "library.iptv.packages.name", 64)
                         or pkg_id,
                 "sources": sources,
+                "groups": groups,
                 "channels": channels,
             })
     return out
