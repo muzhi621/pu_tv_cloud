@@ -33,8 +33,19 @@ export const AUTH_ACCOUNT_KEY = 'auth_account';
 export const AUTH_SESSIONS_KEY = 'auth_sessions';
 export const AUTH_GUARD_KEY = 'auth_guard';
 
-/** PBKDF2-SHA256 迭代次数：V8 上约 100ms，足够挡住离线爆破又不拖慢登录。 */
-const PBKDF2_ITERATIONS = 120000;
+/**
+ * PBKDF2-SHA256 迭代次数。
+ *
+ * **必须 ≤ 100000**：EdgeOne 运行时的 WebCrypto 对 deriveBits 的迭代次数有硬上限，
+ * 120000 会直接抛平台错误 `Error: Param Invalid`（实测 100000 通过、200000 失败），
+ * 而 `loadAccount` 在首次登录时就要算一次哈希并落 KV，于是整个登录接口 500。
+ * 这个错误没有堆栈、只有一句平台文案，曾经把问题指向 KV 写入，实际是算法参数。
+ *
+ * 10 万次在 V8 上约 60~80ms，对单管理员账号够用；盐 16 字节、摘要 32 字节不变。
+ */
+const PBKDF2_ITERATIONS = 100000;
+/** 运行时上限（实测值）。旧账号若记着更大的数，校验时会明确报错而不是 500 空错误。 */
+export const PBKDF2_MAX_ITERATIONS = 100000;
 const SALT_BYTES = 16;
 const SESSION_TOKEN_BYTES = 32;
 const MAX_SESSIONS = 20;
@@ -151,6 +162,14 @@ export async function loadAccount(env) {
 
 export async function verifyPassword(account, password) {
   if (!account || !account.salt || !account.hash) return false;
+  if (Number(account.iterations) > PBKDF2_MAX_ITERATIONS) {
+    // 只可能来自早期版本（或手改的 KV）：运行时算不了这么大的迭代，
+    // 与其抛平台文案，不如给出「删掉 auth_account 重新初始化」的明确指引。
+    throw new Error(
+      `账号记录的 PBKDF2 迭代次数 ${account.iterations} 超出运行时上限`
+      + ` ${PBKDF2_MAX_ITERATIONS}，请删除存储里的 auth_account 后重新部署初始化`,
+    );
+  }
   const candidate = await pbkdf2Hex(String(password || ''), account.salt, account.iterations);
   return safeEqual(candidate, account.hash);
 }
