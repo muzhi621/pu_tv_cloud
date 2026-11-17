@@ -92,7 +92,9 @@ def write_all(check_only: bool = False) -> bool:
             ok = False
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        # newline 必须显式指定：默认值在 Windows 上会把 \n 写成 \r\n，于是本地
+        # 生成的产物与 CI（Linux）逐字节不同，提交历史里就只剩一整片换行符噪音。
+        path.write_text(content, encoding="utf-8", newline="\n")
         print("GEN  %s (%d bytes)" % (path.relative_to(ROOT), len(content.encode("utf-8"))))
     return ok
 
