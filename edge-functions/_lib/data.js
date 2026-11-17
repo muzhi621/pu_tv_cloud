@@ -48,6 +48,13 @@ export const SEED = {
       "settings": {
         "managed": false,
         "enabledEntryPaths": []
+      },
+      "wallpaper": {
+        "enabled": false,
+        "imageUrl": "",
+        "boxFit": "cover",
+        "blurSigma": 0,
+        "maskOpacityPercent": 35
       }
     },
     "startup": {

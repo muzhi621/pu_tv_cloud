@@ -59,6 +59,9 @@ VALID_MENU_BY_LOWER = _id_index(VALID_MENU_IDS)
 # children 用「原始大小写」精确比对（与 contract.js 的 VALID_CHILD_IDS 一致）。
 VALID_GROUP_IDS: frozenset[str] = frozenset({"iptv", "vod", "settings"})
 VALID_CHILD_IDS: frozenset[str] = frozenset(VALID_MENU_IDS) | {"settings"}
+# Flutter BoxFit 常用枚举：壁纸填充方式，与客户端 BackgroundConfigModel.boxFit 对齐。
+VALID_BOX_FITS: frozenset[str] = frozenset(
+    {"cover", "contain", "fill", "fitWidth", "fitHeight", "none", "scaleDown"})
 MAX_NAV_GROUPS = 8
 MAX_NAV_CHILDREN = 30
 MAX_NAV_LABEL_LEN = 32
@@ -426,6 +429,31 @@ def normalize_navigation(part: dict, warnings: list[str]) -> dict:
         base["settings"] = settings
     elif settings_part is not None:
         raise ConfigError("navigation.settings 必须是对象")
+
+    # 首页壁纸（全局背景）：云端上传图片后下发绝对 http(s) 地址。
+    # enabled=false 时终端零影响；地址必须是 http(s)，防止 javascript:/data: 注入。
+    wallpaper_part = part.get("wallpaper")
+    if isinstance(wallpaper_part, dict):
+        wallpaper = copy.deepcopy(base["wallpaper"])
+        wallpaper["enabled"] = _bool(
+            wallpaper_part.get("enabled"), False, "navigation.wallpaper.enabled")
+        image_url = _str(wallpaper_part.get("imageUrl"), "",
+                         "navigation.wallpaper.imageUrl", 512)
+        if image_url and not image_url.lower().startswith(("http://", "https://")):
+            raise ConfigError("navigation.wallpaper.imageUrl 必须是 http(s) 图片地址")
+        wallpaper["imageUrl"] = image_url
+        wallpaper["boxFit"] = _enum(
+            wallpaper_part.get("boxFit"), "cover", VALID_BOX_FITS,
+            "navigation.wallpaper.boxFit")
+        wallpaper["blurSigma"] = _int(
+            wallpaper_part.get("blurSigma"), 0, 0, 60,
+            "navigation.wallpaper.blurSigma")
+        wallpaper["maskOpacityPercent"] = _int(
+            wallpaper_part.get("maskOpacityPercent"), 35, 0, 100,
+            "navigation.wallpaper.maskOpacityPercent")
+        base["wallpaper"] = wallpaper
+    elif wallpaper_part is not None:
+        raise ConfigError("navigation.wallpaper 必须是对象")
     return base
 
 

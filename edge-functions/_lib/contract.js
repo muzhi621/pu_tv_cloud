@@ -312,6 +312,10 @@ function filterIds(raw, validIndex, seed, field, warnings) {
 /** 一级导航块：IPTV / 影音（类 TVBox）/ 设置；二级项沿用菜单 id。 */
 const VALID_GROUP_IDS = new Set(['iptv', 'vod', 'settings']);
 const VALID_CHILD_IDS = new Set([...VALID_MENU_IDS, 'settings']);
+// Flutter BoxFit 常用枚举：壁纸填充方式，与客户端 BackgroundConfigModel.boxFit 对齐。
+const VALID_BOX_FITS = new Set([
+  'cover', 'contain', 'fill', 'fitWidth', 'fitHeight', 'none', 'scaleDown',
+]);
 const MAX_NAV_GROUPS = 8;
 
 function normalizeNavigation(part, warnings) {
@@ -382,6 +386,29 @@ function normalizeNavigation(part, warnings) {
     const paths = strList(settingsPart.enabledEntryPaths, 'navigation.settings.enabledEntryPaths');
     if (paths !== undefined) settings.enabledEntryPaths = paths.slice(0, 200);
     base.settings = settings;
+  }
+
+  // 首页壁纸（全局背景）：云端上传图片后下发绝对 http(s) 地址。
+  // enabled=false 时终端零影响；地址必须是 http(s)，防止 javascript:/data: 注入。
+  const wallpaperPart = part.wallpaper;
+  if (wallpaperPart !== undefined && wallpaperPart !== null) {
+    if (typeof wallpaperPart !== 'object' || Array.isArray(wallpaperPart)) {
+      throw new ConfigError('navigation.wallpaper 必须是对象');
+    }
+    const wallpaper = clone(base.wallpaper);
+    wallpaper.enabled = bool(wallpaperPart.enabled, false, 'navigation.wallpaper.enabled');
+    const imageUrl = str(wallpaperPart.imageUrl, '', 'navigation.wallpaper.imageUrl', 512);
+    if (imageUrl && !/^https?:\/\//i.test(imageUrl)) {
+      throw new ConfigError('navigation.wallpaper.imageUrl 必须是 http(s) 图片地址');
+    }
+    wallpaper.imageUrl = imageUrl;
+    wallpaper.boxFit = enumeration(wallpaperPart.boxFit, 'cover', VALID_BOX_FITS,
+      'navigation.wallpaper.boxFit');
+    wallpaper.blurSigma = int(wallpaperPart.blurSigma, 0, 0, 60,
+      'navigation.wallpaper.blurSigma');
+    wallpaper.maskOpacityPercent = int(wallpaperPart.maskOpacityPercent, 35, 0, 100,
+      'navigation.wallpaper.maskOpacityPercent');
+    base.wallpaper = wallpaper;
   }
   return base;
 }

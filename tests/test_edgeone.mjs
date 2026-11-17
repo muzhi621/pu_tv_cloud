@@ -275,6 +275,78 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.throws(() => normalizeDocument({ schemaVersion: 2, sections: {} }), /不支持的 schemaVersion/);
   });
 
+  await t.test('首页壁纸：默认值、合法下发与安全校验', async () => {
+    // 缺省补齐：未提交 wallpaper 时用 seed 默认值，enabled=false 不影响终端。
+    const [fresh] = normalizeSections({ navigation: {} });
+    assert.deepEqual(fresh.navigation.wallpaper, {
+      enabled: false, imageUrl: '', boxFit: 'cover',
+      blurSigma: 0, maskOpacityPercent: 35,
+    });
+
+    // 合法下发：http(s) 地址 + 样式字段全部保留。
+    const [ok] = normalizeSections({ navigation: { wallpaper: {
+      enabled: true,
+      imageUrl: 'https://tv.1008618.xyz/api/assets?id=as_abc123',
+      boxFit: 'contain', blurSigma: 12, maskOpacityPercent: 55,
+    } } });
+    assert.equal(ok.navigation.wallpaper.enabled, true);
+    assert.equal(ok.navigation.wallpaper.imageUrl,
+      'https://tv.1008618.xyz/api/assets?id=as_abc123');
+    assert.equal(ok.navigation.wallpaper.boxFit, 'contain');
+    assert.equal(ok.navigation.wallpaper.blurSigma, 12);
+    assert.equal(ok.navigation.wallpaper.maskOpacityPercent, 55);
+
+    // 非法地址直接拒绝：javascript:/data:/相对路径都不允许，防存储型注入。
+    for (const bad of ['javascript:alert(1)', 'data:image/png;base64,aaa', '/api/assets?id=x']) {
+      assert.throws(
+        () => normalizeSections({ navigation: { wallpaper: { enabled: true, imageUrl: bad } } }),
+        /imageUrl 必须是 http\(s\)/,
+      );
+    }
+
+    // 越界数值严格抛错（int 契约不夹取）；非法 boxFit 也是严格枚举抛错。
+    assert.throws(
+      () => normalizeSections({ navigation: { wallpaper: {
+        imageUrl: 'https://example.com/w.jpg', blurSigma: 999,
+      } } }),
+      /blurSigma 必须在 0~60/,
+    );
+    assert.throws(
+      () => normalizeSections({ navigation: { wallpaper: {
+        imageUrl: 'https://example.com/w.jpg', maskOpacityPercent: -5,
+      } } }),
+      /maskOpacityPercent 必须在 0~100/,
+    );
+    assert.throws(
+      () => normalizeSections({ navigation: { wallpaper: {
+        imageUrl: 'https://example.com/w.jpg', boxFit: 'bogus',
+      } } }),
+      /boxFit 必须是/,
+    );
+
+    // 类型错误：wallpaper 非对象直接报错。
+    assert.throws(
+      () => normalizeSections({ navigation: { wallpaper: 'oops' } }),
+      /wallpaper 必须是对象/,
+    );
+
+    // 走真实 PUT → GET 落库链路，确认下发后端到端保留 wallpaper。
+    // If-Match 取当前 revision，避免依赖前面用例留下的固定版本号。
+    const before = await json(await configGet(ctx('GET', '/api/config')));
+    const put = await configPut(ctx('PUT', '/api/config', {
+      headers: { 'If-Match': String(before.revision) },
+      body: { sections: {
+        navigation: { managed: true, wallpaper: {
+          enabled: true, imageUrl: 'https://cdn.example.com/bg.jpg',
+        } },
+      } },
+    }));
+    assert.equal(put.status, 200);
+    const got = await json(await configGet(ctx('GET', '/api/config')));
+    assert.equal(got.sections.navigation.wallpaper.enabled, true);
+    assert.equal(got.sections.navigation.wallpaper.imageUrl, 'https://cdn.example.com/bg.jpg');
+  });
+
   await t.test('KV 键名符合平台限制（字母数字下划线）', () => {
     for (const key of kv.map.keys()) {
       assert.match(key, /^[A-Za-z0-9_]+$/, `非法 KV key: ${key}`);

@@ -124,6 +124,43 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(sections["navigation"]["settings"]["managed"])
         self.assertEqual(sections["navigation"]["settings"]["enabledEntryPaths"], ["/settings/theme"])
 
+    def test_wallpaper_defaults_and_http_only(self):
+        """首页壁纸：缺省补齐；imageUrl 仅接受 http(s)；样式夹到合法区间。"""
+        sections, _ = normalize_sections({"navigation": {}})
+        self.assertEqual(sections["navigation"]["wallpaper"], {
+            "enabled": False, "imageUrl": "", "boxFit": "cover",
+            "blurSigma": 0, "maskOpacityPercent": 35,
+        })
+
+        sections, _ = normalize_sections({"navigation": {"wallpaper": {
+            "enabled": True, "imageUrl": "https://cdn.example.com/bg.jpg",
+            "boxFit": "contain", "blurSigma": 12, "maskOpacityPercent": 55,
+        }}})
+        wp = sections["navigation"]["wallpaper"]
+        self.assertTrue(wp["enabled"])
+        self.assertEqual(wp["imageUrl"], "https://cdn.example.com/bg.jpg")
+        self.assertEqual(wp["boxFit"], "contain")
+        self.assertEqual(wp["blurSigma"], 12)
+        self.assertEqual(wp["maskOpacityPercent"], 55)
+
+        for bad in ("javascript:alert(1)", "data:image/png;base64,aaa", "/api/assets?id=x"):
+            with self.assertRaises(ValueError):
+                normalize_sections({"navigation": {"wallpaper": {"imageUrl": bad}}})
+
+        # 越界数值与非法 boxFit 都是严格抛错（与 contract.js 一致）。
+        with self.assertRaises(ValueError):
+            normalize_sections({"navigation": {"wallpaper": {
+                "imageUrl": "https://example.com/w.jpg", "blurSigma": 999,
+            }}})
+        with self.assertRaises(ValueError):
+            normalize_sections({"navigation": {"wallpaper": {
+                "imageUrl": "https://example.com/w.jpg", "maskOpacityPercent": -5,
+            }}})
+        with self.assertRaises(ValueError):
+            normalize_sections({"navigation": {"wallpaper": {
+                "imageUrl": "https://example.com/w.jpg", "boxFit": "bogus",
+            }}})
+
 
 class NavigationGroupsTests(unittest.TestCase):
     """navigation.groups / defaultGroupId 与 contract.js normalizeNavigation 对齐。"""

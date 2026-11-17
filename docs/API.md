@@ -42,7 +42,7 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 | GET | `/api/bundles` | read | **仅 EdgeOne** | 下发套餐库（导航/弹窗/源选择组合）；额外返回 `usage{packageId: 设备数}` |
 | PUT | `/api/bundles` | write | **仅 EdgeOne** | 覆盖整库；需 `If-Match`，返回 `{revision, updatedAt, warnings, affectedDevices}` |
 | POST | `/api/bundles` | write | **仅 EdgeOne** | `{deviceId, bundleId}` 一次完成绑定 + 立即渲染（`bundleId: ""` 为解绑） |
-| POST | `/api/assets` | write | **仅 EdgeOne** | 上传小图片（退出弹窗二维码等），≤512 KB，PNG/JPG/WEBP/GIF，返回 `{id, url}` |
+| POST | `/api/assets` | write | **仅 EdgeOne** | 上传小图片（退出弹窗二维码、首页壁纸等），≤512 KB，PNG/JPG/WEBP/GIF，返回 `{id, url}` |
 | GET | `/api/assets?id=` | **无需鉴权** | **仅 EdgeOne** | 公开读取上一步上传的图片（终端用 CachedNetworkImage 拉，带不了令牌） |
 | GET | `/api/devices` | read | **仅 EdgeOne** | 设备注册表（在线/离线、别名、绑定套餐、最近下发、拉黑列表、在线判定窗口） |
 | POST | `/api/devices` | write | **仅 EdgeOne** | 10 种管理动作（`bind` / `push` / `rename` / `delete` / `restore` / `purge` / `block` / `unblock` …），支持单台 / 批量 |
@@ -69,6 +69,9 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
                    ],
                    "defaultGroupId": "iptv",
                    "sidebarExpanded": false, "homeKeepAlive": true,
+                   "wallpaper": {"enabled": true,
+                     "imageUrl": "https://tv.1008618.xyz/api/assets?id=as_abc123",
+                     "boxFit": "cover", "blurSigma": 0, "maskOpacityPercent": 35},
                    "settings": {"managed": false, "enabledEntryPaths": []}},
     "startup": {"managed": true, "agreement": {"enabled": true, "requiredVersion": 2,
                  "titleI18n": {"zh": "用户协议"}, "bodyI18n": {}},
@@ -175,6 +178,14 @@ curl -X PUT "$BASE/api/config" \
   全部非法则回退 seed 默认 4 组。
 - `navigation.defaultGroupId`：默认 `iptv`，必须是 `groups` 里存在的 id，否则记
   warning 并保持原值（seed 值）。
+- `navigation.wallpaper`：**首页壁纸（全局背景）**，`{enabled, imageUrl, boxFit,
+  blurSigma, maskOpacityPercent}`。图片由编辑器上传到 `/api/assets` 后得到绝对
+  http(s) 地址（见「素材上传」）；`imageUrl` 仅接受 http(s)（防 javascript:/data:
+  注入），留空表示终端沿用本地壁纸。`boxFit` 取 `cover`(默认) / `contain` / `fill`
+  / `fitWidth` / `fitHeight` / `scaleDown` / `none`；`blurSigma` 0-60；
+  `maskOpacityPercent` 0-100（越大文字越清晰）。**独立于 `navigation.managed`**：
+  只需 `enabled=true` 即下发，不接管导航白名单。终端首次应用前保存本地背景快照，
+  关闭下发时自动还原。
 - `startup.exitDialog`：`{enabled, mode, dismissible, showDonate, titleI18n, bodyI18n}`，
   `mode` 取 `always` / `once_per_revision` / `never`；`enabled=false` 表示不接管，
   终端沿用本地原弹窗，保证升级平滑。

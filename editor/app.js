@@ -71,8 +71,10 @@ function setPath(obj, path, value) {
   // 用户改了内容却忘了勾「云端接管本节」，保存后不生效——这里顺手打开，
   // 少一个必踩的坑。显式取消 managed 的勾选不受影响（keys[1] === 'managed'）。
   const section = keys[0];
+  // navigation.wallpaper 是独立功能（客户端不看 managed 门槛），改它不应连带
+  // 打开导航白名单接管，否则用户只想设个壁纸却把菜单也改了。
   if ((section === 'iptv' || section === 'vod' || section === 'navigation')
-      && keys.length > 1 && keys[1] !== 'managed'
+      && keys.length > 1 && keys[1] !== 'managed' && keys[1] !== 'wallpaper'
       && obj[section] && typeof obj[section] === 'object' && !Array.isArray(obj[section])) {
     obj[section].managed = true;
   }
@@ -229,6 +231,7 @@ function renderNavigation() {
       checkline('navigation.sidebarExpanded', '侧栏默认展开') +
       checkline('navigation.homeKeepAlive', '首页页面缓存') +
     '</div>' +
+    wallpaperField() +
     '<h2 style="margin-top:24px">设置菜单目录（P1 预留）</h2>' +
     '<p class="hint">P0 终端尚未接线，此处填写不会生效；P1 上线后可按 AppRoutes 路径隐藏已有设置条目，不允许新增。</p>' +
     '<div class="checkline"><input class="switch" type="checkbox" data-path="navigation.settings.managed"' +
@@ -2567,6 +2570,73 @@ async function uploadQrImage(file) {
   }
 }
 
+/**
+ * 首页壁纸（全局背景）：上传到 /api/assets 后下发绝对 http(s) 地址。
+ * 与二维码共用同一上传通道，受同一上限（512 KB）约束——建议 16:9 横图压缩后上传。
+ */
+function wallpaperField() {
+  const value = String(getPath(state.doc.sections, 'navigation.wallpaper.imageUrl') || '');
+  const isImage = /^https?:\/\//i.test(value) || value.startsWith('data:');
+  return '<h3 style="margin-top:24px">首页壁纸（全局背景）</h3>' +
+    '<p class="hint">上传后下发到所有终端的主界面背景。留空或关闭开关时终端沿用本地壁纸设置。</p>' +
+    checkline('navigation.wallpaper.enabled', '启用云端壁纸') +
+    '<label class="df-field"><span>壁纸图片地址（http/https）</span>' +
+      '<input type="text" data-df="navigation.wallpaper.imageUrl" value="' + esc(value) +
+      '" placeholder="留空 = 终端用本地壁纸；也可以直接上传">' +
+    '</label>' +
+    '<div class="qr-upload">' +
+      '<input type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-wallpaper-upload>' +
+      '<span class="meta">PNG / JPG / WEBP / GIF，≤ 512 KB，建议 16:9 横图并压缩</span>' +
+    '</div>' +
+    '<div class="wp-preview-box">' +
+      (isImage
+        ? '<img class="qr-preview" src="' + esc(value) + '" alt="壁纸预览">'
+        : '<span class="meta">未设置壁纸</span>') +
+    '</div>' +
+    '<div class="row">' +
+      selectField('navigation.wallpaper.boxFit', '填充方式', [
+        { value: 'cover', label: 'cover（铺满裁切，推荐）' },
+        { value: 'contain', label: 'contain（完整显示）' },
+        { value: 'fill', label: 'fill（拉伸）' },
+        { value: 'fitWidth', label: 'fitWidth（按比例铺满宽）' },
+        { value: 'fitHeight', label: 'fitHeight（按比例铺满高）' },
+        { value: 'scaleDown', label: 'scaleDown（仅缩小）' },
+        { value: 'none', label: 'none（原始尺寸）' },
+      ]) +
+      textField('navigation.wallpaper.blurSigma', '背景模糊（0-60，0 = 不模糊）', 'number') +
+      textField('navigation.wallpaper.maskOpacityPercent', '遮罩不透明度（0-100，越大文字越清晰）', 'number') +
+    '</div>';
+}
+
+async function uploadWallpaper(file) {
+  if (!state.doc || !file) return;
+  if (file.size > 512 * 1024) {
+    message('壁纸图片请小于 512 KB（与云端素材上限一致）。请用 16:9 横图并适当压缩：1920×1080 的 JPG 通常 200-400 KB。', 'err');
+    return;
+  }
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+  try {
+    const res = await request('/api/assets', {
+      write: true, method: 'POST',
+      body: JSON.stringify({ data: dataUrl, name: file.name }),
+    });
+    const base = (state.base || window.location.origin).replace(/\/$/, '');
+    const url = /^https?:/i.test(res.url) ? res.url : base + res.url;
+    setPath(state.doc.sections, 'navigation.wallpaper.imageUrl', url);
+    setPath(state.doc.sections, 'navigation.wallpaper.enabled', true);
+    markDirty();
+    toast('壁纸已上传并启用');
+    render();
+  } catch (error) {
+    message('上传失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
 function sectionsFormHtml() {
   const menus = menuItems();
   // 空分组就地补默认三大类：套餐与终端无关，界面不能因为「还没加载过文档」
@@ -3157,6 +3227,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if ('qrUpload' in target.dataset) {
       const file = target.files && target.files[0];
       if (file) uploadQrImage(file);
+      return;
+    }
+    if ('wallpaperUpload' in target.dataset) {
+      const file = target.files && target.files[0];
+      if (file) uploadWallpaper(file);
       return;
     }
     if (target.dataset.libInput) { onLibraryInput(target); return; }

@@ -1,5 +1,5 @@
 /**
- * /api/assets —— 编辑器上传的小图片（退出弹窗二维码等）。
+ * /api/assets —— 编辑器上传的小图片（退出弹窗二维码、首页壁纸等）。
  *
  * POST  上传（写令牌）：body `{ data: 'data:image/png;base64,...' | '<base64>', name? }`
  *       返回 `{ id, url, size, contentType }`；`url` 是相对路径，编辑器补上 API 地址。

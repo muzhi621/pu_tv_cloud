@@ -413,6 +413,13 @@ textarea.raw {
   border-radius: var(--radius-md); background: var(--card); padding: 4px;
 }
 
+/* ================= 首页壁纸预览 ================= */
+.wp-preview-box { margin: 4px 0 12px; }
+.wp-preview-box .qr-preview {
+  display: block; width: 100%; max-width: 420px; max-height: 180px;
+  object-fit: cover; padding: 0;
+}
+
 /* ================= Toast ================= */
 .toast {
   position: fixed; right: 24px; bottom: 24px; z-index: 30;
