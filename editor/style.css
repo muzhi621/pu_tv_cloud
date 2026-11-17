@@ -395,9 +395,10 @@ textarea.raw {
 .lib-scroll { max-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 6px 10px; }
 .lib-site-row {
   display: grid;
-  grid-template-columns: 84px minmax(96px, 1fr) minmax(130px, 1.3fr) minmax(130px, 1fr) minmax(110px, 0.9fr);
+  grid-template-columns: 84px minmax(96px, 1fr) minmax(130px, 1.3fr) minmax(130px, 1fr) minmax(110px, 0.9fr) auto;
   gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--border);
 }
+.lib-site-row .tiny { white-space: nowrap; }
 .lib-site-row:last-child { border-bottom: 0; }
 .lib-site-api { font-size: 11px; color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lib-site-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
@@ -499,10 +500,6 @@ textarea.raw {
 .login-card .primary { justify-content: center; }
 .login-card .err { margin: 0; font-size: 12px; color: var(--destructive); }
 .login-card .err[hidden] { display: none; }
-.login-advanced { margin-top: 4px; font-size: 12px; color: var(--muted-foreground); }
-.login-advanced summary { cursor: pointer; }
-.login-advanced label { margin-top: 10px; }
-.login-advanced .ghost { margin-top: 10px; width: 100%; justify-content: center; }
 
 /* ============================================================
    IPTV 套餐：两级分组编辑 + 频道选择器
@@ -588,6 +585,20 @@ textarea.raw {
   border-bottom: 1px dashed var(--border);
   font-size: 12px;
 }
+.picker-section-count { margin-left: auto; }
+.picker-section-ops { display: flex; gap: 6px; }
+.picker-section-other .picker-section-head { border-bottom-color: var(--ring); }
+.picker-section-other .picker-name { color: var(--muted-foreground); }
+.picker-source {
+  display: flex; align-items: center; gap: 6px; margin-top: 8px;
+  font-size: 12px; color: var(--muted-foreground);
+}
+.picker-source select {
+  min-width: 200px; max-width: 100%;
+  padding: 5px 8px; font: inherit; font-size: 12px;
+  color: var(--foreground); background: var(--card);
+  border: 1px solid var(--input); border-radius: var(--radius-md);
+}
 .picker-row {
   display: flex; align-items: center; gap: 8px;
   padding: 5px 2px; font-size: 13px;
@@ -596,3 +607,61 @@ textarea.raw {
 .picker-row:hover { background: color-mix(in oklch, var(--foreground) 5%, transparent); }
 .picker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
+/* ============================================================
+   套餐预览：按终端（APK）的排列展开
+   左侧分组导航 + 右侧全量频道网格，序号即电视上的先后顺序。
+   ============================================================ */
+.plan-preview-card {
+  width: min(1020px, 100%);
+  max-height: 88vh;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 20px 22px;
+  background: var(--card);
+  color: var(--card-foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+}
+.preview-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.preview-head h2 { margin: 0 0 2px; font-size: 17px; font-weight: 600; }
+.preview-head .meta { margin: 0; }
+.preview-body {
+  flex: 1; min-height: 0;
+  display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 12px;
+}
+.preview-nav {
+  display: flex; flex-direction: column; gap: 4px;
+  overflow: auto; padding-right: 4px;
+  border-right: 1px solid var(--border);
+}
+.preview-nav-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 6px 8px; text-align: left;
+  font: inherit; font-size: 12px;
+  color: var(--foreground); background: transparent;
+  border: 0; border-radius: var(--radius-md); cursor: pointer;
+}
+.preview-nav-item:hover { background: color-mix(in oklch, var(--foreground) 6%, transparent); }
+.preview-main { overflow: auto; display: flex; flex-direction: column; gap: 14px; padding-right: 4px; }
+.preview-block {
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  padding: 10px 12px; background: var(--background);
+}
+.preview-block header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+  font-size: 13px;
+}
+.preview-block-index {
+  width: 20px; height: 20px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600;
+  color: var(--muted-foreground);
+  background: color-mix(in oklch, var(--foreground) 8%, transparent);
+  border-radius: 50%;
+}
+.preview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px 10px; }
+.preview-channel { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 0; }
+.preview-num { min-width: 26px; text-align: right; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.preview-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

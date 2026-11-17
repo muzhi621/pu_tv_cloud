@@ -231,6 +231,8 @@ curl -X PUT "$BASE/api/config" \
     **只是首屏选谁，不是白名单**（白名单仍是 `siteIds`）。格式同站点 id，非法值记
     warning 并清空。EdgeOne 版展开时会复核它是否真的在本次下发的 `sites` 里，
     不在（站点被删 / 被 `siteIds` 排除）就清空，终端据此回退到第一个站点。
+    这一项留空时，展开会兜底用**库级** `library.vod.defaultSiteId`（见下），
+    所以「在 TVBox 源页设为默认」对所有没单独指定的套餐 / 终端都生效；
   - `sources` / `sites` 是**展开产物**：GET `/api/config` 时由服务端按当前库实时写入，
     编辑器保存时会清掉未锁定设备的这两个字段（写了也等于把库的快照固化成人工配置）。
   - `vod.lockLibrary === true` 时相反：服务端完全不读库，只用这两个字段充当
@@ -311,7 +313,8 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
                  "addedAt": "2026-11-10T09:00:00+08:00", "note": ""}],
     "sites": [{"id": "vs_1a2b3c4d:csp_X", "sourceId": "vs_1a2b3c4d", "key": "csp_X",
                "name": "测试站点", "api": "csp_X", "ext": "token-abc", "type": 3,
-               "searchable": 1, "quickSearch": 0, "note": ""}]
+               "searchable": 1, "quickSearch": 0, "note": ""}],
+    "defaultSiteId": "vs_1a2b3c4d:csp_X"
   },
   "updates": [
     {"id": "up_1a2b3c4d", "name": "3.0.43 正式版",

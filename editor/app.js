@@ -3,9 +3,9 @@
 
 const state = {
   base: '',
-  token: '',          // 会话令牌（账号登录）或读令牌（令牌直连）
-  writeToken: '',     // 写令牌：仅「用令牌连接」时使用；会话模式为空
-  // '' = 未登录 | 'session' = 账号登录（读写都可用会话）| 'token' = 手填令牌
+  token: '',          // 会话令牌（只在账号登录后由 /api/auth/login 写入）
+  writeToken: '',     // 保留字段：令牌直连下线后恒为空
+  // '' = 未登录 | 'session' = 账号登录（读写都走会话）
   authMode: '',
   authUser: '',
   authExpiresAt: 0,
@@ -34,6 +34,8 @@ const state = {
   planPickerPkg: '',      // 频道选择器正在编辑的套餐
   planPickerGroup: '',    // 频道选择器正在编辑的分组
   planPickerSource: null, // 该分组绑定的源（对象）
+  planPickerOnlyPicked: false, // 选择器「只看已选」开关
+  planPreviewPkg: '',     // 预览弹窗正在看的套餐
   planSourceChannels: {}, // sourceId → {busy, channels, at, error}：源频道缓存
   tvboxUrl: '',           // TVBox 配置地址输入
   tvboxSummary: '',       // TVBox 最近一次导入摘要
@@ -346,23 +348,6 @@ async function onLoginSubmit(event) {
   } finally {
     if (button) button.disabled = false;
   }
-}
-
-/** 「用令牌连接」：给还没配账号的部署和终端调试留的后门。 */
-async function onTokenConnect() {
-  const tokenInput = $('apiToken');
-  const writeInput = $('apiWriteToken');
-  state.authMode = 'token';
-  state.token = tokenInput ? tokenInput.value.trim() : '';
-  state.writeToken = writeInput ? writeInput.value.trim() : '';
-  if (!state.token) {
-    loginError('请填写访问令牌，或用账号登录');
-    return;
-  }
-  loginError('');
-  hideLogin();
-  syncAccountBar();
-  await reloadAll();
 }
 
 function openPasswordDialog() {
@@ -827,7 +812,7 @@ function newLibraryId(kind) {
   return id;
 }
 
-/** 连接参数：地址固定同源，只有令牌输入框（高级兜底）还在页面上。 */
+/** 连接参数：地址固定同源，令牌直连已下线，这里只保证 base 有值。 */
 function syncConnection() {
   // 编辑器与 API 永远同源部署（/api/* 就在本站路径下），所以不再让人手填地址：
   // 多一个输入框只会让人填错域名、或把「连接并加载」误解成需要额外一步。
@@ -835,13 +820,6 @@ function syncConnection() {
   const typed = baseInput ? baseInput.value.trim() : '';
   if (typed) state.base = typed.replace(/\/$/, '');
   if (!state.base) state.base = window.location.origin;
-  // 会话模式下令牌不在输入框里：会话令牌由登录流程直接写进 state，
-  // 这里若照旧用输入框覆盖，会把登录态清成空串（登录成功却立刻 401）。
-  if (state.authMode === 'session') return;
-  const tokenInput = $('apiToken');
-  const writeInput = $('apiWriteToken');
-  state.token = tokenInput ? tokenInput.value.trim() : '';
-  state.writeToken = writeInput ? writeInput.value.trim() : '';
 }
 
 /**
@@ -1028,13 +1006,17 @@ function renderIptvDispatch() {
   const iptv = iptvSection();
   const pkgs = libraryPackages();
   const picked = new Set(arr(iptv.packageIds));
+  // 勾选顺序就是终端频道列表里套餐的先后：这里直接标出序号，省得猜。
+  const orderOf = new Map(arr(iptv.packageIds).map((id, index) => [id, index + 1]));
   const picker = pkgs === null
     ? libraryUnsupportedHtml()
     : (pkgs.length
       ? '<div class="df-multi">' + pkgs.map((pkg) => {
         const stats = packageGroupStats(pkg);
+        const seq = orderOf.get(pkg.id);
         return '<label><input type="checkbox" data-pkg="' + esc(pkg.id) + '"'
-          + (picked.has(pkg.id) ? ' checked' : '') + '> ' + esc(pkg.name)
+          + (picked.has(pkg.id) ? ' checked' : '') + '> '
+          + (seq ? '<span class="badge">#' + seq + '</span> ' : '') + esc(pkg.name)
           + '（' + (stats.groups ? stats.groups + ' 个分组 · ' : '')
           + stats.channels + ' 个频道）</label>';
       }).join('') + '</div>'
@@ -1043,11 +1025,10 @@ function renderIptvDispatch() {
 
   return head
     + '<p class="hint">当前对象：<strong>' + esc(deviceLabel()) + '</strong>。'
-    + '这里只勾选这台终端要下发的资源库套餐，套餐内容统一在「IPTV 源」页维护。</p>'
+    + '这里只能勾选「IPTV 套餐」（不能直接选导入的源），套餐内容在「IPTV 套餐」页维护。</p>'
     + managedHtml('iptv', ' IPTV 频道')
     + '<h3>资源库套餐</h3>'
-    + '<p class="meta">套餐的「分组 → 频道」在「IPTV 套餐」页维护；这里只勾选下发哪几个套餐，'
-    + '勾选顺序决定终端频道列表里套餐的先后。</p>'
+    + '<p class="meta">勾选顺序决定终端频道列表里套餐的先后（#1 在最前）。</p>'
     + picker
     + (pkgs === null ? '' :
       '<div class="checkline"><input class="switch" type="checkbox" data-path="iptv.lockLibrary"'
@@ -1279,6 +1260,7 @@ function renderIptvPlans() {
       + '<strong>' + esc(pkg.name || pkg.id) + '</strong>'
       + '<span class="meta">' + stats.groups + ' 个分组 · ' + stats.channels + ' 个频道</span>'
       + '<span class="lib-row-ops">'
+      + '<button class="tiny" data-lib="preview-plan" data-id="' + esc(pkg.id) + '">预览</button>'
       + '<button class="tiny danger" data-lib="delete-package" data-id="' + esc(pkg.id) + '">删除</button>'
       + '</span></div>';
   }).join('');
@@ -1308,6 +1290,8 @@ function renderIptvPlans() {
       + '<input class="lib-input" data-lib-input="plan-name" data-id="' + esc(current.id)
       + '" value="' + esc(current.name || '') + '"></label>'
       + '<button class="primary" data-lib="add-group" data-plan="' + esc(current.id) + '">新增分组</button>'
+      + '<button class="ghost" data-lib="preview-plan" data-id="' + esc(current.id)
+      + '">预览终端效果</button>'
       + (legacy
         ? '<button class="ghost" data-lib="split-plan" data-plan="' + esc(current.id)
           + '">把旧频道按分组拆成两级</button>'
@@ -1320,7 +1304,11 @@ function renderIptvPlans() {
       + (groups.length
         ? '<div class="plan-groups">' + groupRows + '</div>'
         : '<p class="muted">还没有分组。点「新增分组」，给它起个名字（如 央视 / 卫视）并选择来源。</p>')
-      + (groups.length ? '<h3>下发预览</h3>' + preview : '');
+      + (groups.length
+        ? '<h3>分组概览</h3>'
+          + '<p class="meta">这里只列每组前 12 个频道；要看完整顺序与全部频道，'
+          + '点上面的「预览终端效果」。</p>' + preview
+        : '');
   }
 
   return PLAN_HEAD
@@ -1396,6 +1384,47 @@ async function loadPlanSourceChannels(sourceId) {
   renderPlanPicker();
 }
 
+/** 频道 URL 归一化：勾选状态与「是否属于当前源」都按它比对。 */
+function channelKey(channel) {
+  return String((channel && channel.url) || '').trim().toLowerCase();
+}
+
+/**
+ * 选择器里的「来源」下拉：允许在这里直接换源，不必回分组行再点一次。
+ * 换源不会丢掉已经选好的频道——它们变成「其他来源」，确定时按原顺序保留，
+ * 这就是「跨源挑频道」：一个分组里可以同时有多个源的频道。
+ */
+function pickerSourceSelect(currentId) {
+  const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
+  if (!sources.length) return '';
+  return '<label class="picker-source">来源'
+    + '<select data-picker-source>' + sources.map((src) =>
+      '<option value="' + esc(src.id) + '"' + (src.id === currentId ? ' selected' : '') + '>'
+      + esc(src.name || src.url) + '</option>').join('') + '</select></label>';
+}
+
+function pickerSectionHtml(name, list, picked, extraClass) {
+  const rows = list.map((channel) => {
+    const url = String(channel.url || '');
+    return '<label class="picker-row" data-picker-row>'
+      + '<input type="checkbox" value="' + esc(url) + '" data-name="' + esc(channel.name)
+      + '" data-logo="' + esc(channel.logo || '') + '"'
+      + (picked.has(channelKey(channel)) ? ' checked' : '') + '>'
+      + '<span class="picker-name">' + esc(channel.name) + '</span>'
+      + '</label>';
+  }).join('');
+  return '<div class="picker-section' + (extraClass ? ' ' + extraClass : '')
+    + '" data-picker-section>'
+    + '<div class="picker-section-head"><strong>' + esc(name) + '</strong>'
+    + '<span class="meta picker-section-count"></span>'
+    + '<span class="picker-section-ops">'
+    + '<button class="tiny" data-picker="group-all">全选</button>'
+    + '<button class="tiny" data-picker="group-none">取消全选</button>'
+    + '</span></div>'
+    + rows
+    + '</div>';
+}
+
 function renderPlanPicker() {
   const host = $('planPickerCard');
   if (!host) return;
@@ -1404,7 +1433,9 @@ function renderPlanPicker() {
   const { group } = hit;
   const src = state.planPickerSource;
   const head = '<div class="picker-head"><div><h2>' + esc(group.name || '未命名分组') + '</h2>'
-    + '<p class="meta">' + (src ? '来源：' + esc(src.name || src.url) : '这个分组还没有绑定 IPTV 源') + '</p></div>'
+    + '<p class="meta">' + (src ? '来源：' + esc(src.name || src.url) : '这个分组还没有绑定 IPTV 源')
+    + '；换来源不会丢掉已选频道，可跨源拼一个分组。</p>'
+    + pickerSourceSelect(src ? src.id : '') + '</div>'
     + '<button class="ghost" data-picker="close">关闭</button></div>';
 
   if (!src) {
@@ -1423,39 +1454,35 @@ function renderPlanPicker() {
     return;
   }
 
-  const picked = new Set(arr(group.channels).map((channel) => String(channel.url).toLowerCase()));
+  const picked = new Set(arr(group.channels).map(channelKey));
+  const cachedUrls = new Set(cache.channels.map(channelKey));
+  // 已经选进来、但不属于当前来源的频道：单独一组展示（默认勾选），
+  // 取消勾选即从分组里移除。没有它们，换来源一次就等于把跨源结果清空。
+  const others = arr(group.channels).filter((channel) => !cachedUrls.has(channelKey(channel)));
+
   const byGroup = new Map();
   for (const channel of cache.channels) {
     const key = channel.group || '未分组';
     if (!byGroup.has(key)) byGroup.set(key, []);
     byGroup.get(key).push(channel);
   }
-  const sections = [...byGroup.entries()].map(([name, list]) =>
-    '<div class="picker-section" data-picker-section>'
-    + '<div class="picker-section-head"><strong>' + esc(name) + '</strong>'
-    + '<span class="meta">' + list.length + '</span></div>'
-    + list.map((channel) => {
-      const url = String(channel.url || '');
-      return '<label class="picker-row" data-picker-row>'
-        + '<input type="checkbox" value="' + esc(url) + '" data-name="' + esc(channel.name)
-        + '" data-logo="' + esc(channel.logo || '') + '"'
-        + (picked.has(url.toLowerCase()) ? ' checked' : '') + '>'
-        + '<span class="picker-name">' + esc(channel.name) + '</span>'
-        + '</label>';
-    }).join('')
-    + '</div>').join('');
+  const sections = (others.length
+    ? pickerSectionHtml('其他来源已选（' + others.length + '）', others, picked, 'picker-section-other')
+    : '')
+    + [...byGroup.entries()].map(([name, list]) =>
+      pickerSectionHtml(name, list, picked, '')).join('');
 
   host.innerHTML = head
     + '<div class="picker-tools">'
     + '<input class="picker-filter" data-picker-filter placeholder="搜索频道名 / 分组">'
-    + '<button class="tiny" data-picker="select-visible">全选可见</button>'
-    + '<button class="tiny" data-picker="clear-all">全部清空</button>'
-    + '<span class="meta" id="pickerCount">已选 ' + arr(group.channels).length
-    + ' / 共 ' + cache.channels.length + '</span>'
+    + '<button class="tiny" data-picker="select-all">全选</button>'
+    + '<button class="tiny" data-picker="select-none">全不选</button>'
+    + '<button class="tiny" data-picker="only-picked">只看已选</button>'
+    + '<span class="meta" id="pickerCount"></span>'
     + '</div>'
     + '<div class="picker-list">' + (sections || '<p class="muted">这个来源没有解析出频道。</p>') + '</div>'
     + '<div class="picker-foot">'
-    + '<span class="meta">最多 800 个频道/分组；保存资源库后终端按此下发。</span>'
+    + '<span class="meta">每个分组最多 800 个频道；确定后记得点「保存资源库」。</span>'
     + '<button class="primary" data-picker="apply">确定</button>'
     + '</div>';
   syncPickerCount();
@@ -1463,13 +1490,18 @@ function renderPlanPicker() {
 
 /** 计数字样随勾选变化，不必重绘整个列表（重绘会丢掉键盘焦点）。 */
 function syncPickerCount() {
-  const label = $('pickerCount');
-  if (!label) return;
   const boxes = document.querySelectorAll('#planPicker .picker-row input[type=checkbox]');
-  const total = boxes.length;
   let checked = 0;
   boxes.forEach((box) => { if (box.checked) checked += 1; });
-  label.textContent = '已选 ' + checked + ' / 共 ' + total;
+  const label = $('pickerCount');
+  if (label) label.textContent = '已选 ' + checked + ' / 共 ' + boxes.length;
+  // 每个分组头也显示「已选 x / y」，否则勾到一半根本不知道哪组漏了。
+  document.querySelectorAll('#planPicker [data-picker-section]').forEach((section) => {
+    const rows = [...section.querySelectorAll('input[type=checkbox]')];
+    const on = rows.filter((box) => box.checked).length;
+    const out = section.querySelector('.picker-section-count');
+    if (out) out.textContent = '已选 ' + on + ' / ' + rows.length;
+  });
 }
 
 function filterPlanPicker(keyword) {
@@ -1486,44 +1518,90 @@ function filterPlanPicker(keyword) {
   });
 }
 
+/** 「只看已选」：勾选变化时即时生效，用来核对跨源拼出来的结果。 */
+function applyPickerOnlyPicked() {
+  if (!state.planPickerOnlyPicked) {
+    const input = document.querySelector('#planPicker [data-picker-filter]');
+    filterPlanPicker(input ? input.value : '');
+    return;
+  }
+  document.querySelectorAll('#planPicker [data-picker-section]').forEach((section) => {
+    let visible = 0;
+    section.querySelectorAll('[data-picker-row]').forEach((row) => {
+      const box = row.querySelector('input[type=checkbox]');
+      const show = !!(box && box.checked);
+      row.hidden = !show;
+      if (show) visible += 1;
+    });
+    section.hidden = visible === 0;
+  });
+}
+
+function setPickerSection(kind, scope) {
+  const root = scope || $('planPicker');
+  const boxes = root.querySelectorAll('.picker-row input[type=checkbox]');
+  boxes.forEach((box) => { box.checked = kind === 'all'; });
+  syncPickerCount();
+  applyPickerOnlyPicked();
+}
+
 function closePlanPicker() {
   const mask = $('planPicker');
   if (mask) mask.hidden = true;
   state.planPickerPkg = '';
   state.planPickerGroup = '';
+  state.planPickerOnlyPicked = false;
   renderPlanPicker();
 }
 
-function onPlanPickerAction(kind) {
+/** 在选择器里换来源：直接改绑分组，已选频道保留为「其他来源」。 */
+function switchPickerSource(sourceId) {
+  const hit = planGroupById(state.planPickerPkg, state.planPickerGroup);
+  if (!hit) return;
+  const src = findLibrarySource(sourceId);
+  if (!src) return;
+  hit.group.sourceId = sourceId;
+  syncPlanPackageSources(hit.pkg);
+  markLibraryDirty();
+  state.planPickerSource = src;
+  renderPlanPicker();
+  if (!planSourceCached(sourceId)) loadPlanSourceChannels(sourceId);
+}
+
+function onPlanPickerAction(button) {
+  const kind = button.dataset.picker;
   if (kind === 'close') { closePlanPicker(); return; }
   if (kind === 'retry') {
     if (state.planPickerSource) loadPlanSourceChannels(state.planPickerSource.id);
     return;
   }
-  if (kind === 'select-visible') {
-    document.querySelectorAll('#planPicker [data-picker-row]').forEach((row) => {
-      if (row.hidden) return;
-      const box = row.querySelector('input[type=checkbox]');
-      if (box) box.checked = true;
-    });
-    syncPickerCount();
+  if (kind === 'select-all') { setPickerSection('all'); return; }
+  if (kind === 'select-none') { setPickerSection('none'); return; }
+  if (kind === 'group-all' || kind === 'group-none') {
+    const section = button.closest('[data-picker-section]');
+    setPickerSection(kind === 'group-all' ? 'all' : 'none', section);
     return;
   }
-  if (kind === 'clear-all') {
-    document.querySelectorAll('#planPicker .picker-row input[type=checkbox]')
-      .forEach((box) => { box.checked = false; });
-    syncPickerCount();
+  if (kind === 'only-picked') {
+    state.planPickerOnlyPicked = !state.planPickerOnlyPicked;
+    button.classList.toggle('primary', state.planPickerOnlyPicked);
+    applyPickerOnlyPicked();
     return;
   }
   if (kind === 'apply') applyChannelPicker();
 }
 
-/** 把勾选结果写回分组：频道顺序就是源里的顺序，组名随分组名。 */
+/**
+ * 把勾选结果写回分组。
+ *
+ * DOM 顺序 = 「其他来源已选（按原顺序）」+「当前源（按源里顺序）」，
+ * 正好等于要下发的频道顺序；大于 800 条截断（与服务端单组上限一致）。
+ */
 function applyChannelPicker() {
   const hit = planGroupById(state.planPickerPkg, state.planPickerGroup);
   if (!hit) { closePlanPicker(); return; }
   const { group } = hit;
-  const channels = [];
+  let channels = [];
   document.querySelectorAll('#planPicker .picker-row input[type=checkbox]').forEach((box) => {
     if (!box.checked) return;
     channels.push({
@@ -1534,14 +1612,96 @@ function applyChannelPicker() {
     });
   });
   if (channels.length > 800) {
-    channels.length = 800;
+    channels = channels.slice(0, 800);
     message('单个分组最多 800 个频道，超出的已被截断。', 'err');
   }
   group.channels = channels;
   markLibraryDirty();
   closePlanPicker();
   render();
-  message('「' + (group.name || '分组') + '」已选 ' + channels.length + ' 个频道，记得点「保存资源库」。', 'ok');
+  message('「' + (group.name || '分组') + '」已选 ' + channels.length
+    + ' 个频道，记得点「保存资源库」。', 'ok');
+}
+
+/* ---------------- 套餐预览（按终端排列展开） ---------------- */
+
+/**
+ * 终端（APK）拿到的频道表 = 分组顺序 → 分组内频道顺序，分组名会写进
+ * 每个频道的 group 字段，客户端再按 genre 解析成频道列表。
+ * 所以预览就是「照下发顺序把所有频道平铺出来」，不做任何排序/去重，
+ * 用户在这里看到的第 1 个频道，就是电视上分组里第一个。
+ */
+function planPreviewChannels(pkg) {
+  const groups = arr(pkg && pkg.groups);
+  if (groups.length) {
+    return groups.map((group) => ({
+      name: group.name || '未命名分组',
+      channels: arr(group.channels),
+    }));
+  }
+  // 旧的一层结构：没有分组，直接按频道自带 group 顺序展示
+  return [{ name: '（未分组 · 旧结构）', channels: arr(pkg && pkg.channels) }];
+}
+
+function openPlanPreview(pkgId) {
+  const pkg = planPackageById(pkgId);
+  if (!pkg) { message('找不到这个套餐，请重新加载资源库。', 'err'); return; }
+  state.planPreviewPkg = pkg.id;
+  renderPlanPreview();
+  const mask = $('planPreview');
+  if (mask) mask.hidden = false;
+}
+
+function closePlanPreview() {
+  const mask = $('planPreview');
+  if (mask) mask.hidden = true;
+  state.planPreviewPkg = '';
+}
+
+function renderPlanPreview() {
+  const host = $('planPreviewCard');
+  if (!host) return;
+  const pkg = planPackageById(state.planPreviewPkg);
+  if (!pkg) { host.innerHTML = ''; return; }
+  const blocks = planPreviewChannels(pkg);
+  const total = blocks.reduce((sum, block) => sum + block.channels.length, 0);
+
+  const nav = blocks.map((block, index) =>
+    '<button class="preview-nav-item" data-preview="goto" data-index="' + index + '">'
+    + (index + 1) + '. ' + esc(block.name)
+    + '<span class="meta">' + block.channels.length + '</span></button>').join('');
+
+  let seq = 0;
+  const body = blocks.map((block, index) => {
+    const rows = block.channels.map((channel) => {
+      seq += 1;
+      return '<div class="preview-channel"><span class="preview-num">' + seq + '</span>'
+        + '<span class="preview-name">' + esc(channel.name || '未命名') + '</span>'
+        + '</div>';
+    }).join('');
+    return '<section class="preview-block" data-preview-block="' + index + '">'
+      + '<header><span class="preview-block-index">' + (index + 1) + '</span>'
+      + '<strong>' + esc(block.name) + '</strong>'
+      + '<span class="meta">' + block.channels.length + ' 个频道</span></header>'
+      + (rows
+        ? '<div class="preview-grid">' + rows + '</div>'
+        : '<p class="muted">这个分组还没有频道。</p>')
+      + '</section>';
+  }).join('');
+
+  host.innerHTML = '<div class="preview-head"><div>'
+    + '<h2>预览 · ' + esc(pkg.name || pkg.id) + '</h2>'
+    + '<p class="meta">按终端排列展开：' + blocks.length + ' 个分组 · ' + total + ' 个频道。'
+    + '序号就是电视上分组内的先后顺序。</p></div>'
+    + '<button class="ghost" data-preview="close">关闭</button></div>'
+    + '<div class="preview-body">'
+    + '<nav class="preview-nav">' + (nav || '<span class="muted">还没有分组</span>') + '</nav>'
+    + '<div class="preview-main" id="planPreviewMain">'
+    + (body || '<p class="muted">这个套餐还没有频道，先在编辑区挑几个。</p>')
+    + '</div></div>'
+    + '<div class="preview-foot"><span class="meta">'
+    + (total ? '共 ' + total + ' 个频道会下发到终端。' : '当前没有可下发的频道。')
+    + '</span><button class="primary" data-preview="close">关闭</button></div>';
 }
 
 /* ---------------- TVBox 源页（库层） ---------------- */
@@ -1560,6 +1720,8 @@ function renderVodLibrary() {
   const doc = state.library;
   const sources = arr(doc.vod.sources);
   const sites = arr(doc.vod.sites);
+  // 库级默认站点：所有终端共用，套餐/终端没单独指定时用它。
+  const defaultSiteId = String((doc.vod && doc.vod.defaultSiteId) || '');
   const countOf = (sourceId) => sites.filter((site) => site.sourceId === sourceId).length;
 
   const spiderCountOf = (sourceId) =>
@@ -1593,20 +1755,29 @@ function renderVodLibrary() {
   const groups = sources.map((src) => {
     const own = sites.filter((site) => site.sourceId === src.id);
     if (!own.length) return '';
-    const rows = own.map((site) =>
-      '<div class="lib-site-row"><code>' + esc(site.key) + '</code>'
-      + '<span class="lib-site-name">' + esc(site.name || site.key) + '</span>'
-      + '<code class="lib-site-api" title="' + esc(site.api || '') + '">' + esc(site.api || '') + '</code>'
-      + '<input class="lib-input" data-lib-input="site-ext" data-id="' + esc(site.id)
-      + '" value="' + esc(site.ext || '') + '" placeholder="ext（多数留空）">'
-      + '<input class="lib-input" data-lib-input="site-note" data-id="' + esc(site.id)
-      + '" value="' + esc(site.note || '') + '" placeholder="备注"></div>').join('');
+    const rows = own.map((site) => {
+      const isDefault = defaultSiteId === site.id;
+      return '<div class="lib-site-row"><code>' + esc(site.key) + '</code>'
+        + '<span class="lib-site-name">' + esc(site.name || site.key) + '</span>'
+        + '<code class="lib-site-api" title="' + esc(site.api || '') + '">' + esc(site.api || '')
+        + '</code>'
+        + '<input class="lib-input" data-lib-input="site-ext" data-id="' + esc(site.id)
+        + '" value="' + esc(site.ext || '') + '" placeholder="ext（多数留空）">'
+        + '<input class="lib-input" data-lib-input="site-note" data-id="' + esc(site.id)
+        + '" value="' + esc(site.note || '') + '" placeholder="备注">'
+        + '<button class="tiny' + (isDefault ? ' primary' : '') + '" data-lib="set-default-site"'
+        + ' data-id="' + esc(site.id) + '" title="'
+        + (isDefault ? '再点一次取消默认站点' : '打开影音时默认选中这个站点') + '">'
+        + (isDefault ? '默认站点' : '设为默认') + '</button></div>';
+    }).join('');
     return '<div class="lib-source-block">'
       + '<div class="lib-source-head"><strong>' + esc(src.name || src.id) + '</strong>'
       + '<span class="meta">' + own.length + ' 个站点</span>'
       + '<code class="lib-site-api">' + esc(src.url || '') + '</code></div>'
       + '<div class="lib-scroll">' + rows + '</div></div>';
   }).join('');
+
+  const defaultSite = sites.find((site) => site.id === defaultSiteId);
 
   return VOD_HEAD
     + libraryToolbar(doc)
@@ -1640,6 +1811,13 @@ function renderVodLibrary() {
       : '<p class="muted">还没有 TVBox 源，先在上面添加。</p>')
 
     + '<h3>站点（' + sites.length + '）</h3>'
+    + '<p class="hint">「默认站点」是打开影音时自动选中的那个，对所有终端生效'
+    + '（套餐 / 单终端里单独指定的优先）。'
+    + (defaultSiteId
+      ? '当前默认：<b>' + esc(defaultSite ? (defaultSite.name || defaultSite.key) : defaultSiteId)
+        + '</b>；再点一次该行按钮即可取消。'
+      : '当前没有设置，终端会按源顺序用第一个站点。')
+    + '改完记得点「保存资源库」，终端下次同步即生效。</p>'
     + (groups || '<p class="muted">还没有站点。</p>');
 }
 
@@ -2014,14 +2192,7 @@ function renderDeviceStatus() {
  * /api/devices 只认读令牌、不带 deviceId，所以配置文档加载失败也不会影响它。
  */
 async function loadDeviceStatus() {
-  if (!state.base) {
-    const baseInput = $('apiBase');
-    state.base = (baseInput && baseInput.value.trim()) || window.location.origin;
-  }
-  if (!state.token) {
-    const tokenInput = $('apiToken');
-    state.token = tokenInput ? tokenInput.value.trim() : '';
-  }
+  if (!state.base) state.base = window.location.origin;
   // 未登录不发请求：登录前每次轮询都会 401，日志和状态条都会被无意义的红字占满。
   if (!state.token) return;
   try {
@@ -2897,9 +3068,40 @@ function deleteVodSource(id) {
   if (!window.confirm('删除源「' + (src.name || src.url) + '」？它下面的站点会一并删除。')) return;
   state.library.vod.sources = sources.filter((item) => item.id !== id);
   state.library.vod.sites = arr(state.library.vod.sites).filter((site) => site.sourceId !== id);
+  // 默认站点跟着源一起删掉了，否则库里留一个指向不存在站点的引用。
+  if (state.library.vod.defaultSiteId
+      && !arr(state.library.vod.sites).some((site) => site.id === state.library.vod.defaultSiteId)) {
+    state.library.vod.defaultSiteId = '';
+  }
   markLibraryDirty();
   render();
   message('已删除源「' + (src.name || src.url) + '」及其站点。记得点「保存资源库」。', 'ok');
+}
+
+/**
+ * 库级默认站点：打开影音时自动选中的站点，全库只有这一个。
+ *
+ * 再点一次同一个站点就是取消（回到「按源顺序第一个」），不需要额外的清除按钮；
+ * 只是本地改动，点「保存资源库」后才写云端、终端下次同步才生效。
+ */
+function setVodDefaultSite(siteId) {
+  const vod = state.library && state.library.vod;
+  if (!vod) return;
+  const sites = arr(vod.sites);
+  const site = sites.find((item) => item.id === siteId);
+  if (!site) { message('找不到这个站点，请重新加载资源库。', 'err'); return; }
+  const current = String(vod.defaultSiteId || '');
+  if (current === siteId) {
+    vod.defaultSiteId = '';
+    markLibraryDirty();
+    render();
+    message('已取消默认站点，终端会按源顺序用第一个站点。', 'ok');
+    return;
+  }
+  vod.defaultSiteId = siteId;
+  markLibraryDirty();
+  render();
+  message('已把「' + (site.name || site.key) + '」设为默认站点，保存资源库后终端同步生效。', 'ok');
 }
 
 /* ---- TVBox 配置解析 ---- */
@@ -3476,9 +3678,11 @@ function onLibraryAction(button) {
   if (kind === 'group-down') { movePlanGroup(button.dataset.plan, button.dataset.id, 1); return; }
   if (kind === 'split-plan') { splitPlanPackage(button.dataset.plan); return; }
   if (kind === 'pick-channels') { openChannelPicker(button.dataset.plan, button.dataset.id); return; }
+  if (kind === 'preview-plan') { openPlanPreview(button.dataset.id || button.dataset.plan); return; }
   if (kind === 'add-vod-source') { addVodSource(); return; }
   if (kind === 'add-vod-source-url') { addVodSourceUrlOnly(); return; }
   if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
+  if (kind === 'set-default-site') { setVodDefaultSite(button.dataset.id); return; }
   if (kind === 'migrate-inline') { migrateInlinePackages(); return; }
   // ---- 在线更新版本库 ----
   if (kind === 'add-update') { addUpdateEntry(); return; }
@@ -3796,6 +4000,11 @@ function deviceVodBlock() {
     candidateSites.push(site);
   }
   const defaultSite = String(vod.defaultSiteId || '');
+  // 资源库级默认站点：这一项留空时终端就用它（服务端展开时兜底），
+  // 所以下拉里要写清楚「跟随时会用谁」，而不是笼统写「第一个站点」。
+  const libDefaultSite = String(
+    (state.library && state.library.vod && state.library.vod.defaultSiteId) || '');
+  const libDefaultHit = allSites.find((site) => site.id === libDefaultSite);
   // 旧默认站点被删/被取消勾选时，下拉里补一条显式的「已失效」选项。
   // 否则 <select> 会静默跳到第一项，用户以为默认站点还是原来那个。
   const defaultKnown = !defaultSite || seenCandidate.has(defaultSite);
@@ -3817,7 +4026,9 @@ function deviceVodBlock() {
     + '</div>'
     + '<label class="df-field"><span>默认站点（打开影音时自动选中）</span>'
     + '<select data-df="vod.defaultSiteId">'
-    + '<option value="">不指定（用第一个站点）</option>'
+    + '<option value="">' + (libDefaultHit
+      ? '跟随资源库默认（' + esc(libDefaultHit.name || libDefaultHit.key) + '）'
+      : '不指定（用第一个站点）') + '</option>'
     + (defaultKnown ? '' : '<option value="' + esc(defaultSite) + '" selected>'
       + esc(defaultSite) + '（已失效，需重新选择）</option>')
     + candidateSites.slice(0, 300).map((site) =>
@@ -3827,7 +4038,7 @@ function deviceVodBlock() {
     + '</select></label>'
     + '<p class="meta">只决定「打开影音先显示哪个站点」，不影响哪些站点可见；'
     + (candidateSites.length
-      ? '可选项来自上面勾选的源与站点。'
+      ? '可选项来自上面勾选的源与站点；选「跟随资源库默认」就到「TVBox 源」页改。'
       : '请先勾选源或站点，否则只能不指定。')
     + '</p>'
     + '<label class="df-check"><input type="checkbox" data-df="vod.lockLibrary"'
@@ -4241,15 +4452,7 @@ async function reloadAll() {
   // 地址固定同源，不会为空；保留兜底只为兼容旧代码路径。
   if (!state.base) state.base = window.location.origin;
   localStorage.setItem('purelive_config_base', state.base);
-  if (state.authMode === 'session') {
-    saveSession();
-  } else {
-    localStorage.setItem('purelive_config_token', state.token);
-    // 写令牌只存会话：关闭标签页即失效，缩小 XSS / 恶意扩展的窃取窗口。
-    // 同时清理历史版本遗留在 localStorage 的写令牌（键名保持不变，见项目约定）。
-    sessionStorage.setItem('purelive_config_write_token', state.writeToken);
-    localStorage.removeItem('purelive_config_write_token');
-  }
+  saveSession();
   clearMessage();
   statusText('正在连接…');
   try {
@@ -4274,13 +4477,7 @@ async function load() {
   clearMessage();
   syncConnection();
   localStorage.setItem('purelive_config_base', state.base);
-  if (state.authMode === 'session') {
-    saveSession();
-  } else {
-    localStorage.setItem('purelive_config_token', state.token);
-    sessionStorage.setItem('purelive_config_write_token', state.writeToken);
-    localStorage.removeItem('purelive_config_write_token');
-  }
+  saveSession();
   statusText('正在连接…');
   try {
     const health = await request('/health');
@@ -4534,31 +4731,15 @@ document.addEventListener('DOMContentLoaded', () => {
   // 连接信息优先级：本机改过（localStorage）> 服务端注入的默认值 > 空白。
   // 默认值由 EdgeOne 环境变量在响应页面时注入，不写进公开仓库。
   const injected = window.__PURETV_DEFAULTS__ || null;
-  // 历史版本把写令牌落在 localStorage；这里一次性迁到 sessionStorage 并清除旧值，
-  // 之后所有写令牌只读会话存储，避免长期驻留浏览器。
-  const legacyWriteToken = localStorage.getItem('purelive_config_write_token');
-  if (legacyWriteToken !== null) {
-    sessionStorage.setItem('purelive_config_write_token', legacyWriteToken);
-    localStorage.removeItem('purelive_config_write_token');
-  }
-  const saved = {
-    base: localStorage.getItem('purelive_config_base'),
-    token: localStorage.getItem('purelive_config_token'),
-    writeToken: sessionStorage.getItem('purelive_config_write_token'),
-  };
-  const hasSaved = saved.base !== null || saved.token !== null || saved.writeToken !== null;
-  let autoConnect = false;
-  if (injected && !hasSaved) {
-    // 地址不再有输入框：注入值只用于兼容「API 与编辑器不同源」的老部署。
-    state.base = (injected.base || window.location.origin).replace(/\/$/, '');
-    if ($('apiToken')) $('apiToken').value = injected.readToken || '';
-    if ($('apiWriteToken')) $('apiWriteToken').value = injected.writeToken || '';
-    autoConnect = !!injected.autoConnect && !!injected.readToken;
-  } else {
-    state.base = (saved.base || window.location.origin).replace(/\/$/, '');
-    if ($('apiToken')) $('apiToken').value = saved.token || '';
-    if ($('apiWriteToken')) $('apiWriteToken').value = saved.writeToken || '';
-  }
+  // 令牌直连已下线：历史版本留在浏览器里的读写令牌就地清掉，
+  // 既不留死凭据，也避免下次启动被当成「已登录」。
+  localStorage.removeItem('purelive_config_token');
+  localStorage.removeItem('purelive_config_write_token');
+  sessionStorage.removeItem('purelive_config_write_token');
+  const savedBase = localStorage.getItem('purelive_config_base');
+  // 地址没有输入框：注入值 / 历史值只用于兼容「API 与编辑器不同源」的部署。
+  state.base = ((savedBase || (injected && injected.base) || window.location.origin) || '')
+    .replace(/\/$/, '');
 
   // 「连接」现在只做一件事：把与终端无关的四份数据（目录 / 设备 / 资源库 / 套餐库）拉一次。
   // 设备文档不再是编辑对象——每台终端的配置由它绑定的套餐渲染。
@@ -4567,20 +4748,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ---- 登录 / 账号 ----
   $('loginForm').addEventListener('submit', onLoginSubmit);
-  $('btnTokenConnect').addEventListener('click', onTokenConnect);
   $('btnLogout').addEventListener('click', logout);
   $('btnChangePassword').addEventListener('click', openPasswordDialog);
   $('pwdForm').addEventListener('submit', onPasswordSubmit);
   $('btnPwdCancel').addEventListener('click', () => { $('pwdMask').hidden = true; });
 
   // ---- IPTV 分组频道选择器 ----
-  // 勾选状态只在「确定」时读 DOM，所以这里只需要按钮与搜索框两个入口；
+  // 勾选状态只在「确定」时读 DOM，所以这里只需要按钮与筛选两个入口；
   // 每次点击重绘列表会丢焦点与滚动位置。
   const picker = $('planPicker');
   if (picker) {
     picker.addEventListener('click', (event) => {
       const button = event.target.closest('button[data-picker]');
-      if (button) { onPlanPickerAction(button.dataset.picker); return; }
+      if (button) { onPlanPickerAction(button); return; }
       if (event.target === picker) closePlanPicker();
     });
     picker.addEventListener('input', (event) => {
@@ -4588,7 +4768,30 @@ document.addEventListener('DOMContentLoaded', () => {
       if (box) filterPlanPicker(box.value);
     });
     picker.addEventListener('change', (event) => {
-      if (event.target && event.target.type === 'checkbox') syncPickerCount();
+      const select = event.target.closest('select[data-picker-source]');
+      if (select) { switchPickerSource(select.value); return; }
+      if (event.target && event.target.type === 'checkbox') {
+        syncPickerCount();
+        applyPickerOnlyPicked();
+      }
+    });
+  }
+
+  // ---- 套餐预览：只读弹窗，点分组名滚动到对应分组 ----
+  const preview = $('planPreview');
+  if (preview) {
+    preview.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-preview]');
+      if (button) {
+        if (button.dataset.preview === 'close') { closePlanPreview(); return; }
+        if (button.dataset.preview === 'goto') {
+          const block = preview.querySelector('[data-preview-block="'
+            + button.dataset.index + '"]');
+          if (block) block.scrollIntoView({ block: 'start', behavior: 'smooth' });
+          return;
+        }
+      }
+      if (event.target === preview) closePlanPreview();
     });
   }
 
@@ -4735,6 +4938,8 @@ document.addEventListener('DOMContentLoaded', () => {
       iptv.packageIds = [...picked];
       iptv.managed = true;
       markDirty();
+      // 重绘一次：#序号 反映的是 packageIds 顺序，不重绘会看到旧编号。
+      renderPanel();
       return;
     }
     if (target.dataset.deviceCheck) {
@@ -4771,23 +4976,12 @@ document.addEventListener('DOMContentLoaded', () => {
   window.setInterval(() => {
     if (document.visibilityState === 'visible') loadDeviceStatus();
   }, 60000);
-  // 启动顺序：有会话 → 直接连接加载；旧部署注入了令牌 → 照旧直连；都没有 → 登录框。
+  // 启动顺序：有会话 → 直接连接加载；否则弹登录框。
   // 未登录时一个业务请求都不发（会话过期时每个页签都会 401，那串红字没有意义）。
   if (savedSession()) {
     restoreSession();
-  } else if (autoConnect) {
-    hideLogin();
-    reloadAll();
   } else {
     syncConnection();
-    if (state.base && state.token) {
-      // 本机填过令牌（升级前一直这么用）：保持自动连接，不因改版把人挡在门外。
-      state.authMode = 'token';
-      hideLogin();
-      syncAccountBar();
-      reloadAll();
-    } else {
-      showLogin();
-    }
+    showLogin();
   }
 });

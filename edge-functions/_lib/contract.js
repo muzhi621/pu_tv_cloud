@@ -1151,18 +1151,24 @@ function inlineVodSites(raw, warnings) {
  *
  * 库里的站点可能被删、也可能被 siteIds 白名单排掉，那时下发的仍是旧 id，
  * 终端会拿一个不存在的站点去开首页（表现为打开影音直接报错）。所以展开时
- * 复核一次：不在列表里就清空，让终端回退到「第一个站点」这条既有逻辑。
+ * 复核一次，优先级：本配置指定 → 资源库默认 → 空（终端回退第一个站点）。
+ * 库级默认只是「没单独指定时用谁」，不会覆盖套餐/终端的显式选择。
  */
-function keepVodDefaultSiteId(raw, sites) {
-  const wanted = typeof raw === 'string' ? raw : '';
-  if (!wanted) return '';
-  return sites.some((site) => site && site.id === wanted) ? wanted : '';
+function pickVodDefaultSiteId(raw, sites, fallback) {
+  const has = (id) => typeof id === 'string' && id
+    && sites.some((site) => site && site.id === id);
+  if (has(raw)) return raw;
+  if (has(fallback)) return fallback;
+  return '';
 }
 
 export function expandVodSites(sections, library = null) {
   const vod = sections && sections.vod;
   if (!vod) return sections;
   const out = clone(sections);
+  // 资源库的默认站点：所有设备共用，设备没指定时兜底。
+  const libDefault = (library && library.vod && typeof library.vod.defaultSiteId === 'string')
+    ? library.vod.defaultSiteId : '';
   const locked = vod.lockLibrary === true;
   const inlineSources = Array.isArray(vod.sources) ? vod.sources : [];
   const inlineSites = Array.isArray(vod.sites) ? vod.sites : [];
@@ -1170,7 +1176,7 @@ export function expandVodSites(sections, library = null) {
   if (!refSourceIds.length) {
     out.vod.sources = inlineSources;
     out.vod.sites = inlineSites;
-    out.vod.defaultSiteId = keepVodDefaultSiteId(vod.defaultSiteId, inlineSites);
+    out.vod.defaultSiteId = pickVodDefaultSiteId(vod.defaultSiteId, inlineSites, libDefault);
     return out;
   }
 
@@ -1217,7 +1223,7 @@ export function expandVodSites(sections, library = null) {
     spiderFlavor: vodFlavor(item.spiderFlavor),
   }));
   out.vod.sites = sites;
-  out.vod.defaultSiteId = keepVodDefaultSiteId(vod.defaultSiteId, sites);
+  out.vod.defaultSiteId = pickVodDefaultSiteId(vod.defaultSiteId, sites, libDefault);
   return out;
 }
 
@@ -1282,7 +1288,9 @@ export function emptyLibrary() {
     revision: 0,
     updatedAt: '',
     iptv: { sources: [], packages: [], epgUrl: '' },
-    vod: { sources: [], sites: [] },
+    // defaultSiteId：库级默认站点。设备/套餐没单独指定时用它，
+    // 打开影音自动选中的就是这个站点。
+    vod: { sources: [], sites: [], defaultSiteId: '' },
     // 在线更新版本：与 IPTV 源、TVBox 源并列的第三类资源。
     // 套餐里选定一条后展开写入设备文档的 sections.update（版本号 + 按架构直链），
     // 终端据此判定「有新版本」并直接从该地址下载。
@@ -1423,7 +1431,7 @@ function normalizeLibraryIptv(part, warnings) {
 
 function normalizeLibraryVod(part, warnings) {
   const raw = libraryObject(part, 'library.vod');
-  const out = { sources: [], sites: [] };
+  const out = { sources: [], sites: [], defaultSiteId: '' };
 
   if (raw.sources !== undefined && raw.sources !== null) {
     if (!Array.isArray(raw.sources)) throw new ConfigError('library.vod.sources 必须是数组');
@@ -1531,6 +1539,17 @@ function normalizeLibraryVod(part, warnings) {
         quickSearch: lenientInt(item.quickSearch, 0, 0, 2),
         note: str(item.note, '', `library.vod.sites[${id}].note`, 200),
       });
+    }
+  }
+  // 库级默认站点：编辑器里「设为默认」的站点，随库一起保存。
+  // 必须落在最终站点列表里才有意义（源/站点可能刚被删、或被上限截断），
+  // 否则留一个悬空 id，终端打开影音就会去开一个不存在的站点。
+  const wantedDefault = str(raw.defaultSiteId, '', 'library.vod.defaultSiteId', 96);
+  if (wantedDefault) {
+    if (out.sites.some((site) => site.id === wantedDefault)) {
+      out.defaultSiteId = wantedDefault;
+    } else {
+      warnings.push(`library.vod.defaultSiteId: 站点 ${wantedDefault} 不在站点列表里，已忽略`);
     }
   }
   return out;

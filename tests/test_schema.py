@@ -782,7 +782,7 @@ class LibraryModelTests(unittest.TestCase):
         self.assertEqual(library["revision"], 0)
         self.assertEqual(library["updatedAt"], "")
         self.assertEqual(library["iptv"], {"sources": [], "packages": [], "epgUrl": ""})
-        self.assertEqual(library["vod"], {"sources": [], "sites": []})
+        self.assertEqual(library["vod"], {"sources": [], "sites": [], "defaultSiteId": ""})
 
     def test_library_non_object_rejected(self):
         for bad in ("x", 1, [], None):
@@ -892,6 +892,30 @@ class LibraryModelTests(unittest.TestCase):
             },
         })
         self.assertEqual(library["vod"]["sites"][0]["id"], "vs_1a2b3c4d:real")
+
+    def test_library_default_site_kept_only_when_site_exists(self):
+        """库级默认站点：存在就保存，悬空 id 丢弃并提示（否则终端会去开不存在的站点）。"""
+        library, _ = normalize_library({
+            "vod": {
+                "sources": [{"id": "vs_1a2b3c4d", "url": "https://b/api"}],
+                "sites": [{"sourceId": "vs_1a2b3c4d", "key": "k1", "api": "csp_k1"}],
+                "defaultSiteId": "vs_1a2b3c4d:k1",
+            },
+        })
+        self.assertEqual(library["vod"]["defaultSiteId"], "vs_1a2b3c4d:k1")
+
+        dropped, warnings = normalize_library({
+            "vod": {
+                "sources": [{"id": "vs_1a2b3c4d", "url": "https://b/api"}],
+                "sites": [{"sourceId": "vs_1a2b3c4d", "key": "k1", "api": "csp_k1"}],
+                "defaultSiteId": "vs_1a2b3c4d:gone",
+            },
+        })
+        self.assertEqual(dropped["vod"]["defaultSiteId"], "")
+        self.assertTrue(any("library.vod.defaultSiteId" in item for item in warnings))
+
+        # 空库也要带这个字段，编辑器 / 终端不用判断键是否存在
+        self.assertEqual(empty_library()["vod"]["defaultSiteId"], "")
 
     def test_library_source_and_package_caps(self):
         sources = [{"id": "s_%08x" % index, "url": "https://a/%d.m3u" % index}

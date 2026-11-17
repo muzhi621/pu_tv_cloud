@@ -53,23 +53,17 @@
 
   <!--
     登录遮罩：没登录时挡住编辑器。
-    登录成功后自动带出同源 API 地址并加载全部数据，操作者不用记令牌；
-    令牌入口收在 details 里，保留给「还没配账号」的部署和终端调试。
+    只保留账号密码一种入口：登录成功后自动带出同源 API 地址并加载全部配置，
+    浏览器里不留任何读写令牌（会话过期就回这里重新登录）。
   -->
   <div id="loginMask" class="login-mask">
     <form id="loginForm" class="login-card">
       <h2>SUTV 云端登录</h2>
-      <p class="meta">用管理员账号登录，登录后自动连接并加载全部配置。</p>
+      <p class="meta">用管理员账号登录，登录后自动加载全部配置。</p>
       <label>账号<input id="loginUser" autocomplete="username" placeholder="admin"></label>
       <label>密码<input id="loginPass" type="password" autocomplete="current-password" placeholder="至少 8 位"></label>
       <p id="loginError" class="err" hidden></p>
       <button class="primary" type="submit" id="btnLogin">登录</button>
-      <details class="login-advanced">
-        <summary>用令牌连接（尚未配置账号 / 终端调试）</summary>
-        <label>访问令牌（读）<input id="apiToken" type="password" placeholder="CONFIG_READ_TOKEN"></label>
-        <label>保存令牌（写）<input id="apiWriteToken" type="password" placeholder="留空 = 用访问令牌"></label>
-        <button type="button" class="ghost" id="btnTokenConnect">用令牌连接并加载</button>
-      </details>
     </form>
   </div>
 
@@ -79,6 +73,14 @@
   -->
   <div id="planPicker" class="login-mask" hidden>
     <div id="planPickerCard" class="plan-picker-card"></div>
+  </div>
+
+  <!--
+    套餐预览：按终端（APK）的排列顺序展开「分组 → 频道」，
+    只读、不改数据，用来在保存前确认下发到电视上的样子。
+  -->
+  <div id="planPreview" class="login-mask" hidden>
+    <div id="planPreviewCard" class="plan-preview-card"></div>
   </div>
 
   <!-- 修改密码：改完所有会话失效，需要重新登录 -->

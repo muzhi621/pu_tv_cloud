@@ -1794,7 +1794,7 @@ test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔
     const data = await json(res);
     assert.equal(data.revision, 0);
     assert.deepEqual(data.iptv, { sources: [], packages: [], epgUrl: '' });
-    assert.deepEqual(data.vod, { sources: [], sites: [] });
+    assert.deepEqual(data.vod, { sources: [], sites: [], defaultSiteId: '' });
 
     const denied = await libraryGet(ctx('GET', '/api/library', {
       env: { CONFIG_READ_TOKEN: 'read-secret' },
@@ -2190,8 +2190,49 @@ test('TVBox 源与站点：库字段、按源展开、白名单与锁定隔离',
     assert.equal(expandVodSites(legacy, library).vod.defaultSiteId, '');
   });
 
-  await t.test('多源同时选中：站点合并、源按引用顺序', () => {
-    const library = buildLibrary();
+  await t.test('库级默认站点：随库保存，配置没指定时兜底，显式指定优先', () => {
+    // 库里的默认站点只在它确实还在站点列表里时才保留
+    const [library] = normalizeLibrary({
+      vod: {
+        sources: [{ id: SOURCE_A, name: '源A', url: 'https://a.example.com/config.json' }],
+        sites: [
+          { sourceId: SOURCE_A, key: 'a1', name: 'A1', api: 'csp_A1' },
+          { sourceId: SOURCE_A, key: 'a2', name: 'A2', api: 'csp_A2' },
+        ],
+        defaultSiteId: `${SOURCE_A}:a2`,
+      },
+    });
+    assert.equal(library.vod.defaultSiteId, `${SOURCE_A}:a2`, '库级默认站点要能存下来');
+
+    // 源被引用但配置里没指定默认站点 → 用库级默认
+    const [plain] = normalizeSections({ vod: { managed: true, sourceIds: [SOURCE_A] } });
+    assert.equal(expandVodSites(plain, library).vod.defaultSiteId, `${SOURCE_A}:a2`);
+
+    // 配置里显式指定 → 覆盖库级默认
+    const [explicit] = normalizeSections({
+      vod: { managed: true, sourceIds: [SOURCE_A], defaultSiteId: `${SOURCE_A}:a1` },
+    });
+    assert.equal(expandVodSites(explicit, library).vod.defaultSiteId, `${SOURCE_A}:a1`);
+
+    // 库级默认的站点没被下发（白名单只留 a1）→ 不能硬塞，回退空串
+    const [narrowed] = normalizeSections({
+      vod: { managed: true, sourceIds: [SOURCE_A], siteIds: [`${SOURCE_A}:a1`] },
+    });
+    assert.equal(expandVodSites(narrowed, library).vod.defaultSiteId, '');
+
+    // 悬空 id 入库时就丢掉，不让它一路传到终端
+    const [dropped, warnings] = normalizeLibrary({
+      vod: {
+        sources: [{ id: SOURCE_A, name: '源A', url: 'https://a.example.com/config.json' }],
+        sites: [{ sourceId: SOURCE_A, key: 'a1', name: 'A1', api: 'csp_A1' }],
+        defaultSiteId: `${SOURCE_A}:nope`,
+      },
+    });
+    assert.equal(dropped.vod.defaultSiteId, '');
+    assert.ok(warnings.some((item) => item.includes('library.vod.defaultSiteId')));
+  });
+
+  await t.test('多源同时选中：站点合并、源按引用顺序', () => {    const library = buildLibrary();
     const [sections] = normalizeSections({
       vod: { managed: true, sourceIds: [SOURCE_B, SOURCE_A] },
     });

@@ -1334,7 +1334,7 @@ def _normalize_library_iptv(part: Any, warnings: list[str]) -> dict:
 
 def _normalize_library_vod(part: Any, warnings: list[str]) -> dict:
     raw = _library_object(part, "library.vod")
-    out: dict = {"sources": [], "sites": []}
+    out: dict = {"sources": [], "sites": [], "defaultSiteId": ""}
 
     raw_sources = raw.get("sources")
     if raw_sources is not None:
@@ -1423,6 +1423,15 @@ def _normalize_library_vod(part: Any, warnings: list[str]) -> dict:
                 "quickSearch": _lenient_int(item.get("quickSearch"), 0, 0, 2),
                 "note": _str(item.get("note"), "", "library.vod.sites.note", 200),
             })
+    # 库级默认站点：设备/套餐没单独指定时用它。只接受落在最终站点列表里的 id，
+    # 否则留一个悬空引用，终端打开影音会去开一个不存在的站点。
+    wanted_default = _str(raw.get("defaultSiteId"), "", "library.vod.defaultSiteId", 96)
+    if wanted_default:
+        if any(site["id"] == wanted_default for site in out["sites"]):
+            out["defaultSiteId"] = wanted_default
+        else:
+            warnings.append("library.vod.defaultSiteId: 站点 %s 不在站点列表里，已忽略"
+                            % wanted_default)
     return out
 
 
@@ -1535,7 +1544,7 @@ def empty_library() -> dict:
         "revision": 0,
         "updatedAt": "",
         "iptv": {"sources": [], "packages": [], "epgUrl": ""},
-        "vod": {"sources": [], "sites": []},
+        "vod": {"sources": [], "sites": [], "defaultSiteId": ""},
         # 在线更新版本：与 IPTV 源、TVBox 源并列的第三类资源。
         # 套餐里选定一条后展开写入设备文档的 sections.update（版本号 + 按架构直链），
         # 终端据此判定「有新版本」并直接从该地址下载。
