@@ -67,19 +67,19 @@
         "titleI18n": {},
         "bodyI18n": {}
       },
-    "exitDialog": {
-      "enabled": false,
-      "mode": "always",
-      "dismissible": true,
-      "showDonate": true,
-      "titleI18n": {},
-      "bodyI18n": {},
-      "qrImageUrl": "",
-      "qrCaptionI18n": {},
-      "donateBodyI18n": {},
-      "confirmTextI18n": {},
-      "cancelTextI18n": {}
-    },
+      "exitDialog": {
+        "enabled": false,
+        "mode": "always",
+        "dismissible": true,
+        "showDonate": true,
+        "titleI18n": {},
+        "bodyI18n": {},
+        "qrImageUrl": "",
+        "qrCaptionI18n": {},
+        "donateBodyI18n": {},
+        "confirmTextI18n": {},
+        "cancelTextI18n": {}
+      },
       "showSplashPage": true
     },
     "update": {
@@ -99,6 +99,11 @@
       "groups": [],
       "channels": [],
       "epgUrl": "",
+      "requestHeaders": {
+        "userAgent": "",
+        "referer": "",
+        "cookie": ""
+      },
       "packages": [],
       "selectedPackageIds": []
     }

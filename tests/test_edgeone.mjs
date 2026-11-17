@@ -347,6 +347,51 @@ test('EdgeOne 配置服务完整流程', async (t) => {
     assert.equal(got.sections.navigation.wallpaper.imageUrl, 'https://cdn.example.com/bg.jpg');
   });
 
+  await t.test('IPTV 请求头：默认值、下发与换行注入清洗', async () => {
+    // 缺省补齐三项空串：编辑器有落点，终端把空值当「不改动」。
+    const [fresh] = normalizeSections({ iptv: {} });
+    assert.deepEqual(fresh.iptv.requestHeaders, {
+      userAgent: '', referer: '', cookie: '',
+    });
+
+    // 合法下发：三项原样保留。
+    const [ok] = normalizeSections({ iptv: { requestHeaders: {
+      userAgent: 'Mozilla/5.0 (Linux; Android 12)',
+      referer: 'http://example.com/',
+      cookie: 'a=b; c=d',
+    } } });
+    assert.equal(ok.iptv.requestHeaders.userAgent, 'Mozilla/5.0 (Linux; Android 12)');
+    assert.equal(ok.iptv.requestHeaders.referer, 'http://example.com/');
+    assert.equal(ok.iptv.requestHeaders.cookie, 'a=b; c=d');
+
+    // 换行注入：/[\u0000-\u001f\u007f]/ 剔除，不得留在下发文档里。
+    const [scrubbed] = normalizeSections({ iptv: { requestHeaders: {
+      referer: 'http://example.com/\r\nX-Injected: 1',
+    } } });
+    assert.doesNotMatch(scrubbed.iptv.requestHeaders.referer, /[\r\n]/);
+    assert.equal(scrubbed.iptv.requestHeaders.referer, 'http://example.com/X-Injected: 1');
+
+    // 类型错误严格抛错（与 schema.py 一致）。
+    assert.throws(() => normalizeSections({ iptv: { requestHeaders: 'nope' } }),
+      /iptv\.requestHeaders 必须是对象/);
+    assert.throws(() => normalizeSections({ iptv: { requestHeaders: { cookie: 123 } } }),
+      /iptv\.requestHeaders\.cookie 必须是字符串/);
+
+    // 超长按上限截断（cookie 2000）。
+    const [long] = normalizeSections({ iptv: { requestHeaders: { cookie: 'x'.repeat(3000) } } });
+    assert.equal(long.iptv.requestHeaders.cookie.length, 2000);
+
+    // 端到端：PUT 后 GET 能读回请求头，且不需要 iptv.managed=true。
+    const before = await json(await configGet(ctx('GET', '/api/config')));
+    const put = await configPut(ctx('PUT', '/api/config', {
+      headers: { 'If-Match': String(before.revision) },
+      body: { sections: { iptv: { requestHeaders: { referer: 'https://ref.example.com/' } } } },
+    }));
+    assert.equal(put.status, 200);
+    const got = await json(await configGet(ctx('GET', '/api/config')));
+    assert.equal(got.sections.iptv.requestHeaders.referer, 'https://ref.example.com/');
+  });
+
   await t.test('KV 键名符合平台限制（字母数字下划线）', () => {
     for (const key of kv.map.keys()) {
       assert.match(key, /^[A-Za-z0-9_]+$/, `非法 KV key: ${key}`);

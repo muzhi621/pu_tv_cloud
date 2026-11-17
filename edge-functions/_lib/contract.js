@@ -25,6 +25,8 @@ export const MAX_PACKAGE_CHANNELS_TOTAL = 5000;
 const PACKAGE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const VERSION_RE = /^\d+(?:\.\d+){0,3}$/;
 const URL_RE = /^https?:\/\/[^\s]+$/i;
+const IPTV_HEADER_LIMITS = [['userAgent', 500], ['referer', 500], ['cookie', 2000]];
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/g;
 const IPTV_URL_RE = /^(https?|rtmp|rtsp|udp|mms|p2p):\/\/[^\s]+$/i;
 
 /**
@@ -187,6 +189,18 @@ export function ensureSectionDefaults(sections) {
     if (!Array.isArray(iptv.selectedPackageIds)) iptv.selectedPackageIds = [];
     if (typeof iptv.lockLibrary !== 'boolean') iptv.lockLibrary = false;
     if (!Number.isInteger(iptv.libraryRevision) || iptv.libraryRevision < 0) iptv.libraryRevision = 0;
+    // v1.2：请求头改由云端下发。老文档没有这一段，补空对象让编辑器有落点；
+    // 空字符串表示「不下发自定义头」，终端此时保留自己的值。
+    const headers = iptv.requestHeaders;
+    if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+      iptv.requestHeaders = { userAgent: '', referer: '', cookie: '' };
+    } else {
+      for (const [key, limit] of IPTV_HEADER_LIMITS) {
+        headers[key] = typeof headers[key] === 'string'
+          ? headers[key].replace(CONTROL_CHARS_RE, '').trim().slice(0, limit)
+          : '';
+      }
+    }
   }
   return sections;
 }
@@ -559,6 +573,36 @@ function normalizeChannelList(raw, field, warnings) {
  * 每台设备只在 selectedPackageIds 里勾选要下发的套餐；GET /api/config 时由
  * expandIptvChannels 展开成终端认识的 channels 字段，终端无需任何改动。
  */
+/**
+ * IPTV 拉流/播放请求头（User-Agent / Referer / Cookie）。
+ *
+ * 这三项由电视端直接拼进 HTTP 请求，所以必须在这里拦住 CR/LF 与控制字符：
+ * 云端配置一旦能带换行，等于把请求头注入的口子开在配置里。字符被清理时
+ * 记 warning，让编辑者知道自己的值没原样生效。
+ */
+
+function normalizeRequestHeaders(value, field, warnings) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new ConfigError(`${field} 必须是对象`);
+  }
+  const out = {};
+  for (const [key, limit] of IPTV_HEADER_LIMITS) {
+    const raw = value[key];
+    if (raw === undefined || raw === null) {
+      out[key] = '';
+      continue;
+    }
+    if (typeof raw !== 'string') throw new ConfigError(`${field}.${key} 必须是字符串`);
+    const cleaned = raw.replace(CONTROL_CHARS_RE, '').trim().slice(0, limit);
+    if (cleaned !== raw.trim()) {
+      warnings.push(`${field}.${key}: 已移除换行/控制字符或超出 ${limit} 字符上限`);
+    }
+    out[key] = cleaned;
+  }
+  return out;
+}
+
 function normalizeIptv(part, warnings) {
   const base = clone(SEED.sections.iptv);
   if (!Array.isArray(base.selectedPackageIds)) base.selectedPackageIds = [];
@@ -568,6 +612,9 @@ function normalizeIptv(part, warnings) {
   const epg = str(part.epgUrl, '', 'iptv.epgUrl', 500);
   base.epgUrl = epg && URL_RE.test(epg) ? epg : '';
   if (epg && !base.epgUrl) warnings.push('iptv.epgUrl: 仅支持 http(s)，已忽略');
+
+  const requestHeaders = normalizeRequestHeaders(part.requestHeaders, 'iptv.requestHeaders', warnings);
+  if (requestHeaders !== undefined) base.requestHeaders = requestHeaders;
 
   const sources = strList(part.sources, 'iptv.sources');
   if (sources !== undefined) {

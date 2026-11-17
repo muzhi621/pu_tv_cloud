@@ -161,6 +161,42 @@ class SchemaTests(unittest.TestCase):
                 "imageUrl": "https://example.com/w.jpg", "boxFit": "bogus",
             }}})
 
+    def test_iptv_request_headers_defaults_and_control_char_scrub(self):
+        """IPTV 请求头：缺省补三项空串；CR/LF 与控制字符必须被剔除。"""
+        sections, _ = normalize_sections({"iptv": {}})
+        self.assertEqual(sections["iptv"]["requestHeaders"], {
+            "userAgent": "", "referer": "", "cookie": "",
+        })
+
+        sections, warnings = normalize_sections({"iptv": {"requestHeaders": {
+            "userAgent": "Mozilla/5.0 (Linux)",
+            "referer": "http://example.com/",
+            "cookie": "a=b; c=d",
+        }}})
+        self.assertEqual(sections["iptv"]["requestHeaders"]["userAgent"], "Mozilla/5.0 (Linux)")
+        self.assertEqual(sections["iptv"]["requestHeaders"]["referer"], "http://example.com/")
+        self.assertEqual(sections["iptv"]["requestHeaders"]["cookie"], "a=b; c=d")
+        self.assertEqual(warnings, [])
+
+        # 换行注入：剔除后记 warning，不允许 CR/LF 落进下发文档。
+        sections, warnings = normalize_sections({"iptv": {"requestHeaders": {
+            "referer": "http://example.com/\r\nX-Injected: 1",
+        }}})
+        self.assertNotIn("\r", sections["iptv"]["requestHeaders"]["referer"])
+        self.assertNotIn("\n", sections["iptv"]["requestHeaders"]["referer"])
+        self.assertEqual(sections["iptv"]["requestHeaders"]["referer"], "http://example.com/X-Injected: 1")
+        self.assertTrue(any("iptv.requestHeaders.referer" in item for item in warnings))
+
+        # 非对象 / 非字符串都严格抛错，与 contract.js 一致。
+        with self.assertRaises(ValueError):
+            normalize_sections({"iptv": {"requestHeaders": "nope"}})
+        with self.assertRaises(ValueError):
+            normalize_sections({"iptv": {"requestHeaders": {"cookie": 123}}})
+
+        # 超长字段按上限截断（cookie 上限 2000）。
+        sections, _ = normalize_sections({"iptv": {"requestHeaders": {"cookie": "x" * 3000}}})
+        self.assertEqual(len(sections["iptv"]["requestHeaders"]["cookie"]), 2000)
+
 
 class NavigationGroupsTests(unittest.TestCase):
     """navigation.groups / defaultGroupId 与 contract.js normalizeNavigation 对齐。"""

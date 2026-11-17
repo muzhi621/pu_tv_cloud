@@ -70,6 +70,8 @@ MAX_NAV_ICON_LEN = 64
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
 _URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 _IPTV_URL_RE = re.compile(r"^(https?|rtmp|rtsp|udp|mms|p2p)://[^\s]+$", re.IGNORECASE)
+# 请求头里出现换行就是注入：CR/LF 与其余控制字符在入库前一律剔除。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 MAX_IPTV_CHANNELS = 3000
 MAX_DOCUMENT_BYTES = 900 * 1024
 # 套餐库上限：套餐里的频道是「频道库」，只在 GET 时展开到 channels，不重复存两份。
@@ -77,6 +79,14 @@ MAX_DOCUMENT_BYTES = 900 * 1024
 # 所有套餐频道数之和的硬上限，用于稳在 MAX_DOCUMENT_BYTES=900KB 内。
 MAX_IPTV_PACKAGES = 12
 MAX_PACKAGE_CHANNELS_TOTAL = 5000
+
+MAX_IPTV_HEADER_LIMITS: tuple[tuple[str, int], ...] = (
+    ("userAgent", 500),
+    ("referer", 500),
+    ("cookie", 2000),
+)
+
+
 
 # spider 契约流派：FongMi :catvod 与 TVBoxOS 的 Spider 基类互不兼容，
 # 两套 jar 不能混用宿主。缺省按 fongmi（现有 catvod-api.jar 的契约）。
@@ -218,6 +228,17 @@ def ensure_section_defaults(sections: dict) -> dict:
         revision = iptv.get("libraryRevision")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             iptv["libraryRevision"] = 0
+        # v1.2：请求头改由云端下发。老文档没有这一段，补空对象让编辑器有落点；
+        # 空字符串表示「不下发自定义头」，终端此时保留自己的值。
+        headers = iptv.get("requestHeaders")
+        if not isinstance(headers, dict):
+            iptv["requestHeaders"] = {"userAgent": "", "referer": "", "cookie": ""}
+        else:
+            for key, limit in MAX_IPTV_HEADER_LIMITS:
+                if not isinstance(headers.get(key), str):
+                    headers[key] = ""
+                else:
+                    headers[key] = _CONTROL_CHARS_RE.sub("", headers[key]).strip()[:limit]
     return sections
 
 
@@ -660,6 +681,32 @@ def _normalize_packages(raw: Any, warnings: list[str]) -> list[dict] | None:
     return packages
 
 
+def _normalize_request_headers(value: Any, warnings: list[str], field: str) -> dict[str, str] | None:
+    """IPTV 拉流/播放请求头（User-Agent / Referer / Cookie）。
+
+    这三项由电视端直接拼进 HTTP 请求，所以必须在这里拦住 CR/LF 与控制字符：
+    云端配置一旦能带换行，等于把请求头注入的口子开在配置里。字符被清理时
+    记 warning，让编辑者知道自己的值没原样生效。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError("%s 必须是对象" % field)
+    out: dict[str, str] = {}
+    for key, limit in MAX_IPTV_HEADER_LIMITS:
+        raw = value.get(key)
+        if raw is None:
+            out[key] = ""
+            continue
+        if not isinstance(raw, str):
+            raise ConfigError("%s.%s 必须是字符串" % (field, key))
+        cleaned = _CONTROL_CHARS_RE.sub("", raw).strip()[:limit]
+        if cleaned != raw.strip():
+            warnings.append("%s.%s: 已移除换行/控制字符或超出 %d 字符上限" % (field, key, limit))
+        out[key] = cleaned
+    return out
+
+
 def normalize_iptv(part: dict, warnings: list[str]) -> dict:
     """IPTV 源节：编辑器解析 M3U/TXT 后写入精简频道列表，云端只校验与下发。"""
     base = copy.deepcopy(SEED["sections"]["iptv"])
@@ -671,6 +718,10 @@ def normalize_iptv(part: dict, warnings: list[str]) -> dict:
     base["epgUrl"] = epg if epg and _URL_RE.match(epg) else ""
     if epg and not base["epgUrl"]:
         warnings.append("iptv.epgUrl: 仅支持 http(s)，已忽略")
+
+    headers = _normalize_request_headers(part.get("requestHeaders"), warnings, "iptv.requestHeaders")
+    if headers is not None:
+        base["requestHeaders"] = headers
 
     sources = _str_list(part.get("sources"), "iptv.sources")
     if sources is not None:

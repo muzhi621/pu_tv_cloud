@@ -73,8 +73,11 @@ function setPath(obj, path, value) {
   const section = keys[0];
   // navigation.wallpaper 是独立功能（客户端不看 managed 门槛），改它不应连带
   // 打开导航白名单接管，否则用户只想设个壁纸却把菜单也改了。
+  // iptv.requestHeaders 同理：它按字段下发，改了只要终端拉到配置就生效，
+  // 不该顺手把「整节接管频道列表」也打开。
   if ((section === 'iptv' || section === 'vod' || section === 'navigation')
       && keys.length > 1 && keys[1] !== 'managed' && keys[1] !== 'wallpaper'
+      && keys[1] !== 'requestHeaders'
       && obj[section] && typeof obj[section] === 'object' && !Array.isArray(obj[section])) {
     obj[section].managed = true;
   }
@@ -393,6 +396,9 @@ function iptvSection() {
   const iptv = sections.iptv;
   if (!Array.isArray(iptv.packages)) iptv.packages = [];
   if (!Array.isArray(iptv.selectedPackageIds)) iptv.selectedPackageIds = [];
+  // 请求头（UA / Referer / Cookie）由云端下发，字段固定三项，缺了就地补空对象，
+  // 表单才不会因为老文档没有这一段而渲染成 undefined。
+  if (!isObj(iptv.requestHeaders)) iptv.requestHeaders = { userAgent: '', referer: '', cookie: '' };
   // packageIds 指向资源库套餐；老文档只有 selectedPackageIds + 内联 packages。
   if (!Array.isArray(iptv.packageIds)) iptv.packageIds = [];
   if (!Array.isArray(iptv.channels)) iptv.channels = [];
@@ -2707,6 +2713,15 @@ function sectionsFormHtml() {
     + '</div>'
 
     + '<div class="df-block"><h3>IPTV 套餐下发</h3>' + deviceIptvBlock() + '</div>'
+
+    + '<div class="df-block"><h3>IPTV 请求头</h3>'
+    + dfText('iptv.requestHeaders.userAgent', 'User-Agent')
+    + dfText('iptv.requestHeaders.referer', 'Referer')
+    + dfTextArea('iptv.requestHeaders.cookie', 'Cookie（形如 a=b; c=d）', 2)
+    + '<p class="meta">这三项随拉流与播放请求一起带给源站，用于少数需要防盗链 Referer / 专用 UA 的源。'
+    + '<b>留空＝不改动终端现有值</b>（升级后终端上已配好的请求头不会被清掉）；'
+    + '改动按字段生效，不需要勾「云端接管本节」，终端下一次同步（约 3 分钟内）后生效。</p>'
+    + '</div>'
 
     + '<div class="df-block"><h3>TVBox 站点下发</h3>' + deviceVodBlock() + '</div>'
 

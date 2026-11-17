@@ -104,6 +104,11 @@ export const SEED = {
       "groups": [],
       "channels": [],
       "epgUrl": "",
+      "requestHeaders": {
+        "userAgent": "",
+        "referer": "",
+        "cookie": ""
+      },
       "packages": [],
       "selectedPackageIds": []
     }

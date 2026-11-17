@@ -86,6 +86,7 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
     "iptv": {"managed": true, "sources": [], "groups": ["央视频道"],
              "channels": [{"name": "CCTV-1", "group": "央视频道", "url": "http://.../1.m3u8", "logo": ""}],
              "epgUrl": "",
+             "requestHeaders": {"userAgent": "", "referer": "", "cookie": ""},
              "packages": [{"id": "pkg_cctv", "name": "央视+卫视",
                           "sources": ["https://.../list.m3u"], "channelCount": 2}],
              "selectedPackageIds": ["pkg_cctv"],
@@ -111,6 +112,13 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
 > 「设备内联套餐」与「被引用的库套餐」。客户端拿到的仍是同一个 `channels` 字段，
 > 无需感知区别。上面的示例同时列了 `selectedPackageIds` 与 `packageIds` 以便对照，
 > 实际一台设备通常只用其中一种。
+>
+> **`iptv.requestHeaders`（v3.0.41+）**：IPTV 拉流与播放的 `User-Agent` / `Referer` /
+> `Cookie`，用于少数需要防盗链 Referer 或专用 UA 的源。三项均为字符串，上限分别是
+> 500 / 500 / 2000 字符；服务端会剔除 `\r`、`\n` 与其余控制字符（防止请求头注入），
+> 被清理时返回 `warnings`。终端只在字段**非空**时覆盖本地值——留空表示「不改动终端
+> 现有请求头」，避免升级后把用户已在用的 Referer/UA 清掉。该字段独立于
+> `iptv.managed` 生效，只想下发请求头时无需接管整节。
 
 `GET /api/config` 展开 `iptv.channels` 的四档优先级（仅 EdgeOne 有库；FC 版没有库，
 恒走第 3 档）：
