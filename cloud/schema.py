@@ -778,7 +778,9 @@ def _normalize_package_groups(raw: Any, field: str, warnings: list[str],
             break
         raw_channels = entry.get("channels") or []
         if not isinstance(raw_channels, list):
-            raise ConfigError("%s[%s].channels 必须是数组" % (field, name))
+            # 与 contract.js 一致：脏数据当空分组，不整份 400。
+            warnings.append("%s[%s].channels 不是数组，按空分组处理" % (field, name))
+            raw_channels = []
         decorated = []
         for channel in raw_channels:
             if isinstance(channel, dict):
