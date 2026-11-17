@@ -31,7 +31,7 @@ import {
   normalizeDocument, normalizeSections, expandIptvChannels, expandVodSites, viewDocument,
   normalizeLibrary, emptyLibrary, parseSpiderField, resolveVodAsset,
 } from '../edge-functions/_lib/contract.js';
-import { optionsHandler } from '../edge-functions/_lib/http.js';
+import { handle, optionsHandler, readJsonBody } from '../edge-functions/_lib/http.js';
 import { listDevices as storageListDevices } from '../edge-functions/_lib/storage.js';
 import {
   onRequestPost as iptvFetchPost, checkFetchUrl, decodeSubscription, detectBinaryPayload,
@@ -675,6 +675,100 @@ test('IPTV 云端代理：SSRF 防护、编码识别与失败隔离', async (t) 
  * getReader().read() 第一次就 done:true，但 arrayBuffer() 有完整内容。
  * 旧实现流优先 → 所有订阅抓成 0 字节 → 编辑器全线「无法解析」。
  */
+test('请求体读取：EdgeOne 空流场景不能把写接口打成 500', async (t) => {
+  // 2026-11-17 线上事故回归：EdgeOne 的 request.body 能 getReader()，但读出来是空流；
+  // 一旦先调 getReader()，body 就被 lock，随后回退 request.text() 必抛「Body is unusable」，
+  // 被 handle 兜底成 500「服务端内部错误: Error」，导致保存套餐 / 开机公告 / 上传壁纸
+  // 等全部写接口失败。修法：整体读取（text）优先，流式只作兜底，且已用过的 body 不再二次读。
+  const jsonRequest = () => ({
+    method: 'PUT',
+    url: `${BASE}/api/bundles`,
+    headers: new Headers({ 'content-type': 'application/json', 'content-length': '9' }),
+    body: {
+      getReader() {
+        // 复刻线上：空流，且一被调用就等价于「body 已锁定」
+        return { async read() { return { done: true, value: undefined }; } };
+      },
+    },
+    async text() { return '{"ok":1}'; },
+  });
+
+  await t.test('整体读取优先，能正常解析 JSON', async () => {
+    assert.deepEqual(await readJsonBody(jsonRequest()), { ok: 1 });
+  });
+
+  await t.test('text 不可用时退回流式读取', async () => {
+    const enc = new TextEncoder();
+    const chunks = [enc.encode('{"a":'), enc.encode('2}')];
+    const request = {
+      method: 'POST',
+      url: `${BASE}/api/bundles`,
+      headers: new Headers({}),
+      body: {
+        getReader() {
+          let i = 0;
+          return {
+            async read() {
+              return i < chunks.length
+                ? { done: false, value: chunks[i++] }
+                : { done: true, value: undefined };
+            },
+          };
+        },
+      },
+      async text() { throw new TypeError('text 不可用'); },
+    };
+    assert.deepEqual(await readJsonBody(request), { a: 2 });
+  });
+
+  await t.test('body 已被消费时不再二次读取，也不抛二次异常', async () => {
+    let locked = false;
+    const request = {
+      method: 'PUT',
+      url: `${BASE}/api/bundles`,
+      headers: new Headers({}),
+      get bodyUsed() { return locked; },
+      get body() {
+        return {
+          get locked() { return locked; },
+          getReader() { locked = true; return { async read() { return { done: true, value: undefined }; } }; },
+        };
+      },
+      async text() { locked = true; return '{"x":1}'; },
+    };
+    assert.deepEqual(await readJsonBody(request), { x: 1 });
+  });
+
+  await t.test('读取失败返回 400 body_unreadable，而不是 500', async () => {
+    const request = {
+      method: 'POST',
+      url: `${BASE}/api/bundles`,
+      headers: new Headers({}),
+      body: null,
+      async text() { throw new Error('stream locked'); },
+    };
+    const response = await handle({ env: {}, request }, async ({ request: req }) => {
+      await readJsonBody(req);
+      return new Response('unreachable');
+    });
+    assert.equal(response.status, 400);
+    const payload = JSON.parse(await response.text());
+    assert.equal(payload.error, 'body_unreadable');
+    assert.match(payload.message, /stream locked/);
+  });
+
+  await t.test('未知异常仍然是 500，但带上真实 message 便于定位', async () => {
+    const request = { method: 'GET', url: `${BASE}/api/bundles`, headers: new Headers({}) };
+    const response = await handle({ env: {}, request }, async () => {
+      throw new Error('storage exploded');
+    });
+    assert.equal(response.status, 500);
+    const payload = JSON.parse(await response.text());
+    assert.equal(payload.error, 'internal_error');
+    assert.match(payload.message, /storage exploded/);
+  });
+});
+
 test('IPTV 云端代理：边缘运行时响应体读取与内容判定', async (t) => {
   const savedFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = savedFetch; });

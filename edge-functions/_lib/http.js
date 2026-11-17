@@ -90,33 +90,66 @@ export async function readJsonBody(request) {
   const declared = Number(request.headers.get('content-length') || 0);
   if (declared > MAX) throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
 
+  // 整体读取优先（2026-11-17 线上事故的根因）：
+  // EdgeOne Pages Functions 里 request.body 虽然提供 getReader()，但读出来是「空流」
+  // （第一次 read 就 done:true）。更致命的是——**一旦调用 getReader()，body 就被 lock**，
+  // 之后 `request.text()` 必定抛普通 Error（"Body is unusable"），被 handle 兜底成
+  // 500「服务端内部错误: Error」。云端所有带 body 的写接口（保存套餐 / 保存设备配置 /
+  // 上传壁纸 / 拉黑删除 / 绑定下发）全部因此失败，而本地 Node 测试行为正常，测不出来。
+  // 与 api/iptv/fetch.js 的 readLimited 是同一个坑，必须同样「整体读取优先」。
   let raw = '';
-  // 流式累加：每块都检查，超阈值立即中断读取，不把整个超大 body 读进内存。
-  // 某些运行时请求体是空流（见 fetch.js 的 readLimited 注释），流读取拿不到
-  // 内容时回退到 text()——此时 declared 已校验过，兜底路径仍有上限保护。
-  let streamed = false;
-  if (request.body && typeof request.body.getReader === 'function') {
-    const reader = request.body.getReader();
-    const decoder = new TextDecoder();
-    let bytes = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value || !value.length) continue;
-        bytes += value.length;
-        if (bytes > MAX) throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
-        raw += decoder.decode(value, { stream: true });
+  let failure = null;
+  try {
+    if (typeof request.text === 'function') raw = await request.text();
+  } catch (error) {
+    failure = error; // 某些运行时只实现 body 流，走下面的兜底
+  }
+
+  // 兜底：整体读取不可用 / 返回空时才试流式。body 已被消费或锁定（locked/bodyUsed）
+  // 就直接放弃，不制造「二次读取必失败」的假错误。
+  if (!raw && request.body && typeof request.body.getReader === 'function') {
+    const body = request.body;
+    const alreadyUsed = body.locked === true
+      || (typeof request.bodyUsed === 'boolean' && request.bodyUsed === true);
+    if (!alreadyUsed) {
+      try {
+        const reader = body.getReader();
+        const decoder = new TextDecoder();
+        let bytes = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || !value.length) continue;
+          bytes += value.length;
+          if (bytes > MAX) throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
+          raw += decoder.decode(value, { stream: true });
+        }
+        raw += decoder.decode();
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        if (!failure) failure = error;
       }
-      raw += decoder.decode();
-      streamed = raw.length > 0;
-    } catch (error) {
-      if (error instanceof HttpError) throw error;
-      raw = ''; // 触发下面的 text() 兜底
     }
   }
-  if (!streamed) raw = await request.text();
-  if (!raw) throw new ConfigError('请求体不能为空');
+
+  if (!raw) {
+    // 有异常却读不出内容：明确报「请求体读取失败」，别再伪装成 500 内部错误。
+    if (failure) {
+      throw new HttpError(
+        400, 'body_unreadable',
+        `无法读取请求体（${(failure && failure.message) || failure}）`,
+      );
+    }
+    // 声明了长度却读到 0 字节：运行时的请求体流不可用，属于部署环境问题，
+    // 报「为空」会误导成调用方没传 body。
+    if (declared > 0) {
+      throw new HttpError(
+        400, 'body_unreadable',
+        `请求体声明 ${declared} 字节但读不到内容，该运行时的请求体流可能不可用`,
+      );
+    }
+    throw new ConfigError('请求体不能为空');
+  }
   if (new TextEncoder().encode(raw).length > MAX) {
     throw new HttpError(413, 'payload_too_large', '请求体超过 2 MiB');
   }
@@ -194,9 +227,18 @@ export async function handle(context, fn) {
       });
     }
     try { console.error('[pu_tv_cloud]', error); } catch (_) { /* 日志不可用则忽略 */ }
+    // 只回 name 会得到「服务端内部错误: Error」这种哑错误（2026-11-17 踩过），
+    // 带上级 message 才能在控制台一眼定位；截断避免把内部细节整段吐出去。
+    const detail = error && error.message
+      ? `${(error && error.name) || 'Error'}: ${String(error.message).slice(0, 300)}`
+      : String((error && error.name) || error || 'unknown');
     return send({
       env, request, status: 500,
-      body: { error: 'internal_error', message: `服务端内部错误: ${error && error.name}` },
+      body: {
+        error: 'internal_error',
+        message: `服务端内部错误: ${detail}`,
+        hint: '详情见函数日志（EdgeOne 控制台 → Pages → 函数日志）',
+      },
     });
   }
 }
