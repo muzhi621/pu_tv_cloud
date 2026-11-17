@@ -36,6 +36,15 @@ import { listDevices as storageListDevices } from '../edge-functions/_lib/storag
 import {
   onRequestPost as iptvFetchPost, checkFetchUrl, decodeSubscription, detectBinaryPayload,
 } from '../edge-functions/api/iptv/fetch.js';
+import { onRequestGet as updateGet } from '../edge-functions/api/update/index.js';
+import {
+  flattenVersion, abiOf, repoOf, proxyPrefixes, buildFromReleases, buildFromStatic,
+  loadAppUpdate, resetAppUpdateCache,
+} from '../edge-functions/_lib/update.js';
+import {
+  onRequestGet as manifestGet, onRequestPost as manifestPost,
+} from '../edge-functions/api/update/manifest.js';
+import { normalizeUploadedManifest } from '../edge-functions/_lib/update.js';
 
 class MemoryKV {
   constructor() { this.map = new Map(); }
@@ -2467,5 +2476,271 @@ test('终端管理：拉黑保留记录并拒绝配置请求', async (t) => {
     assert.ok(list.blocked.includes('tv-x'), '黑名单应保留，删除不解除拉黑');
     assert.equal((await configGet(ctx('GET', '/api/config?deviceId=tv-x', { env }))).status, 403);
     await devicesPost(ctx('POST', '/api/devices', { env, body: { action: 'unblock', deviceId: 'tv-x' } }));
+  });
+});
+
+test('应用更新清单：云端代取 GitHub，终端只认自己的域名', async (t) => {
+  const env = { UPDATE_GITHUB_REPO: 'muzhi621/pu_tv_client' };
+
+  /** 一条最小可用的 GitHub release。 */
+  const release = (tag, { prerelease = false, draft = false, abis = ['arm64-v8a'] } = {}) => ({
+    tag_name: tag,
+    name: `SUTV ${tag}`,
+    body: `## ${tag}\n- 修了个 bug`,
+    html_url: `https://github.com/muzhi621/pu_tv_client/releases/tag/${tag}`,
+    published_at: '2026-11-17T09:30:00Z',
+    prerelease,
+    draft,
+    author: { login: 'github-actions[bot]', avatar_url: 'https://a/x.png', html_url: 'https://github.com/apps/x' },
+    assets: [
+      ...abis.map((abi, index) => ({
+        name: `SUTV-${abi}-impeller.apk`,
+        browser_download_url: `https://github.com/muzhi621/pu_tv_client/releases/download/${tag}/SUTV-${abi}-impeller.apk`,
+        size: 37748736 + index,
+        digest: 'sha256:' + 'a'.repeat(64),
+        download_count: 3,
+      })),
+      {
+        name: 'source.zip',
+        browser_download_url: `https://github.com/muzhi621/pu_tv_client/archive/${tag}.zip`,
+        size: 1024,
+      },
+    ],
+  });
+
+  await t.test('版本号扁平化与仓库配置校验', () => {
+    assert.equal(flattenVersion('3.0.42'), 130042);
+    assert.equal(flattenVersion('v3.0.9'), 130009);
+    assert.equal(flattenVersion(''), 0);
+    // 非法仓库配置不能拼进 URL，必须回落到默认仓库
+    assert.equal(repoOf({ UPDATE_GITHUB_REPO: 'x' }).slug, 'muzhi621/pu_tv_client');
+    assert.equal(repoOf({ UPDATE_GITHUB_REPO: 'a/../../etc' }).slug, 'muzhi621/pu_tv_client');
+    assert.equal(repoOf({}).slug, 'muzhi621/pu_tv_client');
+  });
+
+  await t.test('反代前缀可被 env 覆盖，且只保留 https', () => {
+    const list = proxyPrefixes({ UPDATE_PROXY_PREFIXES: 'https://a.example,http://bad.example' });
+    assert.deepEqual(list, ['https://a.example/']);
+    // 全部非法时回落内置列表，不能变成空数组（否则等于禁用反代）
+    assert.ok(proxyPrefixes({ UPDATE_PROXY_PREFIXES: 'ftp://x' }).length > 0);
+  });
+
+  await t.test('清单挑选最新非预发布版本，且只带 APK 资产', () => {
+    const payload = buildFromReleases(
+      [release('v3.0.43', { prerelease: true }), release('v3.0.42', { abis: ['arm64-v8a', 'armeabi-v7a'] })],
+      env,
+    );
+    assert.equal(payload.version, '3.0.42');
+    assert.equal(payload.version_num, 130042);
+    assert.equal(payload.prerelease, false);
+    assert.deepEqual(payload.android_abis, ['arm64-v8a', 'armeabi-v7a']);
+    assert.equal(payload.assets.length, 2, 'zip 等非 APK 资产不能下发给终端');
+    assert.ok(payload.assets.every((asset) => asset.name.endsWith('.apk')));
+    assert.ok(payload.assets[0].digest.startsWith('sha256:'));
+    assert.ok(payload.downloadPrefixes.length > 0, '终端要拿到云端指定的下载镜像');
+    assert.equal(payload.releases.length, 2);
+    // releases.json 侧用 changelog，客户端模型用 changeLog，两个都得有
+    assert.ok(payload.releases[0].changelog.length > 0);
+    assert.equal(payload.releases[0].changeLog, payload.releases[0].changelog);
+    // 历史条目的文件名不带扩展名，与仓库里 releases.json 的写法一致
+    assert.ok(payload.releases[0].files.every((file) => !file.name.endsWith('.apk')));
+    assert.equal(payload.releases[0].date, '2026-11-17');
+  });
+
+  await t.test('只有预发布时不能返回空清单', () => {
+    const payload = buildFromReleases([release('v3.1.0', { prerelease: true })], env);
+    assert.equal(payload.version, '3.1.0');
+    assert.equal(payload.prerelease, true);
+  });
+
+  await t.test('静态清单兜底：没有 asset 也能报出版本', () => {
+    const payload = buildFromStatic(
+      { version: '3.0.41', version_num: 130041, version_desc: '旧说明', android_abis: ['armeabi-v7a'] },
+      [{ version: '3.0.41', title: 'v3.0.41', date: '2026-11-16', files: [] }],
+      env,
+    );
+    assert.equal(payload.version, '3.0.41');
+    assert.deepEqual(payload.assets, []);
+    assert.equal(payload.releases.length, 1);
+    assert.throws(() => buildFromStatic({}, [], env), /version/);
+  });
+
+  await t.test('官方 API 不可达时自动换到反代', async () => {
+    resetAppUpdateCache();
+    const seen = [];
+    const fetchImpl = async (url) => {
+      seen.push(url);
+      if (url.startsWith('https://api.github.com/')) throw new Error('ECONNRESET');
+      return { ok: true, text: async () => JSON.stringify([release('v3.0.42')]) };
+    };
+    const { payload, cached } = await loadAppUpdate(env, { fetchImpl });
+    assert.equal(payload.source, 'proxy');
+    assert.equal(payload.version, '3.0.42');
+    assert.equal(cached, false);
+    assert.ok(seen.length >= 2, '官方地址失败后必须继续试反代');
+  });
+
+  await t.test('API 与反代全挂时，静态 version.json 也能报出版本', async () => {
+    resetAppUpdateCache();
+    const fetchImpl = async (url) => {
+      if (String(url).endsWith('/assets/version.json')) {
+        return { ok: true, text: async () => JSON.stringify({ version: '3.0.41', version_num: 130041, version_desc: '旧说明' }) };
+      }
+      if (String(url).endsWith('/assets/releases.json')) {
+        return { ok: true, text: async () => JSON.stringify([{ version: '3.0.41', title: 'v3.0.41', date: '2026-11-16', files: [] }]) };
+      }
+      throw new Error('blocked');
+    };
+    const { payload } = await loadAppUpdate(env, { fetchImpl });
+    assert.equal(payload.source, 'static');
+    assert.equal(payload.version, '3.0.41');
+    assert.deepEqual(payload.assets, [], '静态清单没有 asset 信息，客户端退化为文件列表');
+    assert.equal(payload.releases.length, 1);
+  });
+
+  await t.test('进程内缓存命中后不再出网；全部失败时用旧结果续命', async () => {
+    resetAppUpdateCache();
+    const ok = async () => ({ ok: true, text: async () => JSON.stringify([release('v3.0.42')]) });
+    await loadAppUpdate(env, { fetchImpl: ok });
+    let called = 0;
+    const bomb = async () => { called += 1; throw new Error('all down'); };
+
+    const hit = await loadAppUpdate(env, { fetchImpl: bomb });
+    assert.equal(hit.cached, true);
+    assert.equal(called, 0, '缓存有效期内不能回源');
+
+    // 超过 TTL：回源失败，但 24 小时内的旧清单仍然可用（附 stale 标记）
+    const stale = await loadAppUpdate(env, { fetchImpl: bomb, now: Date.now() + 10 * 60 * 1000 });
+    assert.equal(stale.payload.stale, true);
+    assert.equal(stale.cached, true);
+    assert.equal(stale.payload.version, '3.0.42');
+    resetAppUpdateCache();
+  });
+
+  await t.test('GET /api/update 带 CDN 缓存头，且不泄露内部细节', async () => {
+    const original = globalThis.fetch;
+    resetAppUpdateCache();
+    globalThis.fetch = async (url) => {
+      if (String(url).startsWith('https://api.github.com/')) {
+        return { ok: true, text: async () => JSON.stringify([release('v3.0.42')]) };
+      }
+      throw new Error('blocked');
+    };
+    try {
+      const res = await updateGet(ctx('GET', '/api/update'));
+      assert.equal(res.status, 200);
+      const cache = res.headers.get('cache-control');
+      assert.match(cache, /max-age=300/);
+      assert.match(cache, /stale-while-revalidate/);
+      assert.equal(res.headers.get('x-update-source'), 'github');
+      const data = await json(res);
+      assert.equal(data.version, '3.0.42');
+      assert.ok(data.downloadPrefixes.length > 0);
+    } finally {
+      globalThis.fetch = original;
+      resetAppUpdateCache();
+    }
+
+    // 所有源都挂：503 + 可执行提示，而不是 500「服务端内部错误」
+    const env2 = { UPDATE_PROXY_PREFIXES: 'https://dead.example/' };
+    const dead = async () => { throw new Error('boom'); };
+    globalThis.fetch = dead;
+    try {
+      resetAppUpdateCache();
+      const res = await updateGet(ctx('GET', '/api/update', { env: env2 }));
+      assert.equal(res.status, 503);
+      const data = await json(res);
+      assert.equal(data.error, 'update_unavailable');
+      assert.ok(data.hint.includes('GITHUB_TOKEN'));
+    } finally {
+      globalThis.fetch = original;
+      resetAppUpdateCache();
+    }
+  });
+});
+
+test('更新源与上传清单：来源可配、按架构直链、清单可上传', async (t) => {
+  await t.test('契约：source 枚举 / 反代前缀补斜杠 / downloads 分架构', () => {
+    assert.throws(() => normalizeSections({ update: { source: 'ftp' } }), /update\.source/);
+    const [mirror] = normalizeSections({ update: { source: 'mirror', mirrorPrefix: 'https://gh.example.com' } });
+    assert.equal(mirror.update.source, 'mirror');
+    assert.equal(mirror.update.mirrorPrefix, 'https://gh.example.com/', '漏写斜杠会拼出坏地址');
+    const [defaults] = normalizeSections({ update: {} });
+    assert.equal(defaults.update.source, 'cloud', '缺省必须等于原来的行为');
+    assert.deepEqual(defaults.update.downloads, { 'arm64-v8a': '', 'armeabi-v7a': '' });
+
+    const [filled] = normalizeSections({
+      update: { downloads: { 'arm64-v8a': 'https://cdn.example.com/a.apk' } },
+    });
+    assert.equal(filled.update.downloads['arm64-v8a'], 'https://cdn.example.com/a.apk');
+    assert.equal(filled.update.downloads['armeabi-v7a'], '', '没填的那条留空，终端按「用清单资产」处理');
+    assert.throws(() => normalizeSections({ update: { downloads: [] } }), /downloads/);
+    assert.throws(() => normalizeSections({ update: { downloads: { 'arm64-v8a': 'ftp://x' } } }), /downloads/);
+
+    const [, warnings] = normalizeSections({ update: { source: 'custom' } });
+    assert.ok(warnings.some((item) => item.includes('custom')), '自填地址却没填，要给提示');
+  });
+
+  await t.test('上传清单：清洗字段，版本号必须自洽', () => {
+    const manifest = normalizeUploadedManifest({
+      version: 'v3.0.42',
+      version_desc: '自建 CDN 说明',
+      android_abis: ['arm64-v8a', 'x86_64'],
+      download_url: 'https://example.com/releases',
+      assets: [
+        { name: 'SUTV-arm64-v8a-impeller.apk', url: 'https://cdn.example.com/a.apk', size: 100, digest: 'sha256:' + 'A'.repeat(64) },
+        { name: 'notes.txt', url: 'https://cdn.example.com/a.txt' },
+      ],
+    });
+    assert.equal(manifest.version, '3.0.42');
+    assert.equal(manifest.version_num, 130042, '缺 version_num 时按仓库规则带产品位');
+    assert.deepEqual(manifest.android_abis, ['arm64-v8a'], '不认识的 ABI 必须丢掉');
+    assert.equal(manifest.assets.length, 1, '非 APK 资产不能进清单');
+    assert.equal(manifest.assets[0].digest, 'sha256:' + 'a'.repeat(64), 'digest 统一小写');
+
+    assert.throws(() => normalizeUploadedManifest({ version: '3.0.42', version_num: 30042 }), /不一致/);
+    assert.throws(() => normalizeUploadedManifest([]), /JSON 对象/);
+    assert.throws(() => normalizeUploadedManifest({ version: 'latest' }), /version/);
+  });
+
+  await t.test('POST/GET /api/update/manifest：写要令牌，读公开', async () => {
+    const missing = await manifestGet(ctx('GET', '/api/update/manifest'));
+    assert.equal(missing.status, 404);
+    assert.equal((await json(missing)).error, 'no_manifest');
+
+    const env = { CONFIG_WRITE_TOKEN: 'w' };
+    const denied = await manifestPost(ctx('POST', '/api/update/manifest', {
+      env, body: { manifest: { version: '3.0.42' } },
+    }));
+    assert.equal(denied.status, 401, '写接口不能被匿名调用');
+
+    const saved = await manifestPost(ctx('POST', '/api/update/manifest', {
+      env,
+      headers: { Authorization: 'Bearer w' },
+      body: {
+        manifest: { version: '3.0.42', version_desc: '自建 CDN', android_abis: ['arm64-v8a'] },
+        name: 'version.json',
+      },
+    }));
+    assert.equal(saved.status, 200);
+    const info = await json(saved);
+    assert.equal(info.url, '/api/update/manifest');
+    assert.equal(info.version_num, 130042);
+
+    const read = await manifestGet(ctx('GET', '/api/update/manifest'));
+    assert.equal(read.status, 200);
+    assert.match(read.headers.get('cache-control'), /max-age=300/);
+    assert.equal(read.headers.get('x-content-type-options'), 'nosniff');
+    const data = await json(read);
+    assert.equal(data.version, '3.0.42');
+    assert.equal(data.version_desc, '自建 CDN');
+
+    // 脏版本号不能覆盖掉一份本来能用的清单
+    const bad = await manifestPost(ctx('POST', '/api/update/manifest', {
+      env, headers: { Authorization: 'Bearer w' }, body: { version: 'latest' },
+    }));
+    assert.equal(bad.status, 400);
+    const still = await json(await manifestGet(ctx('GET', '/api/update/manifest')));
+    assert.equal(still.version, '3.0.42');
   });
 });

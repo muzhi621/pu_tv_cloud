@@ -134,6 +134,13 @@ function idIndex(ids) {
 const VALID_MENU_BY_LOWER = idIndex(VALID_MENU_IDS);
 const VALID_PROMPTS = new Set(CATALOG.updatePrompts);
 const VALID_NOTICE_MODES = new Set(CATALOG.noticeModes);
+/** 更新清单来源，与 schema.py 的 VALID_UPDATE_SOURCES 一致；缺键时用内置默认。 */
+const VALID_UPDATE_SOURCES = new Set(
+  CATALOG.updateSources || ['cloud', 'github', 'mirror', 'custom', 'upload'],
+);
+export const UPDATE_ABIS = Object.freeze(
+  CATALOG.updateAbis || ['arm64-v8a', 'armeabi-v7a'],
+);
 
 export class ConfigError extends Error {
   constructor(message) {
@@ -527,10 +534,49 @@ function normalizeUpdate(part, warnings) {
   base.minSupportedVersion = version;
   base.allowPrerelease = bool(part.allowPrerelease, base.allowPrerelease, 'update.allowPrerelease');
   base.allowUserOverride = bool(part.allowUserOverride, base.allowUserOverride, 'update.allowUserOverride');
+  // 更新清单来源（cloud/github/mirror/custom/upload），语义见 schema.py。
+  base.source = enumeration(part.source, base.source, VALID_UPDATE_SOURCES, 'update.source');
+  // 更新清单端点；留空 = 终端用「配置域名 + /api/update」（见 schema.py 同名逻辑）。
+  const manifest = str(part.manifestUrl, '', 'update.manifestUrl', 300);
+  if (manifest && !URL_RE.test(manifest)) {
+    throw new ConfigError('update.manifestUrl 必须是 http(s) 完整地址');
+  }
+  base.manifestUrl = manifest;
+  let prefix = str(part.mirrorPrefix, '', 'update.mirrorPrefix', 200);
+  if (prefix) {
+    if (!URL_RE.test(prefix)) throw new ConfigError('update.mirrorPrefix 必须是 http(s) 前缀');
+    if (!prefix.endsWith('/')) prefix += '/';
+  }
+  base.mirrorPrefix = prefix;
+  const downloads = part.downloads;
+  const cleanDownloads = {};
+  for (const abi of UPDATE_ABIS) cleanDownloads[abi] = '';
+  if (downloads !== undefined && downloads !== null) {
+    if (typeof downloads !== 'object' || Array.isArray(downloads)) {
+      throw new ConfigError('update.downloads 必须是对象');
+    }
+    for (const abi of UPDATE_ABIS) {
+      const value = str(downloads[abi], '', `update.downloads.${abi}`, 500);
+      if (value && !URL_RE.test(value)) {
+        throw new ConfigError(`update.downloads.${abi} 必须是 http(s) 完整地址`);
+      }
+      cleanDownloads[abi] = value;
+    }
+  }
+  base.downloads = cleanDownloads;
   base.mirrorUrls = urls(part.mirrorUrls, 'update.mirrorUrls');
   if ('changelogI18n' in part) base.changelogI18n = i18n(part.changelogI18n, 'update.changelogI18n');
   if (base.prompt === 'force') {
     warnings.push('update.prompt=force 会阻断旧版本使用，请确认已配置可用下载地址');
+  }
+  if (base.source === 'mirror' && !base.mirrorPrefix) {
+    warnings.push('update.source=mirror 但未填反代前缀，终端会回落到云端清单');
+  }
+  if (base.source === 'custom' && !base.manifestUrl) {
+    warnings.push('update.source=custom 但未填清单地址，终端会回落到云端清单');
+  }
+  if (base.source === 'upload' && !base.manifestUrl) {
+    warnings.push('update.source=upload 需先上传清单文件（编辑器更新页）');
   }
   return base;
 }

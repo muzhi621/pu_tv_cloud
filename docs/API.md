@@ -47,6 +47,9 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 | GET | `/api/devices` | read | **仅 EdgeOne** | 设备注册表（在线/离线、别名、绑定套餐、最近下发、拉黑列表、在线判定窗口） |
 | POST | `/api/devices` | write | **仅 EdgeOne** | 10 种管理动作（`bind` / `push` / `rename` / `delete` / `restore` / `purge` / `block` / `unblock` …），支持单台 / 批量 |
 | POST | `/api/iptv/fetch` | write | **仅 EdgeOne** | 云端代抓 M3U/M3U8/TXT 订阅（受限代理，一次最多 10 个地址） |
+| GET | `/api/update` | **无需鉴权** | **仅 EdgeOne** | 应用更新清单：云端代取 GitHub Releases（版本号 + APK 资产 + 历史 + 下载镜像），终端不必直连 GitHub |
+| POST | `/api/update/manifest` | write | **仅 EdgeOne** | 上传更新清单（编辑器「更新源 = 上传文件」） |
+| GET | `/api/update/manifest` | **无需鉴权** | **仅 EdgeOne** | 读取上传的更新清单 |
 | GET | `/` | 无 | 两端 | 在线编辑器；EdgeOne 版为内联单页并注入连接默认值，FC 版另提供 `/app.js`、`/style.css` 且需手动填令牌 |
 
 ## GET /api/config
@@ -487,6 +490,106 @@ curl -X POST "$BASE/api/devices" -H "Authorization: Bearer $WRITE_TOKEN" \
 > **DNS rebinding 无法在边缘运行时先验解析**，因此请只填写可信订阅地址；
 > 不要把这个接口当作通用代理开放给不可信输入。
 
+## GET /api/update（仅 EdgeOne）
+
+应用内「检查更新」的数据源。终端在国内容易连不上 `api.github.com` /
+`raw.githubusercontent.com`，第三方 GitHub 反代也时好时坏，于是改由云端出网取
+GitHub，终端只请求自己的域名（和拉配置同一个域名，一定可达）。
+
+**无需鉴权**：终端不带令牌；端点不接受任何来自 query 的地址参数，不能被当作代理用。
+
+```json
+{"version":"3.0.42","version_num":130042,
+ "version_desc":"- 修复…","prerelease":false,
+ "android_abis":["arm64-v8a","armeabi-v7a"],
+ "download_url":"https://github.com/muzhi621/pu_tv_client/releases/tag/v3.0.42",
+ "assets":[{"name":"SUTV-arm64-v8a-impeller.apk",
+            "url":"https://github.com/…/SUTV-arm64-v8a-impeller.apk",
+            "size":37748736,"digest":"sha256:…"}],
+ "releases":[{"version":"3.0.42","title":"…","date":"2026-11-17",
+              "github":"https://github.com/…","author":{"name":"…","avatar":"…","profile":"…"},
+              "changelog":"…","changeLog":"…",
+              "files":[{"name":"SUTV-arm64-v8a-impeller","size":"36.0mb","downloads":0,"url":"…"}]}],
+ "downloadPrefixes":["https://cdn.gh-proxy.org/","…"],
+ "repo":"muzhi621/pu_tv_client","source":"github",
+ "fetchedAt":"2026-11-17T06:20:00.000Z"}
+```
+
+- 顶层字段与仓库里的 `assets/version.json` **同形**，客户端 `VersionUtil` 直接复用解析；
+  `assets` / `releases` / `downloadPrefixes` 是附加信息，分别替代客户端原本对
+  `api.github.com` 与 `assets/releases.json` 的两次访问。
+- `releases` 与 `assets/releases.json` 同形，同时带 `changelog` 与 `changeLog`
+  （仓库文件用前者，客户端 freezed 模型读后者）。
+- `source` 标明这一份来自哪一级数据源：`github`（官方 API）→ `proxy`（反代 + API）
+  → `static`（仓库静态清单兜底，此时 `assets` 为空）。`stale: true` 表示 GitHub
+  全挂、返回的是 24 小时内的旧清单。
+- 响应带 `Cache-Control: public, max-age=300, s-maxage=300, stale-while-revalidate=1800`，
+  叠加进程内 5 分钟缓存后，GitHub 实际被访问的频率是「每 PoP 每 5 分钟一次」量级。
+
+可选环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `UPDATE_GITHUB_REPO` | 取哪个仓库的 Release（`owner/repo`，非法值回落 `muzhi621/pu_tv_client`） |
+| `GITHUB_TOKEN` | GitHub 令牌，把 API 限额从 60/h 提到 5000/h（公开只读 token 即可） |
+| `UPDATE_PROXY_PREFIXES` | 逗号分隔的 GitHub 反代前缀，覆盖内置列表（反代挂了改这里，不用发版） |
+
+失败（GitHub 与全部反代都不可达、且没有 24 小时内的旧清单）返回 `503`：
+
+```json
+{"error":"update_unavailable","message":"无法获取更新清单（…）",
+ "hint":"GitHub 及其反代均不可达。可配置 GITHUB_TOKEN 提升限额，或用 UPDATE_PROXY_PREFIXES 指定可用的反代前缀"}
+```
+
+### 更新源（`sections.update.source`）
+
+终端取清单的方式也由云端下发，编辑器里五选一，改一次全部终端生效：
+
+| `source` | 终端行为 | 相关字段 |
+|---|---|---|
+| `cloud`（默认） | 请求本域名 `/api/update`，云端代取 GitHub | `manifestUrl`（可选，覆盖端点） |
+| `github` | 直连 `api.github.com` / `github.com` | — |
+| `mirror` | `mirrorPrefix + GitHub 地址` | `mirrorPrefix` |
+| `custom` | 只请求 `manifestUrl` | `manifestUrl` |
+| `upload` | 请求本域名 `/api/update/manifest`（编辑器上传的清单） | `manifestUrl`（上传后自动回填） |
+
+另有 `downloads.arm64-v8a` / `downloads.armeabi-v7a`：按架构指定 APK 直链。
+留空 = 用清单里的 release 资产；填了就以它为准——终端不再访问 GitHub，也不会被套上
+镜像前缀（自己的 CDN/网盘地址是完整的，套前缀必然 404）。
+
+老配置没有这些字段时按 `source=cloud` + 空直链处理，行为与之前完全一致。
+`mirror` 少了前缀、`custom` 少了地址、`upload` 还没传过清单，都会在保存时给出 warning
+（终端会回落到云端清单，不会因此更新失败）。
+
+## GET / POST /api/update/manifest（仅 EdgeOne）
+
+编辑器「更新源 = 上传文件」的清单存放点：把一份 `version.json` 形状的 JSON 传到云端，
+终端读同一个地址，整条更新链路完全不依赖 GitHub。
+
+- **POST**（写令牌）：body 是清单本身，或 `{ "manifest": {...}, "name": "version.json" }`，
+  上限 256 KB。`version` 必须是 `3.0.42` 这样的数字点分版本；`version_num` 给了就必须
+  自洽（`3.0.42` → `130042`，首位 1 是产品位）；`android_abis` 只保留
+  `arm64-v8a` / `armeabi-v7a`；`assets` 只保留 `.apk` 的 http(s) 直链，`digest` 统一小写；
+  `assets` / `releases` 缺省也没关系（终端只少一个大小与校验和）。
+  返回：
+
+  ```json
+  {"url":"/api/update/manifest","version":"3.0.42","version_num":130042,
+   "bytes":1234,"uploadedAt":"2026-11-17T06:20:00.000Z"}
+  ```
+
+- **GET**（无需鉴权）：原样返回清单，
+  `Cache-Control: public, max-age=300`、`X-Content-Type-Options: nosniff`。
+  没上传过返回 `404`：
+
+  ```json
+  {"error":"no_manifest","message":"云端还没有上传更新清单",
+   "hint":"在编辑器「在线更新策略」里上传 version.json，或把更新源改为云端"}
+  ```
+
+只存一份「当前生效的清单」，重新上传即覆盖；它不进配置文档，也不占 revision 历史
+（清单可能几十 KB，塞进配置会让每次 GET 都变重）。
+
 ## /health 响应
 
 ```json
@@ -540,11 +643,13 @@ curl -X POST "$BASE/api/devices" -H "Authorization: Bearer $WRITE_TOKEN" \
 | `deviceId` 设备维度隔离、设备登记 | 有 | **无**（始终读写全局唯一文档） |
 | `GET/POST /api/devices`（8 动作、批量、在线离线） | 有 | **无此接口**（404） |
 | `POST /api/iptv/fetch` 云端代抓 | 有 | **无此接口**（404） |
+| `GET /api/update` 更新清单（云端代取 GitHub） | 有 | **无此接口**（404） |
+| `GET/POST /api/update/manifest` 上传清单 | 有 | **无此接口**（404） |
 | `403 device_blocked` / `503 storage_unavailable` | 有 | 无 |
 | `/health` 存储后端探测 / `degraded` | 有 | 无（固定 `ok`、`backend=file`） |
 
-结论：**核心配置契约一致，EdgeOne 版额外提供 `/api/iptv/fetch`、完整设备管理与
-全局资源库**；依赖设备维度、在线状态、云端代抓或资源库的功能只在 EdgeOne 部署形态下
+结论：**核心配置契约一致，EdgeOne 版额外提供 `/api/iptv/fetch`、`/api/update`、
+完整设备管理与全局资源库**；依赖设备维度、在线状态、云端代抓或资源库的功能只在 EdgeOne 部署形态下
 可用，切回 FC 时这些能力不可用，但 `sections` 结构与终端配置读取逻辑不变。FC 上
 `packageIds` / `vod.sourceIds` 这类库引用不会被展开（终端拿到空内容），跨形态迁移时
 请先把引用展开成内联频道，或改回 `selectedPackageIds`。

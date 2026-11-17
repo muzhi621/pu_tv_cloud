@@ -165,10 +165,12 @@ export async function readJsonBody(request) {
   return value;
 }
 
-export function send({ env, request, status, body, contentType, document, headers }) {
+export function send({ env, request, status, body, contentType, document, headers, cacheControl }) {
   const out = new Headers(headers || {});
   out.set('Content-Type', contentType || 'application/json; charset=utf-8');
-  out.set('Cache-Control', 'no-store');
+  // 默认 no-store：配置文档带设备身份，绝不能被 CDN 缓存给别的终端。
+  // 只有明确声明 cacheControl 的公开只读端点（如 /api/update）才允许缓存。
+  out.set('Cache-Control', cacheControl || 'no-store');
   if (document) {
     out.set('ETag', etagFor(document.revision));
     out.set('X-Revision', String(document.revision));

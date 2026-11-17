@@ -75,7 +75,9 @@ function setPath(obj, path, value) {
   // 打开导航白名单接管，否则用户只想设个壁纸却把菜单也改了。
   // iptv.requestHeaders 同理：它按字段下发，改了只要终端拉到配置就生效，
   // 不该顺手把「整节接管频道列表」也打开。
-  if ((section === 'iptv' || section === 'vod' || section === 'navigation')
+  // update 同理：改了更新策略却不勾「云端接管」，保存后终端还在用本地默认，
+  // 是最容易踩的坑（这一节所有字段都以 managed 为门槛生效）。
+  if ((section === 'iptv' || section === 'vod' || section === 'navigation' || section === 'update')
       && keys.length > 1 && keys[1] !== 'managed' && keys[1] !== 'wallpaper'
       && keys[1] !== 'requestHeaders'
       && obj[section] && typeof obj[section] === 'object' && !Array.isArray(obj[section])) {
@@ -274,8 +276,66 @@ function renderStartup() {
     checkline('startup.showSplashPage', '显示启动页');
 }
 
+/** 更新源：与 config/site_catalog.json 的 updateSources 一一对应。 */
+const UPDATE_SOURCE_OPTIONS = [
+  { value: 'cloud', label: '云端（推荐）：本域名代取 GitHub' },
+  { value: 'github', label: 'GitHub 直连：终端访问 api.github.com' },
+  { value: 'mirror', label: 'GitHub 镜像：终端走反代前缀' },
+  { value: 'custom', label: '自行输入：任意清单地址' },
+  { value: 'upload', label: '上传文件：清单存到云端' },
+];
+
+const UPDATE_SOURCE_HINTS = {
+  cloud: '终端只请求本域名 /api/update，由云端出网取 GitHub。国内网络最稳，推荐。',
+  github: '终端直接访问 api.github.com。仅海外网络或有可用出口时使用。',
+  mirror: '终端在 GitHub 地址前拼上反代前缀；反代不可用时回落到云端清单。',
+  custom: '终端只请求你填的清单地址（自建服务、对象存储都可以）。',
+  upload: '把 version.json 上传到云端，终端读 /api/update/manifest，完全不依赖 GitHub。',
+};
+
+/** 常用 GitHub 反代，与云端 UPDATE_PROXY_PREFIXES、客户端内置列表同源。 */
+const UPDATE_MIRROR_PRESETS = [
+  'https://cdn.gh-proxy.org/',
+  'https://edgeone.gh-proxy.org/',
+  'https://hk.gh-proxy.org/',
+  'https://gh-proxy.com/',
+  'https://ghproxy.net/',
+  'https://gh-proxy.org/',
+  'https://wget.la/',
+];
+
 function renderUpdate() {
+  const model = state.doc.sections.update || {};
+  const known = UPDATE_SOURCE_OPTIONS.map((item) => item.value);
+  const source = known.indexOf(model.source) >= 0 ? model.source : 'cloud';
   const mirrors = (getPath(state.doc.sections, 'update.mirrorUrls') || []).join('\n');
+
+  let sourceExtra = '';
+  if (source === 'mirror') {
+    sourceExtra = '<div class="row">' +
+      textField('update.mirrorPrefix', '反代前缀', 'text', '形如 https://cdn.gh-proxy.org/，末尾斜杠可省略') +
+      '<div class="field"><span>常用反代（选中即填入）</span><select data-special="mirror-preset">' +
+        '<option value="">— 选择 —</option>' +
+        UPDATE_MIRROR_PRESETS.map((item) => '<option value="' + esc(item) + '">' + esc(item) + '</option>').join('') +
+      '</select></div>' +
+      '</div>';
+  } else if (source === 'custom') {
+    sourceExtra = textField('update.manifestUrl', '清单地址（http/https）', 'text',
+      '终端直接请求这个地址，返回结构要和 version.json 一致');
+  } else if (source === 'upload') {
+    sourceExtra = '<div class="qr-upload">' +
+        '<input type="file" accept="application/json,.json" data-manifest-upload>' +
+        '<span class="meta">这里传的是清单文件（version.json），不是 APK；≤ 256 KB</span>' +
+      '</div>' +
+      textField('update.manifestUrl', '清单地址（上传后自动填）', 'text',
+        '留空 = 终端读本域名 /api/update/manifest');
+  } else if (source === 'github') {
+    sourceExtra = '<p class="hint">不需要额外地址：终端直接访问 api.github.com 查询、github.com 下载。</p>';
+  } else {
+    sourceExtra = textField('update.manifestUrl', '自定义清单端点（可留空）', 'text',
+      '留空 = 本域名 /api/update；换域名时填新地址，老终端也能迁过去');
+  }
+
   return '<h2>在线更新策略</h2>' +
     '<p class="hint">云端接管时，终端以云端为版本真值；本地 assets/version.json 降级为离线兜底。</p>' +
     managedHtml('update', '更新策略') +
@@ -294,8 +354,21 @@ function renderUpdate() {
     '</div>' +
     checkline('update.allowPrerelease', '允许预发布版本') +
     checkline('update.allowUserOverride', '允许终端本地覆盖', '关闭后设置页对应开关置灰') +
-    '<div class="field"><span>version.json 完整 URL 列表（每行一个 http/https 地址，留空 = 使用内置 GitHub 镜像）</span>' +
-      '<textarea data-special="mirror-urls">' + esc(mirrors) + '</textarea></div>';
+    '<h3 style="margin-top:24px">更新源</h3>' +
+    '<p class="hint">' + esc(UPDATE_SOURCE_HINTS[source]) + '</p>' +
+    selectField('update.source', '清单从哪取', UPDATE_SOURCE_OPTIONS) +
+    sourceExtra +
+    '<h3 style="margin-top:24px">按架构的安装包</h3>' +
+    '<p class="hint">留空 = 用清单里的 release 资产（云端代取时会自动带 64 位与 32 位两个包）。' +
+      '把 APK 放到自己的 CDN 或网盘时在这里填直链，终端就完全不走 GitHub。</p>' +
+    '<div class="row">' +
+      textField('update.downloads.arm64-v8a', 'arm64-v8a（arm8 / 64 位）', 'text', 'APK 直链') +
+      textField('update.downloads.armeabi-v7a', 'armeabi-v7a（arm7 / 32 位）', 'text', 'APK 直链') +
+    '</div>' +
+    '<details class="adv"><summary>高级：version.json 完整 URL 列表</summary>' +
+      '<p class="hint">仅在清单地址都取不到时兜底。留空 = 使用内置 GitHub 镜像。</p>' +
+      '<div class="field"><textarea data-special="mirror-urls">' + esc(mirrors) + '</textarea></div>' +
+    '</details>';
 }
 
 
@@ -2576,6 +2649,43 @@ async function uploadQrImage(file) {
 }
 
 /**
+ * 上传更新清单（version.json）。
+ *
+ * 用途：把清单托在云端，终端就完全不需要访问 GitHub —— 配合「按架构的安装包」填自己的
+ * 下载直链，国内网络也能正常收到更新。上传成功后自动把更新源切成 upload 并回填绝对
+ * 地址，省得用户自己拼 `/api/update/manifest`。
+ */
+async function uploadUpdateManifest(file) {
+  if (!state.doc || !file) return;
+  if (file.size > 256 * 1024) {
+    message('清单请小于 256 KB（只放版本号、说明和历史，不要塞 APK）。', 'err');
+    return;
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(await file.text());
+  } catch (error) {
+    message('不是合法的 JSON 文件：' + error.message, 'err');
+    return;
+  }
+  try {
+    const res = await request('/api/update/manifest', {
+      write: true, method: 'POST',
+      body: JSON.stringify({ manifest: manifest, name: file.name }),
+    });
+    const base = (state.base || window.location.origin).replace(/\/$/, '');
+    const url = /^https?:/i.test(res.url) ? res.url : base + res.url;
+    setPath(state.doc.sections, 'update.source', 'upload');
+    setPath(state.doc.sections, 'update.manifestUrl', url);
+    markDirty();
+    toast('清单已上传：' + res.version + '（' + Math.round(res.bytes / 1024) + ' KB）');
+    render();
+  } catch (error) {
+    message('上传失败：' + error.message + hintOf(error), 'err');
+  }
+}
+
+/**
  * 首页壁纸（全局背景）：上传到 /api/assets 后下发绝对 http(s) 地址。
  * 与二维码共用同一上传通道，受同一上限（512 KB）约束——建议 16:9 横图压缩后上传。
  */
@@ -3103,6 +3213,15 @@ function onFieldChange(target) {
     else value = target.value;
     setPath(state.doc.sections, path, value);
     markDirty();
+    // 更新源一换，下面该填地址还是该上传文件就变了，必须立刻重绘。
+    if (path === 'update.source') render();
+    return;
+  }
+  if (target.dataset.special === 'mirror-preset') {
+    if (!target.value) return;
+    setPath(state.doc.sections, 'update.mirrorPrefix', target.value);
+    markDirty();
+    render();
     return;
   }
   if (target.dataset.special === 'mirror-urls') {
@@ -3248,6 +3367,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if ('wallpaperUpload' in target.dataset) {
       const file = target.files && target.files[0];
       if (file) uploadWallpaper(file);
+      return;
+    }
+    if ('manifestUpload' in target.dataset) {
+      const file = target.files && target.files[0];
+      if (file) uploadUpdateManifest(file);
       return;
     }
     if (target.dataset.libInput) { onLibraryInput(target); return; }

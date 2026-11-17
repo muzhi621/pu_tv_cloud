@@ -42,6 +42,14 @@ SEED: dict = _read_json("seed.json")
 VALID_MENU_IDS: tuple[str, ...] = tuple(item["id"] for item in CATALOG["menus"])
 VALID_PROMPTS: frozenset[str] = frozenset(CATALOG["updatePrompts"])
 VALID_NOTICE_MODES: frozenset[str] = frozenset(CATALOG["noticeModes"])
+# 更新清单的来源：云端自建 / GitHub 直连 / GitHub 反代 / 自填地址 / 上传到云端。
+# 老 catalog 没有这两个键时用内置默认值（升级期间不必强行刷 catalog）。
+VALID_UPDATE_SOURCES: frozenset[str] = frozenset(
+    CATALOG.get("updateSources") or ("cloud", "github", "mirror", "custom", "upload")
+)
+UPDATE_ABIS: tuple[str, ...] = tuple(
+    CATALOG.get("updateAbis") or ("arm64-v8a", "armeabi-v7a")
+)
 
 
 def _id_index(ids: tuple[str, ...] | frozenset[str]) -> dict[str, str]:
@@ -585,12 +593,55 @@ def normalize_update(part: dict, warnings: list[str]) -> dict:
                                     "update.allowPrerelease")
     base["allowUserOverride"] = _bool(part.get("allowUserOverride"),
                                       base["allowUserOverride"], "update.allowUserOverride")
+    # 更新清单的来源。终端据此决定「清单从哪取」：
+    #   cloud  → 云端 /api/update（默认，代取 GitHub，国内可达）
+    #   github → 直连 api.github.com（海外网络或自备出口时用）
+    #   mirror → 自填 GitHub 反代前缀 + API
+    #   custom → 完全自填的清单地址（自建服务、对象存储都行）
+    #   upload → 编辑器把清单上传到云端，终端读 /api/update/manifest
+    base["source"] = _enum(part.get("source"), base["source"], VALID_UPDATE_SOURCES,
+                           "update.source")
+    # 清单端点。留空 = 终端用「配置域名 + /api/update」。显式填了就用它：
+    # 换域名、或把清单挪到另一台机器时，老终端还能靠这一条配置迁移过去，
+    # 不用等他们先装上新包。
+    manifest = _str(part.get("manifestUrl"), "", "update.manifestUrl", 300)
+    if manifest and not _URL_RE.match(manifest):
+        raise ConfigError("update.manifestUrl 必须是 http(s) 完整地址")
+    base["manifestUrl"] = manifest
+    prefix = _str(part.get("mirrorPrefix"), "", "update.mirrorPrefix", 200)
+    if prefix:
+        if not _URL_RE.match(prefix):
+            raise ConfigError("update.mirrorPrefix 必须是 http(s) 前缀")
+        # 终端是 `前缀 + github 地址` 直接拼，少了斜杠会拼出坏地址。
+        if not prefix.endswith("/"):
+            prefix += "/"
+    base["mirrorPrefix"] = prefix
+    # 按 ABI 的直链。留空 = 用清单里的 release 资产；填了就以它为准
+    # （自建 CDN / 网盘镜像装这两个包时用，不再依赖 GitHub 域名）。
+    downloads = part.get("downloads")
+    clean_downloads = dict.fromkeys(UPDATE_ABIS, "")
+    if downloads is not None:
+        if not isinstance(downloads, dict):
+            raise ConfigError("update.downloads 必须是对象")
+        for abi in UPDATE_ABIS:
+            value = _str(downloads.get(abi), "", "update.downloads.%s" % abi, 500)
+            if value and not _URL_RE.match(value):
+                raise ConfigError("update.downloads.%s 必须是 http(s) 完整地址" % abi)
+            clean_downloads[abi] = value
+    base["downloads"] = clean_downloads
     mirrors = _urls(part.get("mirrorUrls"), "update.mirrorUrls")
     base["mirrorUrls"] = mirrors
     if "changelogI18n" in part:
         base["changelogI18n"] = _i18n(part["changelogI18n"], "update.changelogI18n")
     if base["prompt"] == "force":
         warnings.append("update.prompt=force 会阻断旧版本使用，请确认已配置可用下载地址")
+    # 配置互相矛盾时给个提示，别让终端默默回落到默认通道。
+    if base["source"] == "mirror" and not prefix:
+        warnings.append("update.source=mirror 但未填反代前缀，终端会回落到云端清单")
+    if base["source"] == "custom" and not manifest:
+        warnings.append("update.source=custom 但未填清单地址，终端会回落到云端清单")
+    if base["source"] == "upload" and not manifest:
+        warnings.append("update.source=upload 需先上传清单文件（编辑器更新页）")
     return base
 
 

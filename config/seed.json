@@ -90,6 +90,13 @@
       "minSupportedVersion": "",
       "allowPrerelease": false,
       "allowUserOverride": true,
+      "source": "cloud",
+      "manifestUrl": "",
+      "mirrorPrefix": "",
+      "downloads": {
+        "arm64-v8a": "",
+        "armeabi-v7a": ""
+      },
       "mirrorUrls": [],
       "changelogI18n": {}
     },

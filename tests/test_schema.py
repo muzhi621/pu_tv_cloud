@@ -103,6 +103,39 @@ class SchemaTests(unittest.TestCase):
         })
         self.assertEqual(sections["update"]["mirrorUrls"], ["https://a.example.com/x.json"])
 
+    def test_update_source_and_mirror_prefix(self):
+        # 更新源只认五种；瞎写直接 400，别让终端拿到一个它不认识的取值。
+        with self.assertRaises(ConfigError):
+            normalize_sections({"update": {"source": "ftp"}})
+        sections, _ = normalize_sections({"update": {"source": "mirror", "mirrorPrefix": "https://gh.example.com"}})
+        self.assertEqual(sections["update"]["source"], "mirror")
+        # 终端是「前缀 + github 地址」直接拼，少了斜杠会拼出坏地址。
+        self.assertEqual(sections["update"]["mirrorPrefix"], "https://gh.example.com/")
+        sections, _ = normalize_sections({"update": {}})
+        self.assertEqual(sections["update"]["source"], "cloud", "缺省必须等于原来的行为")
+
+    def test_update_source_warnings_are_actionable(self):
+        _, warnings = normalize_sections({"update": {"source": "mirror"}})
+        self.assertTrue(any("mirror" in item for item in warnings))
+        _, warnings = normalize_sections({"update": {"source": "custom"}})
+        self.assertTrue(any("custom" in item for item in warnings))
+        _, warnings = normalize_sections({"update": {"source": "upload"}})
+        self.assertTrue(any("upload" in item for item in warnings))
+
+    def test_update_downloads_per_abi(self):
+        sections, _ = normalize_sections({"update": {"downloads": {
+            "arm64-v8a": "https://cdn.example.com/sutv-arm8.apk",
+        }}})
+        self.assertEqual(sections["update"]["downloads"]["arm64-v8a"],
+                         "https://cdn.example.com/sutv-arm8.apk")
+        # 没填的那条必须留空串（终端按「空 = 用清单资产」处理，不能是 None）
+        self.assertEqual(sections["update"]["downloads"]["armeabi-v7a"], "")
+        # 非法协议不能进配置：终端会拿它当真去下载
+        with self.assertRaises(ConfigError):
+            normalize_sections({"update": {"downloads": {"armeabi-v7a": "ftp://bad"}}})
+        with self.assertRaises(ConfigError):
+            normalize_sections({"update": {"downloads": []}})
+
     def test_notice_defaults_to_dismissible_and_safe(self):
         sections, _ = normalize_sections({"startup": {"notice": {"enabled": True}}})
         notice = sections["startup"]["notice"]

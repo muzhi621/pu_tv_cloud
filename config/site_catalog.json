@@ -20,6 +20,17 @@
     "dialog",
     "force"
   ],
+  "updateSources": [
+    "cloud",
+    "github",
+    "mirror",
+    "custom",
+    "upload"
+  ],
+  "updateAbis": [
+    "arm64-v8a",
+    "armeabi-v7a"
+  ],
   "noticeModes": [
     "once_per_revision",
     "always",

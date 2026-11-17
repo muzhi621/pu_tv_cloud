@@ -640,3 +640,34 @@ export async function writeAsset(env, asset) {
   await db.put(KEY_ASSET(asset.id), JSON.stringify(asset));
   return asset;
 }
+
+/* ================= 上传的更新清单 ================= */
+
+/**
+ * 编辑器「上传清单」存这里，终端读 `/api/update/manifest`。
+ *
+ * 为什么单独存一个键而不是塞进 update 节：清单本身可能几 KB 到几十 KB（版本说明 +
+ * 历史版本），放进配置文档会把每次 GET 的响应撑大，也污染 revision 快照历史。
+ * 这里只存一份「当前生效的清单」，重新上传即覆盖。
+ */
+const KEY_UPDATE_MANIFEST = 'update_manifest';
+/** 256 KB：足够放版本说明与几十条历史，再大就不是清单了。 */
+export const MAX_UPDATE_MANIFEST_BYTES = 256 * 1024;
+
+export async function readUpdateManifest(env) {
+  const db = await backend(env);
+  const value = await db.getJSON(KEY_UPDATE_MANIFEST);
+  if (!value || typeof value !== 'object' || !value.manifest) return null;
+  return value;
+}
+
+export async function writeUpdateManifest(env, manifest, name = '') {
+  const db = await backend(env);
+  const record = {
+    manifest,
+    name: String(name || '').slice(0, 120),
+    uploadedAt: new Date().toISOString(),
+  };
+  await db.put(KEY_UPDATE_MANIFEST, JSON.stringify(record));
+  return record;
+}

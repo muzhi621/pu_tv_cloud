@@ -95,6 +95,13 @@ export const SEED = {
       "minSupportedVersion": "",
       "allowPrerelease": false,
       "allowUserOverride": true,
+      "source": "cloud",
+      "manifestUrl": "",
+      "mirrorPrefix": "",
+      "downloads": {
+        "arm64-v8a": "",
+        "armeabi-v7a": ""
+      },
       "mirrorUrls": [],
       "changelogI18n": {}
     },
@@ -136,6 +143,17 @@ export const CATALOG = {
     "silent",
     "dialog",
     "force"
+  ],
+  "updateSources": [
+    "cloud",
+    "github",
+    "mirror",
+    "custom",
+    "upload"
+  ],
+  "updateAbis": [
+    "arm64-v8a",
+    "armeabi-v7a"
   ],
   "noticeModes": [
     "once_per_revision",
