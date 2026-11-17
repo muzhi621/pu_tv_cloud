@@ -17,8 +17,11 @@ async function probe(out, name, run) {
 }
 
 export async function onRequestGet(context) {
-  return handle(context, async ({ env }) => {
+  return handle(context, async ({ env, request }) => {
+    const url = new URL(request.url);
+    const iterations = Math.max(1, Math.min(Number(url.searchParams.get('iter')) || 1000, 500000));
     const out = {};
+    out.iterations = iterations;
     out.cryptoType = typeof globalThis.crypto;
     out.hasSubtle = !!(globalThis.crypto && globalThis.crypto.subtle);
 
@@ -40,12 +43,16 @@ export async function onRequestGet(context) {
         'raw', new TextEncoder().encode('probe'), 'PBKDF2', false, ['deriveBits'],
       );
       const bits = await globalThis.crypto.subtle.deriveBits(
-        { name: 'PBKDF2', salt: new Uint8Array(16), iterations: 1000, hash: 'SHA-256' },
+        { name: 'PBKDF2', salt: new Uint8Array(16), iterations, hash: 'SHA-256' },
         key,
         256,
       );
       return new Uint8Array(bits).length;
     });
+
+    await probe(out, 'envUser', () => String((env && env.CONFIG_ADMIN_USER) || ''));
+    await probe(out, 'envPasswordLength',
+      () => String((env && env.CONFIG_ADMIN_PASSWORD) || '').length);
 
     await probe(out, 'metaRead', async () => (await readMeta(env, 'auth_probe')) === null);
     await probe(out, 'metaWrite', async () => {
@@ -55,6 +62,14 @@ export async function onRequestGet(context) {
     await probe(out, 'metaReadBack', async () => {
       const value = await readMeta(env, 'auth_probe');
       return !!(value && value.at);
+    });
+
+    // 真正跑一遍 loadAccount（会顺带把环境变量里的账号初始化进 KV）：
+    // 成功即说明登录链路可用，失败则把真实错误带出来。
+    await probe(out, 'loadAccount', async () => {
+      const { loadAccount } = await import('../../_lib/auth.js');
+      const account = await loadAccount(env);
+      return account ? 'ok' : 'none';
     });
 
     return send({ env, request: context.request, status: 200, body: out });
