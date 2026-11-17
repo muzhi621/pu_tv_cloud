@@ -231,7 +231,6 @@ function renderNavigation() {
       checkline('navigation.sidebarExpanded', '侧栏默认展开') +
       checkline('navigation.homeKeepAlive', '首页页面缓存') +
     '</div>' +
-    wallpaperField() +
     '<h2 style="margin-top:24px">设置菜单目录（P1 预留）</h2>' +
     '<p class="hint">P0 终端尚未接线，此处填写不会生效；P1 上线后可按 AppRoutes 路径隐藏已有设置条目，不允许新增。</p>' +
     '<div class="checkline"><input class="switch" type="checkbox" data-path="navigation.settings.managed"' +
@@ -2671,6 +2670,8 @@ function sectionsFormHtml() {
             (item) => item.name || item.id)).join('')
       : '<p class="meta">当前文档还没有分组信息，保存一次后服务端会按默认三大类补齐。</p>')
     + '</div>'
+
+    + '<div class="df-block">' + wallpaperField() + '</div>'
 
     + '<div class="df-block"><h3>开机公告</h3>'
     + dfCheck('startup.notice.enabled', '启用公告')
