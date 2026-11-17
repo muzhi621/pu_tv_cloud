@@ -15,9 +15,14 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 > `403 device_blocked`。逐项对照见文末「与 FC 版的差异（API 视角）」。两端的
 > `GET /api/config` 轻量视图（套餐展开 + `withPackages=1` 剥离）则**都实现**。
 
-除 `/health` 与静态编辑器外，所有 `/api/*` 请求需要 `Authorization: Bearer <read-token>`。
+除 `/health`、`/api/auth/status`、`/api/auth/login`、`/api/auth/logout`、`/api/update*`、
+`/api/assets?id=` 与静态编辑器外，所有 `/api/*` 请求需要 `Authorization: Bearer <token>`。
 写入类接口（PUT、rollback、`PUT /api/library`、`POST /api/devices`、`POST /api/iptv/fetch`）
 需要 `<write-token>`。
+
+EdgeOne 版还接受**编辑器会话令牌**（`POST /api/auth/login` 返回，见文末「编辑器账号与会话」）：
+会话等价管理员，读接口与写接口都放行，有效期默认 12 小时，改密码即全部失效。
+终端始终用真实令牌直连，不受影响。
 
 > **设备维度（仅 EdgeOne 实现）**：`/api/config`、`/api/config/revisions`、
 > `/api/config/rollback` 都接受 `?deviceId=<id>`（或 `X-Device-Id` 头）。带上表示读写
@@ -52,7 +57,12 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 | GET | `/api/update/manifest` | **无需鉴权** | **仅 EdgeOne** | 读取上传的更新清单 |
 | POST | `/api/update/apk` | write | **仅 EdgeOne** | 在线更新版本库：签发 APK 直传地址 / 完工校验 / 删除上传 |
 | GET | `/api/update/apk` | **无需鉴权** | **仅 EdgeOne** | 按 key 流式下载安装包（终端装包用） |
-| GET | `/` | 无 | 两端 | 在线编辑器；EdgeOne 版为内联单页并注入连接默认值，FC 版另提供 `/app.js`、`/style.css` 且需手动填令牌 |
+| POST | `/api/auth/login` | **无需鉴权** | **仅 EdgeOne** | 编辑器管理员登录：`{username, password}` → `{token, user, expiresAt, base}`（会话令牌） |
+| GET | `/api/auth/status` | **无需鉴权** | **仅 EdgeOne** | 登录页探测服务端有没有配置账号（`{initialized, source}`） |
+| GET | `/api/auth/session` | 会话 | **仅 EdgeOne** | 校验已保存的会话是否仍有效（刷新页面免重新登录） |
+| POST | `/api/auth/password` | 会话或 write | **仅 EdgeOne** | 修改管理员密码（需当前密码）；改完全部会话失效 |
+| POST | `/api/auth/logout` | **无需鉴权** | **仅 EdgeOne** | 注销当前会话，幂等（始终 200） |
+| GET | `/` | 无 | 两端 | 在线编辑器；EdgeOne 版为内联单页，只注入同源 API 地址（**不注入任何令牌**），登录后自动加载 |
 
 ## GET /api/config
 
@@ -212,11 +222,15 @@ curl -X PUT "$BASE/api/config" \
   内容，忽略资源库后续变化。
 - `iptv.libraryRevision`（int ≥ 0，默认 0）：设备文档已追平到库的哪个 revision，
   **由服务端维护**（懒触发时 bump），客户端不要自行加一或伪造。
-- `vod`：TVBox 源/站点节，`{managed:false, sourceIds:[], siteIds:[], sources:[],
-  sites:[], lockLibrary:false, libraryRevision:0}`。`sourceIds` ≤ 20，元素形如
+- `vod`：TVBox 源/站点节，`{managed:false, sourceIds:[], siteIds:[], defaultSiteId:"",
+  sources:[], sites:[], lockLibrary:false, libraryRevision:0}`。`sourceIds` ≤ 20，元素形如
   `vs_1a2b3c4d`；`siteIds` ≤ 500，元素形如 `vs_1a2b3c4d:csp_X`
   （`^[A-Za-z0-9_:-]{1,96}$`）。设备只存引用，站点清单在库里存一份。
   老文档没有这一节时读出来自动补默认值。
+  - `defaultSiteId`（string，默认 `""`）：打开影音时默认选中的站点，
+    **只是首屏选谁，不是白名单**（白名单仍是 `siteIds`）。格式同站点 id，非法值记
+    warning 并清空。EdgeOne 版展开时会复核它是否真的在本次下发的 `sites` 里，
+    不在（站点被删 / 被 `siteIds` 排除）就清空，终端据此回退到第一个站点。
   - `sources` / `sites` 是**展开产物**：GET `/api/config` 时由服务端按当前库实时写入，
     编辑器保存时会清掉未锁定设备的这两个字段（写了也等于把库的快照固化成人工配置）。
   - `vod.lockLibrary === true` 时相反：服务端完全不读库，只用这两个字段充当
@@ -671,6 +685,65 @@ GitHub，终端只请求自己的域名（和拉配置同一个域名，一定�
 配置里引用上传的包时，`sections.update.downloads[abi]` 填
 `https://<配置域名>/api/update/apk?key=<urlencode(key)>`——编辑器选版本时自动展开。
 
+## 编辑器账号与会话（仅 EdgeOne）
+
+编辑器不再让人手填读写令牌：打开页面先登录，登录成功后自动带出同源 API 地址并
+加载全部数据。**真实令牌永不下发到浏览器**——会话只代表「已通过密码验证」。
+
+### 账号从哪来
+
+单管理员。首次登录时由环境变量落地到存储，之后以存储为准：
+
+| 环境变量 | 必填 | 说明 |
+|---|---|---|
+| `CONFIG_ADMIN_USER` | 否 | 管理员账号，默认 `admin` |
+| `CONFIG_ADMIN_PASSWORD` | 是（要开登录时） | 初始密码，**至少 8 位**；不足 8 位视为未配置 |
+| `CONFIG_SESSION_HOURS` | 否 | 会话有效期（小时），默认 12，范围 1~168 |
+
+> 环境变量**只在存储里还没有账号时生效**。之后在页面上改密码会写入
+> `auth_account` 并递增 `epoch`，重新部署也不会被环境变量覆盖回去——否则每次
+> 发布都会把新密码重置成环境变量里的旧密码。忘记密码只在存储里删掉
+> `auth_account` 这一个键，再让它按环境变量重新初始化。
+
+### 登录
+
+```
+POST /api/auth/login
+{"username":"admin","password":"••••••••"}
+
+200 {"token":"<64 位十六进制>","user":"admin","expiresAt":1763000000000,
+     "base":"https://tv.example.com"}
+```
+
+- 会话令牌 32 字节随机数，存储里只留它的 SHA-256 摘要，泄露 KV 也无法据此登录。
+- 会话表最多保留 20 条并清理过期项（KV 单值有上限，登录一次加一条会写爆）。
+- 失败限流：全局连续 5 次失败锁 5 分钟，锁定期内**正确密码也返回 429**。
+- 未配置账号返回 `503 auth_not_initialized`，`message` 里直接写明要设置哪个环境变量。
+
+### 会话怎么用
+
+任何 `/api/*` 请求带上 `Authorization: Bearer <会话 token>` 即可，等价管理员
+（读接口与写接口都放行）。校验顺序：先比真实读/写令牌，不是令牌才当会话查。
+
+- 会话过期、或密码被改（`epoch` 前进）→ 401，编辑器自动回到登录框。
+- 终端不带会话，仍然用 `CONFIG_READ_TOKEN` 直连，行为与改造前完全一致。
+
+### 改密码 / 登出
+
+```
+POST /api/auth/password      (Bearer 会话或写令牌)
+{"oldPassword":"...","newPassword":"..."}
+200 {"ok":true,"relogin":true}
+
+POST /api/auth/logout        (Bearer 会话)
+200 {"ok":true}
+```
+
+改密码必须提供当前密码（会话被借用时不能单靠会话改密）。成功后**所有会话立即失效**，
+包括发起修改的这一个——编辑器会引导重新登录。
+
+---
+
 ## /health 响应
 
 ```json
@@ -700,8 +773,10 @@ GitHub，终端只请求自己的域名（和拉配置同一个域名，一定�
 | 405 | `method_not_allowed` | 方法不支持 |
 | 409 | `revision_conflict` | 乐观锁冲突 |
 | 413 | `payload_too_large` | 请求体超限：EdgeOne 2 MiB、FC 1 MiB |
+| 429 | `too_many_attempts` | **仅 EdgeOne**：登录连续失败 5 次后锁定 5 分钟（`retryAfterSeconds`） |
 | 500 | `internal_error` | 服务端异常（不向客户端泄露栈） |
 | 503 | `storage_unavailable` | **仅 EdgeOne**：KV 未绑定且 Blob SDK 不可用 |
+| 503 | `auth_not_initialized` | **仅 EdgeOne**：没有配置管理员账号（`CONFIG_ADMIN_PASSWORD` 缺失或不足 8 位） |
 
 ## 与 FC 版的差异（API 视角）
 

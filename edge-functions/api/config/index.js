@@ -99,7 +99,7 @@ async function catchUpLibrary(env, document, deviceId, library) {
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'read');
+    await requireAuth(request, env, 'read');
     const { id, meta } = deviceScope(request);
     await rejectBlocked(env, id);
     // 设备文档与全局资源库互不依赖，并发读：终端每 3 分钟心跳一次，两次 KV
@@ -180,7 +180,7 @@ async function freezeLockedChannels(env, sections) {
 
 export async function onRequestPut(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const { id } = deviceScope(request);
     await rejectBlocked(env, id);
     const body = await readJsonBody(request);

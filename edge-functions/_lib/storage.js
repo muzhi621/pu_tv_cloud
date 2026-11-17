@@ -712,3 +712,22 @@ export async function deleteApk(env, key) {
   const store = await apkStore(env);
   await store.delete(key);
 }
+
+/**
+ * 认证类数据的通用读写（账号哈希 / 会话表 / 失败计数）。
+ *
+ * 这几份数据与设备文档无关，也不进 revision 体系，所以不复用 `read()`——
+ * 它会补齐 seed 文档、会走设备作用域，用在这里只会把键空间搞乱。
+ * 键名与结构由 auth.js 决定，存储层只负责落盘，两边各写一份结构必然会漂移。
+ */
+export async function readMeta(env, key) {
+  const db = await backend(env);
+  return db.getJSON(key);
+}
+
+export async function writeMeta(env, key, value) {
+  const db = await backend(env);
+  // 与 write() 一致：两种后端的 put 都接受字符串，KV 存对象在部分运行时会被
+  // 当成 "[object Object]" 落盘。
+  await db.put(key, JSON.stringify(value));
+}

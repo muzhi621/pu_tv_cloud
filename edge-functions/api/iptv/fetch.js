@@ -276,7 +276,7 @@ async function fetchOne(raw) {
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
     // 导入源属于编辑动作，必须持有写令牌，避免被当成开放代理滥用。
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
     const urls = Array.isArray(body.urls) ? body.urls : (body.url ? [body.url] : []);
     if (!urls.length) throw new ConfigError('请提供 urls 数组或 url 字符串');

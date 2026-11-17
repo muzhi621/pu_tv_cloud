@@ -50,7 +50,7 @@ export async function onRequestGet(context) {
 
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
     // 兼容两种写法：包一层 `manifest`，或直接把清单当 body 发上来。
     const raw = body.manifest && typeof body.manifest === 'object' ? body.manifest : body;

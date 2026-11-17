@@ -7,6 +7,7 @@
  *   MAX_DOCUMENT_BYTES 约束，避免出现平台无法承载的超大文档。
  */
 import { ConfigError, etagFor, SCHEMA_VERSION } from './contract.js';
+import { lookupSession } from './auth.js';
 import { Conflict, StorageUnavailable, normalizeDeviceId } from './storage.js';
 
 /**
@@ -72,15 +73,30 @@ function constantTimeEqual(a, b) {
   return diff === 0;
 }
 
-export function requireAuth(request, env, scope) {
+/**
+ * 鉴权：先比真实令牌，再试编辑器会话。
+ *
+ * - 真实令牌（终端 / 脚本 / 旧编辑器）：与改动前完全一致，`scope` 决定用读还是
+ *   写令牌，比较走常量时间。
+ * - 会话令牌（编辑器网页登录）：等价于管理员，读写都放行。会话本身有有效期，
+ *   改密码即全部失效，所以不需要在这里再区分 scope。
+ *
+ * 注意这是 async 的：会话校验要读一次会话表与账号记录（见 _lib/auth.js）。
+ * 所有调用点都必须 await——漏掉会得到「永远通过」的 Promise 真值。
+ */
+export async function requireAuth(request, env, scope) {
   const readToken = (env.CONFIG_READ_TOKEN || '').trim();
   const writeToken = (env.CONFIG_WRITE_TOKEN || '').trim() || readToken;
-  const token = scope === 'read' ? readToken : writeToken;
-  if (!token) return; // devMode：未配置 token 时不鉴权，与 FC 版一致
+  const expected = scope === 'read' ? readToken : writeToken;
+  if (!expected) return { via: 'dev' }; // devMode：未配置 token 时不鉴权，与 FC 版一致
   const header = request.headers.get('Authorization') || '';
-  if (!header.startsWith('Bearer ') || !constantTimeEqual(header.slice(7).trim(), token)) {
-    throw new HttpError(401, 'unauthorized', '缺少或无效的 Bearer Token');
+  const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (bearer && constantTimeEqual(bearer, expected)) return { via: 'token' };
+  if (bearer) {
+    const session = await lookupSession(env, bearer);
+    if (session) return { via: 'session', user: session.user };
   }
+  throw new HttpError(401, 'unauthorized', '缺少或无效的 Bearer Token');
 }
 
 export async function readJsonBody(request) {

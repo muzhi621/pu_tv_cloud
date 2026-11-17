@@ -618,6 +618,26 @@ class VodSectionTests(unittest.TestCase):
         self.assertEqual([site["id"] for site in vod["sites"]], ["vs_aaaaaaaa:a1"])
         self.assertEqual(vod["sites"][0]["ext"], "token-a1")
 
+    def test_vod_default_site(self):
+        """默认站点：合法 id 原样保留，非法格式清空并记 warning，缺省为空串。"""
+        sections, _ = normalize_sections({
+            "vod": {
+                "sourceIds": ["vs_aaaaaaaa"],
+                "siteIds": ["vs_aaaaaaaa:csp_A", "vs_aaaaaaaa:csp_B"],
+                "defaultSiteId": "vs_aaaaaaaa:csp_B",
+            },
+        })
+        self.assertEqual(sections["vod"]["defaultSiteId"], "vs_aaaaaaaa:csp_B")
+
+        # 缺省：老文档没有这个字段，补成空串（= 不指定，终端用第一个站点）
+        sections, _ = normalize_sections({"vod": {"sourceIds": []}})
+        self.assertEqual(sections["vod"]["defaultSiteId"], "")
+
+        # 非法格式（含空格 / 超长）：不能把任意字符串下发给终端
+        sections, warnings = normalize_sections({"vod": {"defaultSiteId": "有中文 的站点"}})
+        self.assertEqual(sections["vod"]["defaultSiteId"], "")
+        self.assertTrue(any("vod.defaultSiteId" in w for w in warnings))
+
     def test_vod_source_url_mode_roundtrip(self):
         """双轨：url/mode 在设备内联源与资源库源里都不被规范化丢掉。"""
         sections, _ = normalize_sections({

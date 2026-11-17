@@ -6,7 +6,7 @@ export const onRequestOptions = optionsHandler;
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'read');
+    await requireAuth(request, env, 'read');
     const { id } = deviceScope(request);
     const url = new URL(request.url);
     const parsed = Number.parseInt(url.searchParams.get('limit') || '20', 10);

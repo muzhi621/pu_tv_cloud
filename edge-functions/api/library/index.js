@@ -33,7 +33,7 @@ function libraryRefs(library) {
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'read');
+    await requireAuth(request, env, 'read');
     const library = await readLibrary(env);
     return send({
       env, request, status: 200, body: library, document: library,
@@ -43,7 +43,7 @@ export async function onRequestGet(context) {
 
 export async function onRequestPut(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
 
     let ifMatch = (request.headers.get('If-Match') || '').trim().replace(/^"|"$/g, '');

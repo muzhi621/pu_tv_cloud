@@ -9,7 +9,7 @@ export const onRequestOptions = optionsHandler;
 
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const { id } = deviceScope(request);
     const body = await readJsonBody(request);
     const { revision } = body;

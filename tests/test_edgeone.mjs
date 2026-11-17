@@ -48,6 +48,11 @@ import {
   onRequestGet as apkGet, onRequestPost as apkPost, looksLikeApk,
 } from '../edge-functions/api/update/apk.js';
 import { normalizeUploadedManifest } from '../edge-functions/_lib/update.js';
+import { onRequestPost as authLogin } from '../edge-functions/api/auth/login.js';
+import { onRequestGet as authStatusGet } from '../edge-functions/api/auth/status.js';
+import { onRequestGet as authSessionGet } from '../edge-functions/api/auth/session.js';
+import { onRequestPost as authPasswordPost } from '../edge-functions/api/auth/password.js';
+import { onRequestPost as authLogoutPost } from '../edge-functions/api/auth/logout.js';
 
 class MemoryKV {
   constructor() { this.map = new Map(); }
@@ -640,29 +645,30 @@ test('IPTV 节：解析结果校验、去重与协议白名单', async (t) => {
   });
 });
 
-test('编辑器连接信息由环境变量注入，且不写进仓库文件', async (t) => {
-  // 2026-11-16 起预填默认关闭：必须显式 CONFIG_EDITOR_PRELOAD=1 才注入令牌，
-  // 避免「打开编辑器域名即在源码看到写令牌」。旧部署需显式开启。
+test('编辑器连接信息只注入同源地址，不注入任何令牌', async (t) => {
+  // 改成账号登录后，页面源码里绝不能出现读写令牌：打开域名即拿到写权限是
+  // 旧预填方案最大的问题。地址仍然预填（同源），登录流程也会自己带出来。
   const env = {
     CONFIG_READ_TOKEN: 'READ-TOKEN', CONFIG_WRITE_TOKEN: 'WRITE-TOKEN',
     CONFIG_EDITOR_PRELOAD: '1',
   };
   const req = new Request('https://tv.example.com/');
 
-  await t.test('预填值与自动连接开关（显式开启后）', () => {
+  await t.test('只给地址与固定 autoConnect=false', () => {
     const defaults = preloadDefaults(env, req);
-    assert.equal(defaults.base, 'https://tv.example.com');
-    assert.equal(defaults.readToken, 'READ-TOKEN');
-    assert.equal(defaults.writeToken, 'WRITE-TOKEN');
-    assert.equal(defaults.autoConnect, true);
+    assert.deepEqual(defaults, { base: 'https://tv.example.com', autoConnect: false });
     assert.equal(preloadDefaults({ ...env, CONFIG_EDITOR_PRELOAD: '0' }, req), null);
-    assert.equal(preloadDefaults({}, req), null);
+    // 地址预填不涉及机密：默认就注入，省掉手填域名这一步
+    assert.equal(preloadDefaults({}, req).base, 'https://tv.example.com');
   });
 
-  await t.test('预填默认关闭：仅配置令牌不注入', () => {
+  await t.test('令牌永远不进页面', () => {
     const tokenOnly = { CONFIG_READ_TOKEN: 'READ-TOKEN', CONFIG_WRITE_TOKEN: 'WRITE-TOKEN' };
-    assert.equal(preloadDefaults(tokenOnly, req), null);
+    const defaults = preloadDefaults(tokenOnly, req);
+    assert.equal(defaults.readToken, undefined);
+    assert.equal(defaults.writeToken, undefined);
   });
+
 
   await t.test('注入脚本转义 < ，不会闭合 script 标签', () => {
     const html = injectDefaults('<html><head></head><body></body></html>',
@@ -672,16 +678,154 @@ test('编辑器连接信息由环境变量注入，且不写进仓库文件', as
     assert.match(html, /\\u003c\/script/);
   });
 
-  await t.test('带令牌环境变量的页面含默认值，未配置时不含', async () => {
+  await t.test('页面注入地址但不含令牌（默认即注入地址）', async () => {
     const withDefaults = await (await editorGet(ctx('GET', '/', { env }))).text();
     assert.match(withDefaults, /window\.__PURETV_DEFAULTS__/);
-    assert.match(withDefaults, /READ-TOKEN/);
-    assert.match(withDefaults, /WRITE-TOKEN/);
+    assert.ok(withDefaults.includes('https://config.example.com'), '地址应被注入');
+    // 页面源码里出现令牌 = 打开域名即拿到写权限，这条断言守住改造成果。
+    assert.ok(!withDefaults.includes('READ-TOKEN'));
+    assert.ok(!withDefaults.includes('WRITE-TOKEN'));
     const plain = await (await editorGet(ctx('GET', '/'))).text();
-    // app.js 源码里本来就有读取 window.__PURETV_DEFAULTS__ 的代码，
-    // 所以只能断言「没有注入赋值语句、也没有令牌值」。
-    assert.ok(!plain.includes('window.__PURETV_DEFAULTS__={'));
+    // 没有环境变量时同样只注入同源地址：地址不是机密，省掉手填一眼
+    assert.match(plain, /window\.__PURETV_DEFAULTS__/);
+    assert.ok(plain.includes('https://config.example.com'));
     assert.ok(!plain.includes('READ-TOKEN'));
+  });
+});
+
+test('编辑器账号：环境变量初始化、会话鉴权、改密码与失败限流', async (t) => {
+  const savedKv = globalThis.PURETV_KV;
+  const fresh = new MemoryKV();
+  globalThis.PURETV_KV = fresh;
+  t.after(() => { globalThis.PURETV_KV = savedKv; });
+
+  const env = {
+    CONFIG_READ_TOKEN: 'READ-TOKEN',
+    CONFIG_WRITE_TOKEN: 'WRITE-TOKEN',
+    CONFIG_ADMIN_USER: 'admin',
+    CONFIG_ADMIN_PASSWORD: 'secret-pass-1',
+  };
+  const login = (body, e = env) => authLogin(ctx('POST', '/api/auth/login', { body, env: e }));
+  const bearer = (token) => ({ Authorization: 'Bearer ' + token });
+
+  await t.test('未配置账号：登录与状态都给出可执行提示', async () => {
+    const status = await json(await authStatusGet(ctx('GET', '/api/auth/status', { env: {} })));
+    assert.equal(status.initialized, false);
+    assert.match(status.hint, /CONFIG_ADMIN_PASSWORD/);
+
+    const res = await login({ username: 'admin', password: 'secret-pass-1' }, {});
+    assert.equal(res.status, 503);
+    assert.equal((await json(res)).error, 'auth_not_initialized');
+  });
+
+  await t.test('环境变量首次初始化账号，状态转为已配置', async () => {
+    const status = await json(await authStatusGet(ctx('GET', '/api/auth/status', { env })));
+    assert.equal(status.initialized, true);
+    // 只是探测，不应该把账号写进 KV——真正落库发生在第一次成功登录时。
+    assert.equal(fresh.map.has('auth_account'), false);
+
+    const res = await login({ username: 'admin', password: 'secret-pass-1' });
+    assert.equal(res.status, 200);
+    assert.equal(fresh.map.has('auth_account'), true);
+    // 存储里只有 PBKDF2 哈希，没有明文密码
+    const stored = JSON.parse(fresh.map.get('auth_account'));
+    assert.equal(stored.hash.length, 64);
+    assert.ok(!JSON.stringify(stored).includes('secret-pass-1'));
+  });
+
+  await t.test('密码错被拒；账号错与密码错返回同一提示', async () => {
+    const badPass = await login({ username: 'admin', password: 'nope-nope' });
+    const badUser = await login({ username: 'guest', password: 'secret-pass-1' });
+    assert.equal(badPass.status, 401);
+    assert.equal(badUser.status, 401);
+    assert.equal((await json(badPass)).message, (await json(badUser)).message);
+  });
+
+  await t.test('会话可读写，且不依赖真实令牌', async () => {
+    fresh.map.delete('auth_account'); // 换一轮干净状态，避免上一组失败计数干扰
+    const res = await login({ username: 'admin', password: 'secret-pass-1' });
+    const data = await json(res);
+    assert.match(data.token, /^[0-9a-f]{64}$/);
+    assert.equal(data.user, 'admin');
+    assert.ok(data.expiresAt > Date.now());
+    assert.equal(data.base, BASE);
+    assert.ok(!JSON.stringify(data).includes('WRITE-TOKEN'));
+
+    const read = await configGet(ctx('GET', '/api/config', { headers: bearer(data.token), env }));
+    assert.equal(read.status, 200, '会话应能读配置');
+    // 会话等价管理员：写接口同样放行（这里用改密码接口验证「写」这条路径）
+    const pwd = await authPasswordPost(ctx('POST', '/api/auth/password', {
+      headers: bearer(data.token),
+      body: { oldPassword: 'secret-pass-1', newPassword: 'secret-pass-2' },
+      env,
+    }));
+    assert.equal(pwd.status, 200, '会话应能进入写接口');
+  });
+
+  await t.test('改密码后旧会话立即失效，新密码可登录', async () => {
+    fresh.map.clear();
+    const first = await json(await login({ username: 'admin', password: 'secret-pass-1' }));
+    const other = await json(await login({ username: 'admin', password: 'secret-pass-1' }));
+
+    const changed = await authPasswordPost(ctx('POST', '/api/auth/password', {
+      headers: bearer(first.token),
+      body: { oldPassword: 'secret-pass-1', newPassword: 'secret-pass-2' },
+      env,
+    }));
+    assert.equal(changed.status, 200);
+
+    // 两个会话都必须失效：只作废「当前这一个」等于把旧设备留在登录态
+    for (const token of [first.token, other.token]) {
+      const check = await authSessionGet(ctx('GET', '/api/auth/session', { headers: bearer(token), env }));
+      assert.equal(check.status, 401);
+    }
+    const stale = await login({ username: 'admin', password: 'secret-pass-1' });
+    assert.equal(stale.status, 401, '旧密码不应再能登录');
+    const ok = await login({ username: 'admin', password: 'secret-pass-2' });
+    assert.equal(ok.status, 200);
+  });
+
+  await t.test('改密码：旧密码错 / 新密码过短 / 与原密码相同都被拒', async () => {
+    fresh.map.clear();
+    const session = await json(await login({ username: 'admin', password: 'secret-pass-1' }));
+    const post = (body) => authPasswordPost(ctx('POST', '/api/auth/password', {
+      headers: bearer(session.token), body, env,
+    }));
+    assert.equal((await post({ oldPassword: 'wrong-old', newPassword: 'another-pass' })).status, 400);
+    assert.equal((await post({ oldPassword: 'secret-pass-1', newPassword: 'short' })).status, 400);
+    assert.equal((await post({ oldPassword: 'secret-pass-1', newPassword: 'secret-pass-1' })).status, 400);
+  });
+
+  await t.test('登出后会话失效，且重复登出仍返回 200', async () => {
+    fresh.map.clear();
+    const session = await json(await login({ username: 'admin', password: 'secret-pass-1' }));
+    const out1 = await authLogoutPost(ctx('POST', '/api/auth/logout', { headers: bearer(session.token), env }));
+    assert.equal(out1.status, 200);
+    const check = await authSessionGet(ctx('GET', '/api/auth/session', { headers: bearer(session.token), env }));
+    assert.equal(check.status, 401);
+    const out2 = await authLogoutPost(ctx('POST', '/api/auth/logout', { headers: bearer(session.token), env }));
+    assert.equal(out2.status, 200);
+  });
+
+  await t.test('连续失败 5 次后锁定，锁定期间正确密码也不放行', async () => {
+    fresh.map.clear();
+    for (let i = 0; i < 5; i += 1) {
+      const res = await login({ username: 'admin', password: 'bad-' + i });
+      assert.equal(res.status, 401);
+    }
+    const locked = await login({ username: 'admin', password: 'secret-pass-1' });
+    assert.equal(locked.status, 429);
+    const data = await json(locked);
+    assert.equal(data.error, 'too_many_attempts');
+    assert.ok(data.retryAfterSeconds > 0);
+  });
+
+  await t.test('真实令牌仍然直连（终端不受改造影响）', async () => {
+    // 终端只带 CONFIG_READ_TOKEN：没有会话也必须能拉配置
+    const read = await configGet(ctx('GET', '/api/config', {
+      headers: bearer('READ-TOKEN'), env,
+    }));
+    assert.equal(read.status, 200);
   });
 });
 
@@ -1524,8 +1668,8 @@ test('资源库文档模型：id 规则、上限与协议校验', async (t) => {
   await t.test('设备 vod 节：默认值、上限与类型校验', () => {
     const [sections] = normalizeSections({});
     assert.deepEqual(sections.vod, {
-      managed: false, sourceIds: [], siteIds: [], sources: [], sites: [],
-      lockLibrary: false, libraryRevision: 0,
+      managed: false, sourceIds: [], siteIds: [], defaultSiteId: '',
+      sources: [], sites: [], lockLibrary: false, libraryRevision: 0,
     });
 
     const sourceIds = Array.from({ length: 21 }, (_, i) => `vs_${String(i).padStart(8, '0')}`);
@@ -1879,8 +2023,8 @@ test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔
     // 没有库引用 → 不 bump，revision 原样
     assert.equal(doc.revision, 5);
     assert.deepEqual(doc.sections.vod, {
-      managed: false, sourceIds: [], siteIds: [], sources: [], sites: [],
-      lockLibrary: false, libraryRevision: 0,
+      managed: false, sourceIds: [], siteIds: [], defaultSiteId: '',
+      sources: [], sites: [], lockLibrary: false, libraryRevision: 0,
     });
     assert.deepEqual(doc.sections.iptv.packageIds, []);
   });
@@ -2007,6 +2151,43 @@ test('TVBox 源与站点：库字段、按源展开、白名单与锁定隔离',
     });
     const out = expandVodSites(sections, library);
     assert.deepEqual(out.vod.sites.map((item) => item.id), [`${SOURCE_A}:a2`]);
+  });
+
+  await t.test('默认站点：在列表里就下发，被排除则清空', () => {
+    const library = buildLibrary();
+    const [sections] = normalizeSections({
+      vod: { managed: true, sourceIds: [SOURCE_A], defaultSiteId: `${SOURCE_A}:a2` },
+    });
+    const out = expandVodSites(sections, library);
+    assert.equal(out.vod.defaultSiteId, `${SOURCE_A}:a2`, '默认站点要随文档下发');
+
+    // 白名单只留 a1：默认站点 a2 已经不下发了，必须清空——否则终端会拿一个
+    // 不存在的站点去开首页，表现为「打开影音直接报错」。
+    const [narrowed] = normalizeSections({
+      vod: {
+        managed: true,
+        sourceIds: [SOURCE_A],
+        siteIds: [`${SOURCE_A}:a1`],
+        defaultSiteId: `${SOURCE_A}:a2`,
+      },
+    });
+    assert.equal(expandVodSites(narrowed, library).vod.defaultSiteId, '');
+
+    // 锁定快照：按内联站点校验，而不是库里的站点
+    const [locked] = normalizeSections({
+      vod: {
+        managed: true,
+        lockLibrary: true,
+        defaultSiteId: `${SOURCE_A}:only`,
+        sources: [{ id: SOURCE_A, name: '快照源' }],
+        sites: [{ id: `${SOURCE_A}:only`, sourceId: SOURCE_A, api: 'csp_Old' }],
+      },
+    });
+    assert.equal(expandVodSites(locked, library).vod.defaultSiteId, `${SOURCE_A}:only`);
+
+    // 缺省：老文档没有这个字段 → 空串（终端回退第一个站点）
+    const [legacy] = normalizeSections({ vod: { managed: true, sourceIds: [SOURCE_A] } });
+    assert.equal(expandVodSites(legacy, library).vod.defaultSiteId, '');
   });
 
   await t.test('多源同时选中：站点合并、源按引用顺序', () => {

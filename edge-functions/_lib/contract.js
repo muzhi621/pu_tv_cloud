@@ -182,6 +182,9 @@ export const DEFAULT_VOD = {
   managed: false,
   sourceIds: [],
   siteIds: [],
+  // 打开影音时默认选中的站点 id（必须在最终下发的 sites 里，否则清空）。
+  // 只是「首屏选谁」，不是访问白名单——白名单仍然是 siteIds。
+  defaultSiteId: '',
   // 展开后的产物（GET 时由 expandVodSites 写入），也是锁定快照的载体：
   // lockLibrary 为 true 时终端只认这两个字段，不再跟随资源库。
   sources: [],
@@ -943,6 +946,16 @@ function normalizeVod(part, warnings) {
   base.lockLibrary = bool(part.lockLibrary, false, 'vod.lockLibrary');
   base.libraryRevision = int(part.libraryRevision, 0, 0, 1e9, 'vod.libraryRevision');
 
+  // 默认站点：只是「打开影音时先选谁」。引用是否真的在下发列表里由
+  // expandVodSites 复核（那一步才知道库里现在还有没有这个站点）；
+  // 这里只挡格式非法的值，避免把任意字符串下发到终端。
+  const rawDefaultSite = str(part.defaultSiteId, '', 'vod.defaultSiteId', 96);
+  if (rawDefaultSite && !VOD_SITE_ID_RE.test(rawDefaultSite)) {
+    warnings.push(`vod.defaultSiteId: 忽略格式非法的站点 id ${rawDefaultSite}`);
+  } else {
+    base.defaultSiteId = rawDefaultSite;
+  }
+
   // 锁定快照 / 手工内联：只做字段级裁剪，不深究语义（它们本来就是从
   // expandVodSites 产物或编辑器写回来的，结构已经受控）。
   base.sources = inlineVodSources(part.sources, warnings);
@@ -1035,6 +1048,19 @@ function inlineVodSites(raw, warnings) {
  * 输出字段刻意压到终端真正需要的量：站点只带 id/name/api/ext/type 与两个
  * 搜索标记，把 note、addedAt 之类纯管理字段丢掉，心跳体才不至于过大。
  */
+/**
+ * 默认站点只在「本次真的下发了它」时才有意义。
+ *
+ * 库里的站点可能被删、也可能被 siteIds 白名单排掉，那时下发的仍是旧 id，
+ * 终端会拿一个不存在的站点去开首页（表现为打开影音直接报错）。所以展开时
+ * 复核一次：不在列表里就清空，让终端回退到「第一个站点」这条既有逻辑。
+ */
+function keepVodDefaultSiteId(raw, sites) {
+  const wanted = typeof raw === 'string' ? raw : '';
+  if (!wanted) return '';
+  return sites.some((site) => site && site.id === wanted) ? wanted : '';
+}
+
 export function expandVodSites(sections, library = null) {
   const vod = sections && sections.vod;
   if (!vod) return sections;
@@ -1046,6 +1072,7 @@ export function expandVodSites(sections, library = null) {
   if (!refSourceIds.length) {
     out.vod.sources = inlineSources;
     out.vod.sites = inlineSites;
+    out.vod.defaultSiteId = keepVodDefaultSiteId(vod.defaultSiteId, inlineSites);
     return out;
   }
 
@@ -1092,6 +1119,7 @@ export function expandVodSites(sections, library = null) {
     spiderFlavor: vodFlavor(item.spiderFlavor),
   }));
   out.vod.sites = sites;
+  out.vod.defaultSiteId = keepVodDefaultSiteId(vod.defaultSiteId, sites);
   return out;
 }
 

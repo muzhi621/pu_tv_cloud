@@ -24,7 +24,7 @@ export const onRequestOptions = optionsHandler;
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'read');
+    await requireAuth(request, env, 'read');
     const bundles = await readBundles(env);
     // 附带每台绑定数：编辑器列表直接显示「3 台设备在用」，不用再请求一次。
     const devices = await listDevices(env);
@@ -45,7 +45,7 @@ export async function onRequestGet(context) {
 
 export async function onRequestPut(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
 
     let ifMatch = (request.headers.get('If-Match') || '').trim().replace(/^"|"$/g, '');
@@ -92,7 +92,7 @@ export async function onRequestPut(context) {
  */
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
     const deviceId = String(body.deviceId || '').trim();
     const bundleId = String(body.bundleId || '').trim();

@@ -4,36 +4,27 @@
  * 编辑器由 scripts/build_edgeone_assets.py 把 editor/{index.html,style.css,app.js}
  * 内联成单个 HTML 字符串，因此本部署不需要任何静态资源目录或构建命令。
  *
- * 连接信息由本函数在「响应时」从环境变量注入，而不是写进仓库：
- * pu_tv_cloud 是公开仓库，任何硬编码的令牌都会立刻被扫描机器人抓走。
- * CONFIG_READ_TOKEN / CONFIG_WRITE_TOKEN 本来就是部署时必填的环境变量，
- * 这里复用来预填编辑器的三个输入框，打开页面即可直接「连接并加载」。
+ * 连接信息：改成账号登录后，页面**只注入同源 API 地址，不注入任何令牌**。
+ * 注入令牌（历史上 CONFIG_EDITOR_PRELOAD=1 的做法）等于绕开登录——任何打开
+ * 该域名的人都能在源码里拿到写令牌，这正是本次改造要消除的问题。
+ * 登录成功后前端拿的是会话令牌，真实读写令牌永不下发到浏览器。
  *
- * 安全边界（2026-11-16 收紧）：能访问本页的人会在源码里看到令牌，因此预填
- * **默认关闭**——打开页面是空白输入框，需手动填写。仅当运营确认编辑器域名
- * 不对外传播时，才显式设置 CONFIG_EDITOR_PRELOAD=1 开启预填（兼容旧部署）。
- * 前端另把写令牌存进 sessionStorage（关闭标签页即失效），不落 localStorage。
- * 响应带 Cache-Control: no-store，避免 CDN 把带令牌的页面缓存给其他访客。
+ * CONFIG_EDITOR_PRELOAD=0 仍可关闭地址预填（留空即手填），但开关与安全性无关。
+ * 响应带 Cache-Control: no-store，避免 CDN 把页面缓存给其他访客。
  */
 import { EDITOR_HTML } from './_lib/editor.js';
 import { handle, send } from './_lib/http.js';
 
 const OFF_VALUES = ['0', 'false', 'off', 'no', 'disabled'];
 
-/** 返回要预填的连接信息；关闭开关或未配置令牌时返回 null。 */
+/** 返回要预填的连接信息：只有地址，没有令牌；关掉开关时返回 null。 */
 export function preloadDefaults(env, request) {
-  // 默认关闭：安全优先，避免编辑器域名被打开即泄露写令牌。
-  // 旧部署若依赖预填，需显式配置 CONFIG_EDITOR_PRELOAD=1。
-  const flag = String(env.CONFIG_EDITOR_PRELOAD ?? '0').trim().toLowerCase();
+  const flag = String(env.CONFIG_EDITOR_PRELOAD ?? '1').trim().toLowerCase();
   if (OFF_VALUES.includes(flag)) return null;
-  const readToken = String(env.CONFIG_READ_TOKEN || '').trim();
-  const writeToken = String(env.CONFIG_WRITE_TOKEN || '').trim();
-  if (!readToken && !writeToken) return null; // devMode：没有令牌，无需预填
   return {
     base: new URL(request.url).origin,
-    readToken,
-    writeToken,
-    autoConnect: true,
+    // 不自动连接：未登录前前端不主动请求，登录流程自己会带出地址并加载。
+    autoConnect: false,
   };
 }
 

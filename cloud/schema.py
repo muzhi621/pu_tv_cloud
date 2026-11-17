@@ -200,6 +200,8 @@ DEFAULT_VOD: dict = {
     "managed": False,
     "sourceIds": [],
     "siteIds": [],
+    # 打开影音时默认选中的站点 id；只是首屏选谁，不是白名单（白名单是 siteIds）。
+    "defaultSiteId": "",
     # 展开产物 / 锁定快照载体，与 contract.js 的 DEFAULT_VOD 对齐。
     "sources": [],
     "sites": [],
@@ -921,6 +923,14 @@ def normalize_vod(part: dict, warnings: list[str]) -> dict:
     base["lockLibrary"] = _bool(part.get("lockLibrary"), False, "vod.lockLibrary")
     base["libraryRevision"] = _int(part.get("libraryRevision"), 0, 0,
                                    MAX_LIBRARY_REVISION, "vod.libraryRevision")
+
+    # 默认站点：只决定「打开影音先选谁」，不参与白名单语义。FC 版没有全局资源库，
+    # 展开由客户端自己做，所以这里只挡格式非法的值。
+    raw_default_site = _str(part.get("defaultSiteId"), "", "vod.defaultSiteId", 96)
+    if raw_default_site and not _VOD_SITE_ID_RE.match(raw_default_site):
+        warnings.append("vod.defaultSiteId: 忽略格式非法的站点 id %s" % raw_default_site)
+    else:
+        base["defaultSiteId"] = raw_default_site
 
     # 内联源 / 站点：既可能是服务端展开的产物，也可能是人工写死的快照。
     # FC 版没有全局资源库，这两个字段是 TVBox 配置唯一的落地处。

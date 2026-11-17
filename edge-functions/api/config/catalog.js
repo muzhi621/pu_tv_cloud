@@ -5,8 +5,8 @@ import { handle, optionsHandler, requireAuth, send } from '../../_lib/http.js';
 export const onRequestOptions = optionsHandler;
 
 export async function onRequestGet(context) {
-  return handle(context, ({ env, request }) => {
-    requireAuth(request, env, 'read');
+  return handle(context, async ({ env, request }) => {
+    await requireAuth(request, env, 'read');
     return send({ env, request, status: 200, body: CATALOG });
   });
 }

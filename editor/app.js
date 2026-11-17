@@ -3,8 +3,12 @@
 
 const state = {
   base: '',
-  token: '',          // 读令牌：GET /api/* 与 /health
-  writeToken: '',     // 写令牌：PUT /api/config、POST rollback；留空时回退读令牌
+  token: '',          // 会话令牌（账号登录）或读令牌（令牌直连）
+  writeToken: '',     // 写令牌：仅「用令牌连接」时使用；会话模式为空
+  // '' = 未登录 | 'session' = 账号登录（读写都可用会话）| 'token' = 手填令牌
+  authMode: '',
+  authUser: '',
+  authExpiresAt: 0,
   deviceId: '',       // 空 = 全局模板；非空 = 某台终端的独立配置
   devices: [],        // 上线终端注册表
   blocked: [],        // 已拉黑的设备 id（与「删除」无关，需单独 block/unblock）
@@ -129,12 +133,285 @@ async function request(path, options) {
     try { data = JSON.parse(text); } catch (_) { data = text; }
   }
   if (!response.ok) {
+    // 会话过期：直接弹登录框，别让人对着「保存失败 401」猜原因。
+    // /api/auth/* 的 401 是「密码错」这类业务结果，交给调用方处理。
+    if (response.status === 401 && state.authMode === 'session' && !path.startsWith('/api/auth/')) {
+      clearSession();
+      state.authMode = '';
+      state.token = '';
+      showLogin('登录已过期，请重新登录');
+    }
     const error = new Error((data && data.message) || ('HTTP ' + response.status));
     error.status = response.status;
     error.data = data;
     throw error;
   }
   return data;
+}
+
+/* ---------------- 登录 / 会话 ---------------- */
+
+/**
+ * 会话只存在 localStorage 的这一处，且只存「会话令牌」——真实读写令牌从不
+ * 落到浏览器，这也是改用账号登录的初衷。
+ */
+const SESSION_KEY = 'purelive_session';
+
+function saveSession() {
+  if (state.authMode !== 'session' || !state.token) return;
+  localStorage.setItem(SESSION_KEY, JSON.stringify({
+    token: state.token,
+    user: state.authUser,
+    expiresAt: state.authExpiresAt,
+    base: state.base,
+  }));
+  // 历史版本把令牌存在这个键里；会话模式下它不该再留任何东西，
+  // 否则下次启动会被当成长期令牌直连。
+  localStorage.removeItem('purelive_config_token');
+}
+
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
+
+function savedSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || !data.token) return null;
+    // 过期就当场丢掉：与其发一次必 401 的请求，不如直接给登录框。
+    if (!(Number(data.expiresAt) > Date.now())) {
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return data;
+  } catch (_) {
+    return null;
+  }
+}
+
+function syncAccountBar() {
+  const logged = state.authMode === 'session';
+  const badge = $('accountBadge');
+  if (badge) {
+    badge.hidden = !logged;
+    badge.textContent = logged ? ('已登录 · ' + state.authUser) : '';
+  }
+  const logout = $('btnLogout');
+  if (logout) logout.hidden = !logged;
+  // 用令牌连接的部署同样要能改密码（密码存在服务端，与连接方式无关）。
+  const pwd = $('btnChangePassword');
+  if (pwd) pwd.hidden = !state.authMode;
+}
+
+function showLogin(reason) {
+  syncAccountBar();
+  const mask = $('loginMask');
+  if (!mask) return;
+  mask.hidden = false;
+  const error = $('loginError');
+  if (error) {
+    error.textContent = reason || '';
+    error.hidden = !reason;
+  }
+  const user = $('loginUser');
+  if (user && !user.value) user.value = 'admin';
+  const pass = $('loginPass');
+  if (pass && document.activeElement !== pass) pass.focus();
+}
+
+function hideLogin() {
+  const mask = $('loginMask');
+  if (mask) mask.hidden = true;
+}
+
+/** 账号登录：成功后自动带出同源 API 地址并加载全部数据。 */
+async function loginWithAccount(username, password) {
+  const base = ((state.base || '').trim() || window.location.origin).replace(/\/$/, '');
+  const response = await fetch(base + '/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch (_) { data = null; }
+  }
+  if (!response.ok) {
+    const error = new Error((data && data.message) || ('HTTP ' + response.status));
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+  state.base = ((data && data.base) || base).replace(/\/$/, '');
+  state.token = data.token;
+  state.writeToken = '';
+  state.authMode = 'session';
+  state.authUser = data.user || username;
+  state.authExpiresAt = Number(data.expiresAt) || 0;
+  const baseInput = $('apiBase');
+  if (baseInput) baseInput.value = state.base;
+  saveSession();
+  hideLogin();
+  syncAccountBar();
+  await reloadAll();
+}
+
+/**
+ * 页面启动：先看有没有能用的会话。
+ *
+ * 有效就直接连接加载（用户完全感知不到登录这回事），无效才显示登录框。
+ * 校验必须问服务端：localStorage 里的 expiresAt 只是本地时钟，会话也可能
+ * 因为「改了密码」被服务端提前作废。
+ */
+async function restoreSession() {
+  const saved = savedSession();
+  if (!saved) {
+    showLogin();
+    return;
+  }
+  state.base = (saved.base || window.location.origin).replace(/\/$/, '');
+  state.token = saved.token;
+  state.authMode = 'session';
+  state.authUser = saved.user || '';
+  state.authExpiresAt = Number(saved.expiresAt) || 0;
+  const baseInput = $('apiBase');
+  if (baseInput) baseInput.value = state.base;
+  try {
+    const info = await request('/api/auth/session');
+    state.authUser = (info && info.user) || state.authUser;
+    state.authExpiresAt = Number(info && info.expiresAt) || state.authExpiresAt;
+    saveSession();
+    syncAccountBar();
+    hideLogin();
+    await reloadAll();
+  } catch (error) {
+    clearSession();
+    state.authMode = '';
+    state.token = '';
+    showLogin(error.status === 401
+      ? '登录已过期，请重新登录'
+      : '无法连接服务端：' + error.message + hintOf(error));
+  }
+}
+
+async function logout() {
+  try {
+    await request('/api/auth/logout', { method: 'POST' });
+  } catch (_) {
+    // 登出失败也要清本地：会话可能已经过期，用户意图是「离开」。
+  }
+  clearSession();
+  state.authMode = '';
+  state.token = '';
+  state.writeToken = '';
+  state.authUser = '';
+  state.authExpiresAt = 0;
+  showLogin('已退出登录');
+}
+
+function loginError(message) {
+  const box = $('loginError');
+  if (!box) return;
+  box.textContent = message || '';
+  box.hidden = !message;
+}
+
+async function onLoginSubmit(event) {
+  event.preventDefault();
+  const user = ($('loginUser').value || '').trim();
+  const pass = $('loginPass').value || '';
+  if (!user || !pass) {
+    loginError('请填写账号与密码');
+    return;
+  }
+  const button = $('btnLogin');
+  if (button) button.disabled = true;
+  loginError('');
+  try {
+    await loginWithAccount(user, pass);
+    const passInput = $('loginPass');
+    if (passInput) passInput.value = '';
+  } catch (error) {
+    // 未初始化 / 被限流时把服务端的可执行提示原样带出来，别只显示「登录失败」。
+    loginError(error.message + (error.data && error.data.hint ? '：' + error.data.hint : ''));
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+/** 「用令牌连接」：给还没配账号的部署和终端调试留的后门。 */
+async function onTokenConnect() {
+  const tokenInput = $('apiToken');
+  const writeInput = $('apiWriteToken');
+  state.authMode = 'token';
+  state.token = tokenInput ? tokenInput.value.trim() : '';
+  state.writeToken = writeInput ? writeInput.value.trim() : '';
+  if (!state.token) {
+    loginError('请填写访问令牌，或用账号登录');
+    return;
+  }
+  loginError('');
+  hideLogin();
+  syncAccountBar();
+  await reloadAll();
+}
+
+function openPasswordDialog() {
+  const mask = $('pwdMask');
+  if (!mask) return;
+  ['pwdOld', 'pwdNew', 'pwdNew2'].forEach((id) => {
+    const input = $(id);
+    if (input) input.value = '';
+  });
+  const error = $('pwdError');
+  if (error) { error.textContent = ''; error.hidden = true; }
+  mask.hidden = false;
+  const first = $('pwdOld');
+  if (first) first.focus();
+}
+
+function passwordError(message) {
+  const box = $('pwdError');
+  if (!box) return;
+  box.textContent = message || '';
+  box.hidden = !message;
+}
+
+async function onPasswordSubmit(event) {
+  event.preventDefault();
+  const oldPassword = $('pwdOld').value || '';
+  const next = $('pwdNew').value || '';
+  const again = $('pwdNew2').value || '';
+  if (!oldPassword || !next) {
+    passwordError('请填写当前密码与新密码');
+    return;
+  }
+  if (next !== again) {
+    passwordError('两次输入的新密码不一致');
+    return;
+  }
+  passwordError('');
+  try {
+    await request('/api/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ oldPassword, newPassword: next }),
+    });
+    const mask = $('pwdMask');
+    if (mask) mask.hidden = true;
+    // 服务端改完密码会把所有会话作废，这里同步清本地并回到登录框，
+    // 否则页面看起来「已登录」但每个请求都 401。
+    clearSession();
+    state.authMode = '';
+    state.token = '';
+    state.writeToken = '';
+    toast('密码已更新，请用新密码重新登录');
+    showLogin('密码已更新，请用新密码重新登录');
+  } catch (error) {
+    passwordError(error.message);
+  }
 }
 
 function toast(message) {
@@ -544,8 +821,13 @@ function newLibraryId(kind) {
 /** 连接参数以输入框为准：单独刷新资源库时也要先同步，否则会用到旧令牌。 */
 function syncConnection() {
   state.base = $('apiBase').value.trim();
-  state.token = $('apiToken').value.trim();
-  state.writeToken = $('apiWriteToken').value.trim();
+  // 会话模式下令牌不在输入框里：会话令牌由登录流程直接写进 state，
+  // 这里若照旧用输入框覆盖，会把登录态清成空串（登录成功却立刻 401）。
+  if (state.authMode === 'session') return;
+  const tokenInput = $('apiToken');
+  const writeInput = $('apiWriteToken');
+  state.token = tokenInput ? tokenInput.value.trim() : '';
+  state.writeToken = writeInput ? writeInput.value.trim() : '';
 }
 
 /**
@@ -1357,6 +1639,8 @@ async function loadDeviceStatus() {
     const tokenInput = $('apiToken');
     state.token = tokenInput ? tokenInput.value.trim() : '';
   }
+  // 未登录不发请求：登录前每次轮询都会 401，日志和状态条都会被无意义的红字占满。
+  if (!state.token) return;
   try {
     const data = await request('/api/devices');
     state.devices = arr(data && data.devices);
@@ -2947,6 +3231,21 @@ function deviceVodBlock() {
     html += '<p class="meta">有 ' + staleSources.length + ' 个源引用已失效（源被删）：'
       + esc(staleSources.join('、')) + '。取消勾选后重新选择即可。</p>';
   }
+  // 这台终端最终会拿到的站点：整源勾选的源下所有站点 + 单独勾选的站点。
+  // 「默认站点」只能从这里选——选一个根本不下发的站点没有意义，服务端
+  // expandVodSites 展开时也会把它清空（否则终端会去开一个不存在的站点）。
+  const candidateSites = [];
+  const seenCandidate = new Set();
+  for (const site of allSites) {
+    if (!pickedSources.includes(site.sourceId) && !pickedSites.includes(site.id)) continue;
+    if (seenCandidate.has(site.id)) continue;
+    seenCandidate.add(site.id);
+    candidateSites.push(site);
+  }
+  const defaultSite = String(vod.defaultSiteId || '');
+  // 旧默认站点被删/被取消勾选时，下拉里补一条显式的「已失效」选项。
+  // 否则 <select> 会静默跳到第一项，用户以为默认站点还是原来那个。
+  const defaultKnown = !defaultSite || seenCandidate.has(defaultSite);
   html += '<p class="meta">整源下发：勾选后该源下所有站点都会下发。</p>'
     + '<div class="df-multi">' + sources.map((src) =>
       '<label><input type="checkbox" data-df-multi="vod.sourceIds" data-value="' + esc(src.id) + '"'
@@ -2963,6 +3262,21 @@ function deviceVodBlock() {
       + (site.note ? ' <span class="meta">' + esc(site.note) + '</span>' : '')
       + '</label>').join('') || '<p class="muted">还没有站点。</p>')
     + '</div>'
+    + '<label class="df-field"><span>默认站点（打开影音时自动选中）</span>'
+    + '<select data-df="vod.defaultSiteId">'
+    + '<option value="">不指定（用第一个站点）</option>'
+    + (defaultKnown ? '' : '<option value="' + esc(defaultSite) + '" selected>'
+      + esc(defaultSite) + '（已失效，需重新选择）</option>')
+    + candidateSites.slice(0, 300).map((site) =>
+      '<option value="' + esc(site.id) + '"'
+      + (defaultSite === site.id ? ' selected' : '') + '>'
+      + esc(site.name || site.key) + '</option>').join('')
+    + '</select></label>'
+    + '<p class="meta">只决定「打开影音先显示哪个站点」，不影响哪些站点可见；'
+    + (candidateSites.length
+      ? '可选项来自上面勾选的源与站点。'
+      : '请先勾选源或站点，否则只能不指定。')
+    + '</p>'
     + '<label class="df-check"><input type="checkbox" data-df="vod.lockLibrary"'
     + (vod.lockLibrary ? ' checked' : '') + '> 锁定资源库</label>'
     + '<p class="meta">锁定后该终端不再跟随资源库变化，保持当前站点表。</p>';
@@ -3373,11 +3687,15 @@ async function reloadAll() {
   syncConnection();
   if (!state.base) { message('请先填写 API 地址（留空表示同源部署）。', 'err'); return; }
   localStorage.setItem('purelive_config_base', state.base);
-  localStorage.setItem('purelive_config_token', state.token);
-  // 写令牌只存会话：关闭标签页即失效，缩小 XSS / 恶意扩展的窃取窗口。
-  // 同时清理历史版本遗留在 localStorage 的写令牌（键名保持不变，见项目约定）。
-  sessionStorage.setItem('purelive_config_write_token', state.writeToken);
-  localStorage.removeItem('purelive_config_write_token');
+  if (state.authMode === 'session') {
+    saveSession();
+  } else {
+    localStorage.setItem('purelive_config_token', state.token);
+    // 写令牌只存会话：关闭标签页即失效，缩小 XSS / 恶意扩展的窃取窗口。
+    // 同时清理历史版本遗留在 localStorage 的写令牌（键名保持不变，见项目约定）。
+    sessionStorage.setItem('purelive_config_write_token', state.writeToken);
+    localStorage.removeItem('purelive_config_write_token');
+  }
   clearMessage();
   statusText('正在连接…');
   try {
@@ -3402,9 +3720,13 @@ async function load() {
   clearMessage();
   syncConnection();
   localStorage.setItem('purelive_config_base', state.base);
-  localStorage.setItem('purelive_config_token', state.token);
-  sessionStorage.setItem('purelive_config_write_token', state.writeToken);
-  localStorage.removeItem('purelive_config_write_token');
+  if (state.authMode === 'session') {
+    saveSession();
+  } else {
+    localStorage.setItem('purelive_config_token', state.token);
+    sessionStorage.setItem('purelive_config_write_token', state.writeToken);
+    localStorage.removeItem('purelive_config_write_token');
+  }
   statusText('正在连接…');
   try {
     const health = await request('/health');
@@ -3688,6 +4010,14 @@ document.addEventListener('DOMContentLoaded', () => {
   $('btnConnect').addEventListener('click', reloadAll);
   $('btnReload').addEventListener('click', reloadAll);
 
+  // ---- 登录 / 账号 ----
+  $('loginForm').addEventListener('submit', onLoginSubmit);
+  $('btnTokenConnect').addEventListener('click', onTokenConnect);
+  $('btnLogout').addEventListener('click', logout);
+  $('btnChangePassword').addEventListener('click', openPasswordDialog);
+  $('pwdForm').addEventListener('submit', onPasswordSubmit);
+  $('btnPwdCancel').addEventListener('click', () => { $('pwdMask').hidden = true; });
+
   $('tabs').addEventListener('click', (event) => {
     const button = event.target.closest('button[data-tab]');
     if (!button) return;
@@ -3867,13 +4197,23 @@ document.addEventListener('DOMContentLoaded', () => {
   window.setInterval(() => {
     if (document.visibilityState === 'visible') loadDeviceStatus();
   }, 60000);
-  // 首次访问且服务端已注入连接信息时直接连上，省掉手动点一次按钮。
-  // 手动填过令牌但没点「连接」的，也自动拉一次：套餐 / 源 / 终端页本来就不需要
-  // 先「加载设备文档」，让用户先点一次纯属多余。
-  if (autoConnect) {
+  // 启动顺序：有会话 → 直接连接加载；旧部署注入了令牌 → 照旧直连；都没有 → 登录框。
+  // 未登录时一个业务请求都不发（会话过期时每个页签都会 401，那串红字没有意义）。
+  if (savedSession()) {
+    restoreSession();
+  } else if (autoConnect) {
+    hideLogin();
     reloadAll();
   } else {
     syncConnection();
-    if (state.base && state.token) reloadAll();
+    if (state.base && state.token) {
+      // 本机填过令牌（升级前一直这么用）：保持自动连接，不因改版把人挡在门外。
+      state.authMode = 'token';
+      hideLogin();
+      syncAccountBar();
+      reloadAll();
+    } else {
+      showLogin();
+    }
   }
 });

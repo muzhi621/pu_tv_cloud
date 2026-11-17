@@ -36,7 +36,7 @@ const ACTIONS = new Set([
 
 export async function onRequestGet(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'read');
+    await requireAuth(request, env, 'read');
     const [devices, blocked] = await Promise.all([listDevices(env), listBlocked(env)]);
     return send({
       env, request, status: 200,
@@ -139,7 +139,7 @@ async function runAction(env, action, id, body) {
 
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
     const action = String(body.action || '').trim();
     if (!ACTIONS.has(action)) {

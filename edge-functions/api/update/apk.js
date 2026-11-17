@@ -88,7 +88,7 @@ export async function onRequestGet(context) {
 
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
-    requireAuth(request, env, 'write');
+    await requireAuth(request, env, 'write');
     const body = await readJsonBody(request);
     const action = String(body.action || '').trim();
 
