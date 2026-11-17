@@ -818,9 +818,14 @@ function newLibraryId(kind) {
   return id;
 }
 
-/** 连接参数以输入框为准：单独刷新资源库时也要先同步，否则会用到旧令牌。 */
+/** 连接参数：地址固定同源，只有令牌输入框（高级兜底）还在页面上。 */
 function syncConnection() {
-  state.base = $('apiBase').value.trim();
+  // 编辑器与 API 永远同源部署（/api/* 就在本站路径下），所以不再让人手填地址：
+  // 多一个输入框只会让人填错域名、或把「连接并加载」误解成需要额外一步。
+  const baseInput = $('apiBase');
+  const typed = baseInput ? baseInput.value.trim() : '';
+  if (typed) state.base = typed.replace(/\/$/, '');
+  if (!state.base) state.base = window.location.origin;
   // 会话模式下令牌不在输入框里：会话令牌由登录流程直接写进 state，
   // 这里若照旧用输入框覆盖，会把登录态清成空串（登录成功却立刻 401）。
   if (state.authMode === 'session') return;
@@ -3685,7 +3690,8 @@ async function ensureRemoteData(tab) {
  */
 async function reloadAll() {
   syncConnection();
-  if (!state.base) { message('请先填写 API 地址（留空表示同源部署）。', 'err'); return; }
+  // 地址固定同源，不会为空；保留兜底只为兼容旧代码路径。
+  if (!state.base) state.base = window.location.origin;
   localStorage.setItem('purelive_config_base', state.base);
   if (state.authMode === 'session') {
     saveSession();
@@ -3995,14 +4001,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const hasSaved = saved.base !== null || saved.token !== null || saved.writeToken !== null;
   let autoConnect = false;
   if (injected && !hasSaved) {
-    $('apiBase').value = injected.base || '';
-    $('apiToken').value = injected.readToken || '';
-    $('apiWriteToken').value = injected.writeToken || '';
+    // 地址不再有输入框：注入值只用于兼容「API 与编辑器不同源」的老部署。
+    state.base = (injected.base || window.location.origin).replace(/\/$/, '');
+    if ($('apiToken')) $('apiToken').value = injected.readToken || '';
+    if ($('apiWriteToken')) $('apiWriteToken').value = injected.writeToken || '';
     autoConnect = !!injected.autoConnect && !!injected.readToken;
   } else {
-    $('apiBase').value = saved.base || '';
-    $('apiToken').value = saved.token || '';
-    $('apiWriteToken').value = saved.writeToken || '';
+    state.base = (saved.base || window.location.origin).replace(/\/$/, '');
+    if ($('apiToken')) $('apiToken').value = saved.token || '';
+    if ($('apiWriteToken')) $('apiWriteToken').value = saved.writeToken || '';
   }
 
   // 「连接」现在只做一件事：把与终端无关的四份数据（目录 / 设备 / 资源库 / 套餐库）拉一次。
