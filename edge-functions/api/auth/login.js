@@ -13,6 +13,22 @@ import {
 
 export const onRequestOptions = optionsHandler;
 
+/**
+ * 给每个阶段打标：鉴权链路上每一步都可能因为运行时差异失败（KV 写入、
+ * WebCrypto、会话表），而 handle() 只把原始 message 透出来，线上看到
+ * 「Param Invalid」这类平台文案时无法判断出在哪一步。抛错时带上阶段名，
+ * 原始错误仍写进函数日志。
+ */
+async function step(name, run) {
+  try {
+    return await run();
+  } catch (error) {
+    console.error(`auth/login failed at ${name}:`, error);
+    const detail = (error && error.message) || String(error);
+    throw new Error(`${name}: ${detail}`);
+  }
+}
+
 export async function onRequestPost(context) {
   return handle(context, async ({ env, request }) => {
     const body = await readJsonBody(request);
@@ -23,7 +39,7 @@ export async function onRequestPost(context) {
     }
 
     // 锁定期间连密码都不校验：否则「锁定」只是让人多等几次而已。
-    const guard = await guardState(env);
+    const guard = await step('guard', () => guardState(env));
     if (guard.locked) {
       throw new HttpError(
         429, 'too_many_attempts',
@@ -32,7 +48,7 @@ export async function onRequestPost(context) {
       );
     }
 
-    const account = await loadAccount(env);
+    const account = await step('account', () => loadAccount(env));
     if (!account) {
       throw new HttpError(
         503, 'auth_not_initialized',
@@ -44,16 +60,16 @@ export async function onRequestPost(context) {
     // 两个条件都要算完再判断：账号错时也走完整的 PBKDF2，否则「账号是否存在」
     // 能通过响应时间看出来。
     const userOk = safeEqual(username, account.user);
-    const passOk = await verifyPassword(account, password);
+    const passOk = await step('verify', () => verifyPassword(account, password));
     if (!userOk || !passOk) {
-      const result = await noteLoginFailure(env);
+      const result = await step('guard-fail', () => noteLoginFailure(env));
       throw new HttpError(401, 'unauthorized', '账号或密码不正确', {
         remainingAttempts: result.locked ? 0 : Math.max(0, AUTH_LIMITS.maxGuardFails - result.fails),
       });
     }
 
-    await clearLoginFailures(env);
-    const session = await createSession(env, account);
+    await step('guard-clear', () => clearLoginFailures(env));
+    const session = await step('session', () => createSession(env, account));
     return send({
       env, request, status: 200,
       body: {
