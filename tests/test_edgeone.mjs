@@ -44,6 +44,9 @@ import {
 import {
   onRequestGet as manifestGet, onRequestPost as manifestPost,
 } from '../edge-functions/api/update/manifest.js';
+import {
+  onRequestGet as apkGet, onRequestPost as apkPost, looksLikeApk,
+} from '../edge-functions/api/update/apk.js';
 import { normalizeUploadedManifest } from '../edge-functions/_lib/update.js';
 
 class MemoryKV {
@@ -411,16 +414,46 @@ test('EdgeOne 配置服务完整流程', async (t) => {
   });
 });
 
-/** 模拟 @edgeone/pages-blob 的 Store：get(key,{type}) / set(key,value)。 */
+/** 模拟 @edgeone/pages-blob 的 Store：get(key,{type}) / set(key,value) / createUploadUrl。 */
 class MemoryBlob {
-  constructor() { this.map = new Map(); }
+  constructor() {
+    this.map = new Map();
+    this.presigned = [];
+  }
+
   async get(key, options = {}) {
     const value = this.map.get(key);
     if (value === undefined) return null;
-    return options.type === 'json' ? JSON.parse(value) : value;
+    const type = options.type || 'text';
+    if (type === 'json') return JSON.parse(value);
+    const bytes = value instanceof Uint8Array ? value : new TextEncoder().encode(String(value));
+    if (type === 'arrayBuffer') {
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    }
+    if (type === 'stream') {
+      return new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+    }
+    return value instanceof Uint8Array ? new TextDecoder().decode(value) : value;
   }
-  async set(key, value) { this.map.set(key, String(value)); }
+
+  async set(key, value) { this.map.set(key, value); }
+
   async delete(key) { this.map.delete(key); }
+
+  /** 预签名上传：真实 SDK 会返回一个可直接 PUT 的 url，这里只记录并回一个假地址。 */
+  async createUploadUrl(key, options = {}) {
+    this.presigned.push({ key, options });
+    return {
+      url: `https://blob.example.invalid/put/${key}`,
+      key,
+      expiresAt: Math.floor(Date.now() / 1000) + (options.expireSeconds || 3600),
+    };
+  }
 }
 
 test('KV 缺失时自动回退 Blob 后端', async (t) => {
@@ -2742,5 +2775,137 @@ test('更新源与上传清单：来源可配、按架构直链、清单可上�
     assert.equal(bad.status, 400);
     const still = await json(await manifestGet(ctx('GET', '/api/update/manifest')));
     assert.equal(still.version, '3.0.42');
+  });
+});
+
+test('在线更新：APK 直传 Blob、完工校验、公开下载', async (t) => {
+  const blob = new MemoryBlob();
+  const saved = globalThis.__PURETV_BLOB_STORE__;
+  globalThis.__PURETV_BLOB_STORE__ = blob;
+  t.after(() => {
+    if (saved === undefined) delete globalThis.__PURETV_BLOB_STORE__;
+    else globalThis.__PURETV_BLOB_STORE__ = saved;
+  });
+  const env = { CONFIG_READ_TOKEN: 'r', CONFIG_WRITE_TOKEN: 'w' };
+  const write = { Authorization: 'Bearer w' };
+  // 只校验 zip 魔数，所以一个 10 字节的假包就够走完流程。
+  const apkBytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4, 5, 6]);
+  const key = 'apk/fedcba9876543210/arm64-v8a.apk';
+
+  await t.test('契约：资源库版本条目与 update 节的目标版本', () => {
+    const [lib, warnings] = normalizeLibrary({
+      updates: [
+        { version: '3.0.43', urls: { 'arm64-v8a': 'https://cdn.example.com/a.apk' } },
+        { version: '3.0.44' },
+        { version: 'latest' },
+        { version: '3.0.45', files: { 'arm64-v8a': { key: 'apk/../../evil.apk' } } },
+      ],
+    });
+    assert.equal(lib.updates.length, 1, '无包无链、版本号非法、key 非法的条目都要丢掉');
+    assert.equal(lib.updates[0].versionNum, 130043, 'versionNum 缺省按 3.0.43→130043 推导');
+    assert.equal(lib.updates[0].id.length, 11, '缺省 id 自动补 up_ + 8 位十六进制');
+    assert.ok(warnings.some((w) => w.includes('既没有安装包也没有下载链接')));
+    assert.ok(warnings.some((w) => w.includes('key 非法')));
+
+    const [sec, pinWarnings] = normalizeSections({
+      update: {
+        version: '3.0.43',
+        updateId: 'up_1a2b3c4d',
+        downloads: { 'arm64-v8a': 'https://cdn.example.com/a.apk' },
+      },
+    });
+    assert.equal(sec.update.version, '3.0.43');
+    assert.equal(sec.update.versionNum, 130043);
+    assert.equal(sec.update.updateId, 'up_1a2b3c4d');
+    assert.equal(pinWarnings.some((w) => w.includes('下不动')), false, '配了直链就不该告警');
+
+    assert.throws(() => normalizeSections({ update: { version: 'latest' } }), /update\.version/);
+    const [, bare] = normalizeSections({ update: { version: '3.0.43' } });
+    assert.ok(bare.some((w) => w.includes('下不动')), '指定版本却没有下载地址必须提示');
+    const [cleared] = normalizeSections({ update: { updateId: 'evil' } });
+    assert.equal(cleared.update.updateId, '', '非法引用直接清空，别让编辑器回显幽灵条目');
+    assert.equal(cleared.update.version, '', '不指定版本时维持原来的「查云端清单」');
+  });
+
+  await t.test('APK 魔数识别', () => {
+    assert.equal(looksLikeApk(apkBytes), true);
+    assert.equal(looksLikeApk(new Uint8Array([0x50, 0x4b, 0x05, 0x06])), true, '空 zip 也算 APK');
+    assert.equal(looksLikeApk(new TextEncoder().encode('<html>')), false);
+    assert.equal(looksLikeApk(new Uint8Array([0x50, 0x4b])), false, '不足 4 字节不能当成本地文件头');
+  });
+
+  await t.test('签名上传地址：要写令牌、只认 arm64-v8a / armeabi-v7a', async () => {
+    const denied = await apkPost(ctx('POST', '/api/update/apk', {
+      env, body: { action: 'sign', abi: 'arm64-v8a' },
+    }));
+    assert.equal(denied.status, 401, '发预签名地址等于发写权限，必须鉴权');
+
+    const badAbi = await apkPost(ctx('POST', '/api/update/apk', {
+      env, headers: write, body: { action: 'sign', abi: 'x86_64' },
+    }));
+    assert.equal(badAbi.status, 400);
+
+    const ok = await apkPost(ctx('POST', '/api/update/apk', {
+      env, headers: write, body: { action: 'sign', abi: 'arm64-v8a' },
+    }));
+    assert.equal(ok.status, 200);
+    const data = await json(ok);
+    assert.match(data.key, /^apk\/[0-9a-f]{16}\/arm64-v8a\.apk$/, 'key 必须由服务端生成');
+    assert.ok(data.uploadUrl.startsWith('https://'), '预签名地址必须是 https');
+    assert.equal(blob.presigned.length, 1, '应真的向 Blob SDK 申请了一次上传地址');
+    assert.equal(blob.presigned[0].key, data.key);
+  });
+
+  await t.test('完工校验：非 APK 拒收并删除，合法包回 size 与 sha256', async () => {
+    const htmlKey = 'apk/0123456789abcdef/arm64-v8a.apk';
+    blob.map.set(htmlKey, new TextEncoder().encode('<html>not an apk</html>'));
+    const bad = await apkPost(ctx('POST', '/api/update/apk', {
+      env, headers: write, body: { action: 'finish', key: htmlKey },
+    }));
+    assert.equal(bad.status, 400);
+    assert.equal(blob.map.has(htmlKey), false, '非 APK 不能留在 Blob 里白占额度');
+
+    blob.map.set(key, apkBytes);
+    const ok = await apkPost(ctx('POST', '/api/update/apk', {
+      env, headers: write, body: { action: 'finish', key },
+    }));
+    assert.equal(ok.status, 200);
+    const data = await json(ok);
+    assert.equal(data.size, apkBytes.byteLength);
+    assert.match(data.sha256, /^[0-9a-f]{64}$/);
+    // 与 Web Crypto 独立算一次，确认摘要不是随手拼的
+    const digest = await crypto.subtle.digest('SHA-256', apkBytes);
+    const expect = Array.prototype.map.call(
+      new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0'),
+    ).join('');
+    assert.equal(data.sha256, expect);
+  });
+
+  await t.test('公开下载：路径穿越 400、不存在 404、正常回 APK 类型', async () => {
+    const traversal = await apkGet(ctx('GET', '/api/update/apk?key='
+      + encodeURIComponent('../secret.txt')));
+    assert.equal(traversal.status, 400, 'key 会拼进对象存储键路径，必须白名单校验');
+
+    const missing = await apkGet(ctx('GET', '/api/update/apk?key='
+      + encodeURIComponent('apk/0123456789abcdef/arm64-v8a.apk')));
+    assert.equal(missing.status, 404);
+
+    const ok = await apkGet(ctx('GET', '/api/update/apk?key=' + encodeURIComponent(key)));
+    assert.equal(ok.status, 200, '终端下载装包带不了 Bearer，必须公开可读');
+    assert.equal(ok.headers.get('content-type'), 'application/vnd.android.package-archive');
+    assert.equal(ok.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(ok.headers.get('cache-control'), /immutable/);
+    const body = new Uint8Array(await ok.arrayBuffer());
+    assert.deepEqual(Array.from(body.slice(0, 4)), [0x50, 0x4b, 0x03, 0x04]);
+  });
+
+  await t.test('删除上传：清理已换掉的旧包', async () => {
+    const del = await apkPost(ctx('POST', '/api/update/apk', {
+      env, headers: write, body: { action: 'delete', key },
+    }));
+    assert.equal(del.status, 200);
+    assert.equal(blob.map.has(key), false);
+    const gone = await apkGet(ctx('GET', '/api/update/apk?key=' + encodeURIComponent(key)));
+    assert.equal(gone.status, 404);
   });
 });

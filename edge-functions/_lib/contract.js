@@ -117,6 +117,20 @@ const LIB_PACKAGE_ID_RE = /^pkg_[0-9a-f]{8}$/;
 const LIB_VOD_SOURCE_ID_RE = /^vs_[0-9a-f]{8}$/;
 /** TVBox 站点 id = `${sourceId}:${key}`，会作为设备 vod.siteIds 的引用值。 */
 const VOD_SITE_ID_RE = /^[A-Za-z0-9_:-]{1,96}$/;
+/** 「在线更新版本」库条目的 id，设备侧 sections.update.updateId 引用它。 */
+const LIB_UPDATE_ID_RE = /^up_[0-9a-f]{8}$/;
+
+/**
+ * 上传 APK 的 Blob key 由服务端生成，不接受客户端自定义。
+ *
+ * 这里再做一次白名单校验：只要它能被配置写进来，就会拼进 `store.get(key)`，
+ * 放开格式等于把对象存储的键空间交给不可信输入（`../` 之类）。
+ */
+export const APK_KEY_RE = /^apk\/[0-9a-f]{16}\/(arm64-v8a|armeabi-v7a)\.apk$/;
+/** 单个 APK 上限 200 MB：再大就不是手机安装包了，也是防误传的兜底。 */
+export const MAX_APK_BYTES = 200 * 1024 * 1024;
+/** 在线更新版本最多保留这么多条（每条最多两个 APK，按 Blob 1 GB 额度也够用）。 */
+export const MAX_LIBRARY_UPDATES = 30;
 
 const VALID_MENU_IDS = CATALOG.menus.map((item) => item.id);
 
@@ -532,6 +546,20 @@ function normalizeUpdate(part, warnings) {
     throw new ConfigError('update.minSupportedVersion 格式应为 3.0.7 这样的数字点分版本');
   }
   base.minSupportedVersion = version;
+  // 套餐指定的「目标版本」：资源库里挑一条在线更新版本，保存套餐时展开写在这里。
+  // 填了它终端就不必再问云端清单——配置本身就说明了该升到哪一版、从哪下载，
+  // 这也是「按套餐分配不同固件」的实现方式。留空则维持原来的「查云端清单」。
+  const pinned = str(part.version, '', 'update.version', 32);
+  if (pinned && !VERSION_RE.test(pinned)) {
+    throw new ConfigError('update.version 格式应为 3.0.43 这样的数字点分版本');
+  }
+  base.version = pinned;
+  base.versionNum = pinned
+    ? lenientInt(part.versionNum, flattenVersion(pinned), 0, 99999999) : 0;
+  base.versionDesc = str(part.versionDesc, '', 'update.versionDesc', 2000);
+  // 引用来源，仅供编辑器回显「当前选的是哪条版本」；终端不读它。
+  base.updateId = str(part.updateId, '', 'update.updateId', 40) || '';
+  if (base.updateId && !LIB_UPDATE_ID_RE.test(base.updateId)) base.updateId = '';
   base.allowPrerelease = bool(part.allowPrerelease, base.allowPrerelease, 'update.allowPrerelease');
   base.allowUserOverride = bool(part.allowUserOverride, base.allowUserOverride, 'update.allowUserOverride');
   // 更新清单来源（cloud/github/mirror/custom/upload），语义见 schema.py。
@@ -568,6 +596,11 @@ function normalizeUpdate(part, warnings) {
   if ('changelogI18n' in part) base.changelogI18n = i18n(part.changelogI18n, 'update.changelogI18n');
   if (base.prompt === 'force') {
     warnings.push('update.prompt=force 会阻断旧版本使用，请确认已配置可用下载地址');
+  }
+  // 套餐指定了目标版本却没给下载地址：终端会显示「有新版本」却下不动。
+  // 必须放在 downloads 赋值之后判断，否则读到的是 seed 的默认值。
+  if (base.version && !Object.values(base.downloads).some(Boolean)) {
+    warnings.push(`update.version=${base.version} 但没有任何架构的下载地址，终端会提示有新版却下不动`);
   }
   if (base.source === 'mirror' && !base.mirrorPrefix) {
     warnings.push('update.source=mirror 但未填反代前缀，终端会回落到云端清单');
@@ -1124,6 +1157,10 @@ export function emptyLibrary() {
     updatedAt: '',
     iptv: { sources: [], packages: [], epgUrl: '' },
     vod: { sources: [], sites: [] },
+    // 在线更新版本：与 IPTV 源、TVBox 源并列的第三类资源。
+    // 套餐里选定一条后展开写入设备文档的 sections.update（版本号 + 按架构直链），
+    // 终端据此判定「有新版本」并直接从该地址下载。
+    updates: [],
   };
 }
 
@@ -1363,6 +1400,104 @@ function normalizeLibraryVod(part, warnings) {
 }
 
 /** 校验并规范化整库（PUT /api/library 用）。返回 [library, warnings]。 */
+/**
+ * `3.0.43` → `130043`，与 update.js 的 flattenVersion 同一套规则：
+ * 100000 的产品位 + major*10000 + minor*100 + patch。
+ */
+function flattenVersion(version) {
+  const parts = String(version || '').split('.').map((part) => Number.parseInt(part, 10));
+  if (!parts.length || !Number.isFinite(parts[0])) return 0;
+  const [major, minor = 0, patch = 0] = parts;
+  return 100000 + major * 10000 + minor * 100 + patch;
+}
+
+/** sha256 只收 64 位小写十六进制；不合法就当没填（终端会退化为大小校验）。 */
+function sha256Hex(value) {
+  const text = String(value == null ? '' : value).trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(text) ? text : '';
+}
+
+/**
+ * 规范化「在线更新版本」列表。
+ *
+ * 每条版本的安装包有两种来源，可以按架构混用：
+ *   - urls[abi]：用户自己填的直链（CDN / 网盘），云端零存储；
+ *   - files[abi]：编辑器上传到 Blob 的安装包，key 由服务端生成（APK_KEY_RE 白名单）。
+ *
+ * 两者都没有的条目直接丢弃——留着只会让套餐选到它之后终端毫无反应。
+ */
+function normalizeLibraryUpdates(part, warnings) {
+  const list = part === undefined || part === null ? [] : part;
+  if (!Array.isArray(list)) throw new ConfigError('library.updates 必须是数组');
+  if (list.length > MAX_LIBRARY_UPDATES) {
+    warnings.push(`library.updates: 超过 ${MAX_LIBRARY_UPDATES} 个上限，已截断`);
+  }
+  const taken = new Set();
+  const out = [];
+  for (const entry of list.slice(0, MAX_LIBRARY_UPDATES)) {
+    const item = libraryItem(entry, 'library.updates', warnings);
+    if (!item) continue;
+    let id = libraryId(item, 'up_', LIB_UPDATE_ID_RE, 'library.updates');
+    if (!id) id = randomLibraryId('up_', taken);
+    if (taken.has(id)) {
+      warnings.push(`library.updates: 忽略重复的版本 id ${id}`);
+      continue;
+    }
+    const version = str(item.version, '', 'library.updates.version', 32);
+    if (!version || !VERSION_RE.test(version)) {
+      warnings.push(`library.updates: 忽略版本号不合法的条目（${version || '空'}），应为 3.0.43 这样的格式`);
+      continue;
+    }
+    taken.add(id);
+
+    const rawUrls = item.urls && typeof item.urls === 'object' && !Array.isArray(item.urls)
+      ? item.urls : {};
+    const rawFiles = item.files && typeof item.files === 'object' && !Array.isArray(item.files)
+      ? item.files : {};
+    const urls = {};
+    const files = {};
+    for (const abi of UPDATE_ABIS) {
+      const url = str(rawUrls[abi], '', `library.updates.urls.${abi}`, 500);
+      if (url && !URL_RE.test(url)) {
+        warnings.push(`library.updates ${id}: ${abi} 的地址不是 http(s)，已忽略`);
+        urls[abi] = '';
+      } else {
+        urls[abi] = url;
+      }
+      const file = rawFiles[abi];
+      if (!file || typeof file !== 'object' || Array.isArray(file)) continue;
+      const key = str(file.key, '', `library.updates.files.${abi}.key`, 200);
+      if (!APK_KEY_RE.test(key)) {
+        warnings.push(`library.updates ${id}: ${abi} 的上传文件 key 非法，已忽略`);
+        continue;
+      }
+      files[abi] = {
+        key,
+        name: str(file.name, '', `library.updates.files.${abi}.name`, 120),
+        size: lenientInt(file.size, 0, 0, MAX_APK_BYTES),
+        sha256: sha256Hex(file.sha256),
+      };
+    }
+    if (!UPDATE_ABIS.some((abi) => urls[abi] || files[abi])) {
+      warnings.push(`library.updates: 忽略既没有安装包也没有下载链接的版本 v${version}`);
+      continue;
+    }
+    out.push({
+      id,
+      name: str(item.name, '', 'library.updates.name', 64) || `v${version}`,
+      version,
+      versionNum: lenientInt(item.versionNum, flattenVersion(version), 0, 99999999),
+      desc: str(item.desc, '', 'library.updates.desc', 2000),
+      prerelease: bool(item.prerelease, false, 'library.updates.prerelease'),
+      urls,
+      files,
+      enabled: bool(item.enabled, true, 'library.updates.enabled'),
+      addedAt: str(item.addedAt, nowIso(), 'library.updates.addedAt', 40),
+    });
+  }
+  return out;
+}
+
 export function normalizeLibrary(raw) {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new ConfigError('资源库文档必须是对象');
@@ -1375,6 +1510,7 @@ export function normalizeLibrary(raw) {
       updatedAt: '',
       iptv: normalizeLibraryIptv(raw.iptv, warnings),
       vod: normalizeLibraryVod(raw.vod, warnings),
+      updates: normalizeLibraryUpdates(raw.updates, warnings),
     },
     warnings,
   ];

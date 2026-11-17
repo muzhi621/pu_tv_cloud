@@ -671,3 +671,44 @@ export async function writeUpdateManifest(env, manifest, name = '') {
   await db.put(KEY_UPDATE_MANIFEST, JSON.stringify(record));
   return record;
 }
+
+/* ================= 上传的安装包（APK） ================= */
+
+/**
+ * APK 以原始字节存 Blob，**不走 getJSON**。
+ *
+ * 为什么不放 KV：KV 单值上限 25 MB，而我们的安装包就在这个量级；再套一层
+ * base64 还要膨胀 33%，塞不进去。Blob 支持 ArrayBuffer / ReadableStream
+ * 直存直取，也不需要把二进制塞进 JSON。
+ *
+ * 也不能走 backend()：那条路在 KV 可用时会选 KV（配置只有几十 KB，用 KV 更快），
+ * 但 APK 必须落在 Blob 上，所以这里直接取 Blob store，与 CONFIG_STORAGE 无关。
+ */
+export async function apkStore(env) {
+  return blobStore(env);
+}
+
+/** 写入一个安装包对象。body 可以是 ArrayBuffer / ReadableStream。 */
+export async function putApk(env, key, body) {
+  const store = await apkStore(env);
+  await store.set(key, body);
+  return key;
+}
+
+/** 读取安装包原始字节（算摘要、校验魔数用）。 */
+export async function readApkBytes(env, key) {
+  const store = await apkStore(env);
+  const value = await store.get(key, { type: 'arrayBuffer', consistency: 'strong' });
+  return value || null;
+}
+
+/** 打开安装包流（下载用）：不必把 25 MB 全读进内存。 */
+export async function openApkStream(env, key) {
+  const store = await apkStore(env);
+  return (await store.get(key, { type: 'stream' })) || null;
+}
+
+export async function deleteApk(env, key) {
+  const store = await apkStore(env);
+  await store.delete(key);
+}

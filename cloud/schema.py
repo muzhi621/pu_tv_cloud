@@ -178,10 +178,19 @@ MAX_VOD_SITES = 500
 MAX_VOD_SITES_PER_SOURCE = 200
 MAX_LIBRARY_BYTES = MAX_DOCUMENT_BYTES
 MAX_LIBRARY_REVISION = 1_000_000_000
+# 在线更新版本：每条最多两个 APK，30 条也远低于 Blob 1 GB 额度。
+MAX_LIBRARY_UPDATES = 30
+# 单个 APK 上限 200 MB：再大就不是手机安装包了，也是防误传的兜底。
+MAX_APK_BYTES = 200 * 1024 * 1024
 # 库内 id 由编辑器生成，格式固定，便于设备侧引用时做正则校验。
 _LIB_SOURCE_ID_RE = re.compile(r"^s_[0-9a-f]{8}$")
 _LIB_PACKAGE_ID_RE = re.compile(r"^pkg_[0-9a-f]{8}$")
 _LIB_VOD_SOURCE_ID_RE = re.compile(r"^vs_[0-9a-f]{8}$")
+# 「在线更新版本」id，设备侧 sections.update.updateId 引用它。
+_LIB_UPDATE_ID_RE = re.compile(r"^up_[0-9a-f]{8}$")
+# 上传 APK 的 Blob key 由服务端生成，不接受客户端自定义：它会拼进对象存储的
+# 键路径，放开格式等于把键空间交给不可信输入（`../` 之类）。
+_APK_KEY_RE = re.compile(r"^apk/[0-9a-f]{16}/(arm64-v8a|armeabi-v7a)\.apk$")
 # TVBox 站点 id = `${sourceId}:${key}`，会作为设备 vod.siteIds 的引用值。
 _VOD_SITE_ID_RE = re.compile(r"^[A-Za-z0-9_:-]{1,96}$")
 
@@ -589,6 +598,19 @@ def normalize_update(part: dict, warnings: list[str]) -> dict:
     if version and not _VERSION_RE.match(version):
         raise ConfigError("update.minSupportedVersion 格式应为 3.0.7 这样的数字点分版本")
     base["minSupportedVersion"] = version
+    # 套餐指定的「目标版本」：资源库里挑一条在线更新版本，保存套餐时展开写在这里。
+    # 填了它终端就不必再问云端清单——配置本身就说明了该升到哪一版、从哪下载，
+    # 这也是「按套餐分配不同固件」的实现方式。留空则维持原来的「查云端清单」。
+    pinned = _str(part.get("version"), "", "update.version", 32)
+    if pinned and not _VERSION_RE.match(pinned):
+        raise ConfigError("update.version 格式应为 3.0.43 这样的数字点分版本")
+    base["version"] = pinned
+    base["versionNum"] = (_lenient_int(part.get("versionNum"), _flatten_version(pinned),
+                                       0, 99999999) if pinned else 0)
+    base["versionDesc"] = _str(part.get("versionDesc"), "", "update.versionDesc", 2000)
+    # 引用来源，仅供编辑器回显「当前选的是哪条版本」；终端不读它。
+    update_id = _str(part.get("updateId"), "", "update.updateId", 40)
+    base["updateId"] = update_id if _LIB_UPDATE_ID_RE.match(update_id) else ""
     base["allowPrerelease"] = _bool(part.get("allowPrerelease"), base["allowPrerelease"],
                                     "update.allowPrerelease")
     base["allowUserOverride"] = _bool(part.get("allowUserOverride"),
@@ -635,6 +657,11 @@ def normalize_update(part: dict, warnings: list[str]) -> dict:
         base["changelogI18n"] = _i18n(part["changelogI18n"], "update.changelogI18n")
     if base["prompt"] == "force":
         warnings.append("update.prompt=force 会阻断旧版本使用，请确认已配置可用下载地址")
+    # 套餐指定了目标版本却没给下载地址：终端会显示「有新版本」却下不动。
+    # 必须放在 downloads 赋值之后判断，否则读到的是 seed 的默认值。
+    if base["version"] and not any(base["downloads"].values()):
+        warnings.append("update.version=%s 但没有任何架构的下载地址，终端会提示有新版却下不动"
+                        % base["version"])
     # 配置互相矛盾时给个提示，别让终端默默回落到默认通道。
     if base["source"] == "mirror" and not prefix:
         warnings.append("update.source=mirror 但未填反代前缀，终端会回落到云端清单")
@@ -1282,6 +1309,108 @@ def _normalize_library_vod(part: Any, warnings: list[str]) -> dict:
     return out
 
 
+def _flatten_version(version: str) -> int:
+    """`3.0.43` → `130043`：100000 的产品位 + major*10000 + minor*100 + patch。
+
+    与 Edge Functions 版 contract.js / update.js 的 flattenVersion 一致，
+    少了产品位就会和仓库现有 releases 里的 version_num 对不上。
+    """
+    parts: list[int] = []
+    for chunk in str(version or "").split("."):
+        if not re.fullmatch(r"\d+", chunk.strip()):
+            break
+        parts.append(int(chunk))
+    if not parts:
+        return 0
+    major = parts[0]
+    minor = parts[1] if len(parts) > 1 else 0
+    patch = parts[2] if len(parts) > 2 else 0
+    return 100000 + major * 10000 + minor * 100 + patch
+
+
+def _sha256_hex(value: Any) -> str:
+    """sha256 只收 64 位小写十六进制；不合法就当没填（终端会退化为大小校验）。"""
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+
+
+def _normalize_library_updates(part: Any, warnings: list[str]) -> list[dict]:
+    """规范化「在线更新版本」列表。
+
+    每条版本的安装包有两种来源，可以按架构混用：
+      - urls[abi]：用户自己填的直链（CDN / 网盘），云端零存储；
+      - files[abi]：编辑器上传到 Blob 的安装包，key 由服务端生成（_APK_KEY_RE 白名单）。
+    两者都没有的条目直接丢弃——留着只会让套餐选到它之后终端毫无反应。
+    """
+    raw = [] if part is None else part
+    if not isinstance(raw, list):
+        raise ConfigError("library.updates 必须是数组")
+    if len(raw) > MAX_LIBRARY_UPDATES:
+        warnings.append("library.updates: 超过 %d 个上限，已截断" % MAX_LIBRARY_UPDATES)
+    taken: set[str] = set()
+    out: list[dict] = []
+    for entry in raw[:MAX_LIBRARY_UPDATES]:
+        item = _library_item(entry, "library.updates", warnings)
+        if item is None:
+            continue
+        item_id = _library_id(item, _LIB_UPDATE_ID_RE, "up_", "library.updates")
+        if not item_id:
+            item_id = _new_library_id("up_", taken)
+        if item_id in taken:
+            warnings.append("library.updates: 忽略重复的版本 id %s" % item_id)
+            continue
+        version = _str(item.get("version"), "", "library.updates.version", 32)
+        if not version or not _VERSION_RE.match(version):
+            warnings.append("library.updates: 忽略版本号不合法的条目（%s），应为 3.0.43 这样的格式"
+                            % (version or "空"))
+            continue
+        taken.add(item_id)
+
+        raw_urls = item.get("urls") if isinstance(item.get("urls"), dict) else {}
+        raw_files = item.get("files") if isinstance(item.get("files"), dict) else {}
+        urls: dict[str, str] = {}
+        files: dict[str, dict] = {}
+        for abi in UPDATE_ABIS:
+            url = _str(raw_urls.get(abi), "", "library.updates.urls.%s" % abi, 500)
+            if url and not _URL_RE.match(url):
+                warnings.append("library.updates %s: %s 的地址不是 http(s)，已忽略"
+                                % (item_id, abi))
+                urls[abi] = ""
+            else:
+                urls[abi] = url
+            file = raw_files.get(abi)
+            if not isinstance(file, dict):
+                continue
+            key = _str(file.get("key"), "", "library.updates.files.%s.key" % abi, 200)
+            if not _APK_KEY_RE.match(key):
+                warnings.append("library.updates %s: %s 的上传文件 key 非法，已忽略"
+                                % (item_id, abi))
+                continue
+            files[abi] = {
+                "key": key,
+                "name": _str(file.get("name"), "", "library.updates.files.%s.name" % abi, 120),
+                "size": _lenient_int(file.get("size"), 0, 0, MAX_APK_BYTES),
+                "sha256": _sha256_hex(file.get("sha256")),
+            }
+        if not any(urls.get(abi) or files.get(abi) for abi in UPDATE_ABIS):
+            warnings.append("library.updates: 忽略既没有安装包也没有下载链接的版本 v%s" % version)
+            continue
+        out.append({
+            "id": item_id,
+            "name": _str(item.get("name"), "", "library.updates.name", 64) or ("v" + version),
+            "version": version,
+            "versionNum": _lenient_int(item.get("versionNum"), _flatten_version(version),
+                                       0, 99999999),
+            "desc": _str(item.get("desc"), "", "library.updates.desc", 2000),
+            "prerelease": _bool(item.get("prerelease"), False, "library.updates.prerelease"),
+            "urls": urls,
+            "files": files,
+            "enabled": _bool(item.get("enabled"), True, "library.updates.enabled"),
+            "addedAt": _str(item.get("addedAt"), now_iso(), "library.updates.addedAt", 40),
+        })
+    return out
+
+
 def empty_library() -> dict:
     """空库：GET /api/library 在没有写过库时也返回结构完整的文档（revision 0）。"""
     return {
@@ -1290,6 +1419,10 @@ def empty_library() -> dict:
         "updatedAt": "",
         "iptv": {"sources": [], "packages": [], "epgUrl": ""},
         "vod": {"sources": [], "sites": []},
+        # 在线更新版本：与 IPTV 源、TVBox 源并列的第三类资源。
+        # 套餐里选定一条后展开写入设备文档的 sections.update（版本号 + 按架构直链），
+        # 终端据此判定「有新版本」并直接从该地址下载。
+        "updates": [],
     }
 
 
@@ -1307,6 +1440,7 @@ def normalize_library(raw: Any) -> tuple[dict, list[str]]:
         "updatedAt": "",
         "iptv": _normalize_library_iptv(raw.get("iptv"), warnings),
         "vod": _normalize_library_vod(raw.get("vod"), warnings),
+        "updates": _normalize_library_updates(raw.get("updates"), warnings),
     }
     return library, warnings
 

@@ -1070,5 +1070,92 @@ class SpiderFieldTests(unittest.TestCase):
         self.assertEqual(source["spiderFlavor"], "fongmi")
 
 
+class OnlineUpdateLibraryTests(unittest.TestCase):
+    """在线更新版本库：与 IPTV 源、TVBox 源并列的第三类资源。"""
+
+    def test_empty_library_has_updates(self):
+        self.assertEqual(empty_library()["updates"], [])
+
+    def test_version_entry_keeps_links_and_files(self):
+        library, warnings = normalize_library({"updates": [{
+            "version": "3.0.43",
+            "name": "3.0.43 正式版",
+            "urls": {"arm64-v8a": "https://cdn.example.com/a.apk"},
+            "files": {"armeabi-v7a": {
+                "key": "apk/0123456789abcdef/armeabi-v7a.apk",
+                "name": "SUTV-armv7.apk",
+                "size": 1024,
+                "sha256": "A" * 64,
+            }},
+        }]})
+        item = library["updates"][0]
+        self.assertEqual(item["version"], "3.0.43")
+        self.assertEqual(item["versionNum"], 130043, "缺省按带产品位规则推导")
+        self.assertEqual(item["name"], "3.0.43 正式版")
+        self.assertEqual(item["urls"]["arm64-v8a"], "https://cdn.example.com/a.apk")
+        self.assertEqual(item["files"]["armeabi-v7a"]["size"], 1024)
+        self.assertEqual(item["files"]["armeabi-v7a"]["sha256"], "a" * 64, "摘要统一小写")
+        self.assertTrue(item["enabled"])
+        self.assertEqual(warnings, [])
+
+    def test_entry_without_apk_is_dropped(self):
+        library, warnings = normalize_library({"updates": [
+            {"version": "3.0.44"},
+            {"version": "latest"},
+            {"version": "3.0.45", "files": {
+                "arm64-v8a": {"key": "apk/../../evil.apk"}}},
+            {"version": "3.0.46", "urls": {"arm64-v8a": "ftp://x/a.apk"}},
+        ]})
+        self.assertEqual(library["updates"], [])
+        joined = " ".join(warnings)
+        self.assertIn("既没有安装包也没有下载链接", joined)
+        self.assertIn("key 非法", joined)
+        self.assertIn("不是 http(s)", joined)
+
+    def test_illegal_update_id_is_rejected(self):
+        with self.assertRaises(ConfigError):
+            normalize_library({"updates": [
+                {"id": "up_zzzz", "version": "3.0.43",
+                 "urls": {"arm64-v8a": "https://a.example.com/a.apk"}},
+            ]})
+
+
+class PinnedUpdateVersionTests(unittest.TestCase):
+    """套餐指定目标版本：终端据此判定「有新版本」并直接下载。"""
+
+    def test_pinned_version_and_downloads(self):
+        sections, warnings = normalize_sections({"update": {
+            "version": "3.0.43",
+            "updateId": "up_1a2b3c4d",
+            "downloads": {"arm64-v8a": "https://cdn.example.com/a.apk"},
+        }})
+        update = sections["update"]
+        self.assertEqual(update["version"], "3.0.43")
+        self.assertEqual(update["versionNum"], 130043)
+        self.assertEqual(update["updateId"], "up_1a2b3c4d")
+        self.assertEqual(warnings, [], "配了直链就不该告警")
+
+    def test_defaults_stay_empty(self):
+        sections, _ = normalize_sections({"update": {}})
+        update = sections["update"]
+        self.assertEqual(update["version"], "", "不指定版本时维持「查云端清单」")
+        self.assertEqual(update["versionNum"], 0)
+        self.assertEqual(update["updateId"], "")
+
+    def test_illegal_version_raises(self):
+        with self.assertRaises(ConfigError):
+            normalize_sections({"update": {"version": "latest"}})
+
+    def test_pinned_without_downloads_warns(self):
+        _, warnings = normalize_sections({"update": {"version": "3.0.43"}})
+        self.assertTrue(
+            any("下不动" in item for item in warnings),
+            "指定了目标版本却没有下载地址，终端会提示有新版却下不动")
+
+    def test_illegal_update_id_is_cleared(self):
+        sections, _ = normalize_sections({"update": {"updateId": "evil"}})
+        self.assertEqual(sections["update"]["updateId"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

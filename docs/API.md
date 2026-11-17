@@ -50,6 +50,8 @@ Base URL：默认部署为腾讯 EdgeOne Pages 项目域名（见 [DEPLOY_EDGEON
 | GET | `/api/update` | **无需鉴权** | **仅 EdgeOne** | 应用更新清单：云端代取 GitHub Releases（版本号 + APK 资产 + 历史 + 下载镜像），终端不必直连 GitHub |
 | POST | `/api/update/manifest` | write | **仅 EdgeOne** | 上传更新清单（编辑器「更新源 = 上传文件」） |
 | GET | `/api/update/manifest` | **无需鉴权** | **仅 EdgeOne** | 读取上传的更新清单 |
+| POST | `/api/update/apk` | write | **仅 EdgeOne** | 在线更新版本库：签发 APK 直传地址 / 完工校验 / 删除上传 |
+| GET | `/api/update/apk` | **无需鉴权** | **仅 EdgeOne** | 按 key 流式下载安装包（终端装包用） |
 | GET | `/` | 无 | 两端 | 在线编辑器；EdgeOne 版为内联单页并注入连接默认值，FC 版另提供 `/app.js`、`/style.css` 且需手动填令牌 |
 
 ## GET /api/config
@@ -85,6 +87,7 @@ EdgeOne 版由平台 CDN 自动压缩（配置文档仅几 KB，无功能差异�
                  "showSplashPage": true},
     "update": {"managed": true, "autoCheck": true, "checkIntervalHours": 24, "prompt": "dialog",
                "minSupportedVersion": "", "allowPrerelease": false, "allowUserOverride": true,
+               "version": "", "versionNum": 0, "versionDesc": "", "updateId": "",
                "mirrorUrls": [], "changelogI18n": {}},
     "iptv": {"managed": true, "sources": [], "groups": ["央视频道"],
              "channels": [{"name": "CCTV-1", "group": "央视频道", "url": "http://.../1.m3u8", "logo": ""}],
@@ -286,9 +289,31 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
     "sites": [{"id": "vs_1a2b3c4d:csp_X", "sourceId": "vs_1a2b3c4d", "key": "csp_X",
                "name": "测试站点", "api": "csp_X", "ext": "token-abc", "type": 3,
                "searchable": 1, "quickSearch": 0, "note": ""}]
-  }
+  },
+  "updates": [
+    {"id": "up_1a2b3c4d", "name": "3.0.43 正式版",
+     "version": "3.0.43", "versionNum": 130043,
+     "desc": "修复了 X；新增 Y",
+     "prerelease": false, "enabled": true,
+     "urls":  {"arm64-v8a": "https://cdn.example.com/SUTV-arm64.apk", "armeabi-v7a": ""},
+     "files": {"arm64-v8a": null,
+               "armeabi-v7a": {"key": "apk/0123456789abcdef/armeabi-v7a.apk",
+                               "name": "SUTV-armv7.apk", "size": 25983734,
+                               "sha256": "a8379a09…"}},
+     "addedAt": "2026-11-17T09:00:00+08:00"}
+  ]
 }
 ```
+
+`updates` 是**在线更新版本库**，与 IPTV 源、TVBox 源并列的第三类资源。每条版本在
+套餐里被选中后会展开写入设备文档的 `sections.update`（版本号 + 说明 + 按架构直链），
+终端据此认定「有新版本」并直接从该地址下载——按套餐给不同终端分配不同固件就靠它。
+
+- `urls[abi]` 与 `files[abi]` 可**按架构混用**：前者是自己填的直链（CDN/网盘），
+  后者是编辑器上传到 Blob 的安装包。两者都没有的条目会被丢弃（选中了也没东西可下）。
+- `files[abi].key` 只接受服务端生成的 `apk/<16 位十六进制>/<abi>.apk`，不接受自定义
+  路径：它会拼进对象存储的键路径。
+- `versionNum` 缺省按 `3.0.43 → 130043` 推导（与 `version.json` 同一套带产品位的规则）。
 
 ### id 规则
 
@@ -297,6 +322,7 @@ GitHub 镜像。`navigation.settings` 是 P1 预留节，P0 终端不读取。
 | IPTV 源 | `s_` + 8 位十六进制 | 编辑器缺省时由服务端补发 |
 | IPTV 套餐 | `pkg_` + 8 位十六进制 | 同上 |
 | TVBox 源 | `vs_` + 8 位十六进制 | 同上 |
+| 在线更新版本 | `up_` + 8 位十六进制 | 同上；设备侧 `sections.update.updateId` 引用它 |
 | TVBox 站点 | `${sourceId}:${key}`，须匹配 `^[A-Za-z0-9_:-]{1,96}$` | 由 `sourceId` + 站点 key 派生；传入的 id 合法且属于同一源时沿用 |
 
 id 是引用目标，格式错了会静默失效，因此**非法 id 直接 400**（内容问题才走 warnings）。
@@ -335,6 +361,8 @@ TVBox 配置顶层的 `spider` 常见写法是 `"./fty.jar;md5;<hash>"`（FongMi
 | `vod.sources` | 20 | warning + 截断 |
 | `vod.sites` | 500 | warning + 截断 |
 | 单个源下站点 | 200 | warning + 跳过 |
+| `updates`（在线更新版本） | 30 | warning + 截断 |
+| 单个上传 APK | 200 MB | **400** + 删除该对象 |
 | 整库 JSON | 900 KB | **400**（提示精简频道或拆套餐） |
 
 ### GET /api/library
@@ -561,6 +589,23 @@ GitHub，终端只请求自己的域名（和拉配置同一个域名，一定�
 `mirror` 少了前缀、`custom` 少了地址、`upload` 还没传过清单，都会在保存时给出 warning
 （终端会回落到云端清单，不会因此更新失败）。
 
+### 按套餐指定目标版本（`update.version`）
+
+| 字段 | 说明 |
+|---|---|
+| `version` | 目标版本号（`3.0.43`）。**非空时终端不再查清单**，直接用它判定有没有新版 |
+| `versionNum` | 扁平版本号，缺省由 `version` 推导（`3.0.43 → 130043`） |
+| `versionDesc` | 更新说明，终端更新弹窗里显示 |
+| `updateId` | 引用的在线更新版本 id（`up_xxxxxxxx`），仅供编辑器回显；终端不读 |
+
+`version` 与 `downloads` 由编辑器在套餐里选定版本时**一起展开写入**：选了哪条版本，
+这一节就带上那一版的版本号、说明与按架构直链。终端拿到配置即认定「该升到这一版」，
+下载走 `downloads`，整条链路不依赖 GitHub，也不依赖云端清单。
+
+不填 `version` 时维持原来的「按 `source` 查清单」行为，`versionNum` 为 0、`updateId` 为空。
+填了 `version` 却没有任何架构的下载地址会在保存时 warning——终端会提示有新版本却下不动。
+
+
 ## GET / POST /api/update/manifest（仅 EdgeOne）
 
 编辑器「更新源 = 上传文件」的清单存放点：把一份 `version.json` 形状的 JSON 传到云端，
@@ -589,6 +634,42 @@ GitHub，终端只请求自己的域名（和拉配置同一个域名，一定�
 
 只存一份「当前生效的清单」，重新上传即覆盖；它不进配置文档，也不占 revision 历史
 （清单可能几十 KB，塞进配置会让每次 GET 都变重）。
+
+## GET / POST /api/update/apk（仅 EdgeOne）
+
+「在线更新」板块的安装包存取。**安装包不走函数请求体**：25 MB 的 APK 塞不进去，
+再套一层 base64 还要膨胀 33%，所以用 Blob 预签名地址让浏览器直接上传。
+
+- **POST**（写令牌），按 `action` 分三种：
+
+  | action | body | 返回 |
+  |---|---|---|
+  | `sign` | `{"abi":"arm64-v8a"}` | `{"key":"apk/<16hex>/arm64-v8a.apk","uploadUrl":"https://…","expiresAt":…,"maxBytes":209715200}` |
+  | `finish` | `{"key":"apk/…/arm64-v8a.apk"}` | `{"key":…,"size":25983734,"sha256":"a8379a09…"}` |
+  | `delete` | `{"key":"apk/…/arm64-v8a.apk"}` | `{"key":…,"deleted":true}` |
+
+  `sign` 只发 `arm64-v8a` / `armeabi-v7a` 两种 key，且 key 由服务端生成——它会拼进
+  对象存储的键路径，不接受客户端自定义。拿到 `uploadUrl` 后直接
+  `PUT <uploadUrl>` 并把 `Content-Type` 设为 `application/vnd.android.package-archive`。
+
+  `finish` 会把上传的字节读回来核对：ZIP 魔数不匹配（APK 一定是 ZIP）或超过 200 MB
+  都直接删除并返回 400，不让垃圾对象白占额度。返回的 `size` / `sha256` 由编辑器存进
+  资源库，终端下载后可据此校验。
+
+- **GET**（无需鉴权）：`?key=apk/<16hex>/<abi>.apk` 流式返回安装包。
+
+  ```
+  Content-Type: application/vnd.android.package-archive
+  X-Content-Type-Options: nosniff
+  Cache-Control: public, max-age=31536000, immutable
+  ```
+
+  终端下载装包带不了 Bearer，所以公开可读；key 是 16 位随机十六进制，不可枚举。
+  每次上传都换 key，因此可以放心 `immutable` 缓存。key 不匹配格式返回 `400`，
+  对象不存在返回 `404 not_found`。
+
+配置里引用上传的包时，`sections.update.downloads[abi]` 填
+`https://<配置域名>/api/update/apk?key=<urlencode(key)>`——编辑器选版本时自动展开。
 
 ## /health 响应
 
@@ -645,6 +726,7 @@ GitHub，终端只请求自己的域名（和拉配置同一个域名，一定�
 | `POST /api/iptv/fetch` 云端代抓 | 有 | **无此接口**（404） |
 | `GET /api/update` 更新清单（云端代取 GitHub） | 有 | **无此接口**（404） |
 | `GET/POST /api/update/manifest` 上传清单 | 有 | **无此接口**（404） |
+| `POST/GET /api/update/apk` 安装包直传与下载 | 有 | **无此接口**（404） |
 | `403 device_blocked` / `503 storage_unavailable` | 有 | 无 |
 | `/health` 存储后端探测 / `degraded` | 有 | 无（固定 `ok`、`backend=file`） |
 

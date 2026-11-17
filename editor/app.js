@@ -27,6 +27,17 @@ const state = {
   libAppendTo: '',        // 「追加到已有套餐」当前选择
   tvboxUrl: '',           // TVBox 配置地址输入
   tvboxSummary: '',       // TVBox 最近一次导入摘要
+  // ---- 在线更新版本库（与 IPTV 源 / TVBox 源并列的第三类资源） ----
+  // 新建表单的临时输入。放在 state 里而不是直接读 DOM：上传 APK 是异步的
+  // （签名 → 直传 → 校验），中途只要重绘一次，未保存的输入就全丢了。
+  updForm: {
+    version: '',
+    name: '',
+    desc: '',
+    urls: { 'arm64-v8a': '', 'armeabi-v7a': '' },
+    files: { 'arm64-v8a': null, 'armeabi-v7a': null },
+  },
+  updUploading: '',       // `${abi}` 正在上传的架构，用于按钮禁用与文案
   doc: null,
   original: null,
   catalog: null,
@@ -514,13 +525,15 @@ function hexId(prefix) {
 }
 
 function newLibraryId(kind) {
-  const prefix = kind === 'src' ? 's_' : (kind === 'vod' ? 'vs_' : 'pkg_');
+  const prefix = kind === 'src' ? 's_' : (kind === 'vod' ? 'vs_'
+    : (kind === 'upd' ? 'up_' : 'pkg_'));
   const lib = state.library;
   const taken = new Set();
   if (lib) {
     if (kind === 'pkg') for (const pkg of arr(lib.iptv.packages)) taken.add(pkg.id);
     if (kind === 'src') for (const src of arr(lib.iptv.sources)) taken.add(src.id);
     if (kind === 'vod') for (const src of arr(lib.vod.sources)) taken.add(src.id);
+    if (kind === 'upd') for (const item of arr(lib.updates)) taken.add(item.id);
   }
   let id = hexId(prefix);
   // 8 位十六进制空间够大，正常一两次就够；加个上限防止 RNG 异常时死循环。
@@ -586,6 +599,12 @@ function ensureLibrary(raw) {
   if (!Array.isArray(doc.iptv.packages)) doc.iptv.packages = [];
   if (!Array.isArray(doc.vod.sources)) doc.vod.sources = [];
   if (!Array.isArray(doc.vod.sites)) doc.vod.sites = [];
+  if (!Array.isArray(doc.updates)) doc.updates = [];
+  for (const item of doc.updates) {
+    if (!isObj(item)) continue;
+    if (!isObj(item.urls)) item.urls = {};
+    if (!isObj(item.files)) item.files = {};
+  }
   for (const pkg of doc.iptv.packages) {
     if (!isObj(pkg)) continue;
     if (!Array.isArray(pkg.channels)) pkg.channels = [];
@@ -957,6 +976,327 @@ function renderVodLibrary() {
 
     + '<h3>站点（' + sites.length + '）</h3>'
     + (groups || '<p class="muted">还没有站点。</p>');
+}
+
+/* ---------------- 在线更新版本库 ---------------- */
+
+const UPDATE_ABI_KEYS = ['arm64-v8a', 'armeabi-v7a'];
+const UPDATE_ABI_NAMES = { 'arm64-v8a': '64 位（arm64-v8a）', 'armeabi-v7a': '32 位（armeabi-v7a）' };
+
+const UPDATE_HEAD = '<h2>在线更新</h2>'
+  + '<p class="meta">这里管理安装包版本——和 IPTV 源、TVBox 源一样属于「资源」。'
+  + '到套餐的「在线更新」里选定一条后，绑定该套餐的终端就会认定有新版本，'
+  + '直接从对应地址下载安装：不必等云端清单，也不依赖 GitHub。'
+  + '两种来源可以按架构混用——<b>上传</b>存在云端（占 Blob 额度，换包后旧包会失效），'
+  + '<b>外链</b>填自己的 CDN / 网盘地址。</p>';
+
+function updateItems() {
+  if (!state.library) return [];
+  if (!Array.isArray(state.library.updates)) state.library.updates = [];
+  return state.library.updates;
+}
+
+function updateById(id) {
+  return updateItems().find((item) => item && item.id === id) || null;
+}
+
+/** 与 contract.js / 客户端同一套规则：100000 产品位 + major*10000 + minor*100 + patch。 */
+function flattenVersionNum(version) {
+  const parts = String(version || '').split('.').map((part) => Number.parseInt(part, 10));
+  if (!parts.length || !Number.isFinite(parts[0])) return 0;
+  const major = parts[0];
+  const minor = Number.isFinite(parts[1]) ? parts[1] : 0;
+  const patch = Number.isFinite(parts[2]) ? parts[2] : 0;
+  return 100000 + major * 10000 + minor * 100 + patch;
+}
+
+/** API 的绝对前缀：state.base 可能为空（同源部署），此时用当前页面 origin。 */
+function originBase() {
+  const base = String(state.base || '').trim().replace(/\/+$/, '');
+  if (!base) return location.origin;
+  return /^https?:\/\//i.test(base) ? base : location.origin + (base.startsWith('/') ? base : '/' + base);
+}
+
+/** 套餐「在线更新」下拉的选项：来自版本库。 */
+function updateVersionOptions() {
+  const sections = (state.doc && state.doc.sections) || {};
+  const current = String(getPath(sections, 'update.updateId') || '');
+  const options = [{ value: '', label: '不指定（按更新源查云端清单）' }];
+  for (const item of updateItems()) {
+    if (!item || !item.version || item.enabled === false) continue;
+    const label = 'v' + item.version
+      + (item.name && item.name !== ('v' + item.version) ? ' · ' + item.name : '');
+    options.push({ value: item.id, label });
+  }
+  // 引用的条目已被删掉时，别让下拉静默跳到第一项——那等于悄悄改了套餐。
+  if (current && !options.some((option) => option.value === current)) {
+    options.push({ value: current, label: '（引用的版本已删除，请重新选择）' });
+  }
+  return options;
+}
+
+/**
+ * 把「选中的版本」展开写进 sections.update。
+ *
+ * 终端只认这一节：版本号决定「有没有新版」，downloads 决定「从哪下」。
+ * 展开发生在选中的那一刻（而不是保存时统一展开），是为了让用户在保存前就能
+ * 在原始 JSON 里看到实际下发内容，也避免保存路径上再分叉出一套逻辑。
+ */
+function applyUpdateVersion(id) {
+  const sections = state.doc && state.doc.sections;
+  if (!sections) return;
+  if (!isObj(sections.update)) sections.update = {};
+  const update = sections.update;
+  const item = id ? updateById(id) : null;
+  if (!item) {
+    update.updateId = '';
+    update.version = '';
+    update.versionNum = 0;
+    update.versionDesc = '';
+    // 不动 downloads：用户可能手填了直链，清掉等于替他删配置。
+    return;
+  }
+  const base = originBase();
+  update.updateId = item.id;
+  update.version = item.version;
+  update.versionNum = Number(item.versionNum) || flattenVersionNum(item.version);
+  update.versionDesc = item.desc || '';
+  if (!isObj(update.downloads)) update.downloads = { 'arm64-v8a': '', 'armeabi-v7a': '' };
+  for (const abi of UPDATE_ABI_KEYS) {
+    const file = isObj(item.files) ? item.files[abi] : null;
+    const url = isObj(item.urls) ? String(item.urls[abi] || '').trim() : '';
+    if (file && file.key) {
+      // 上传的包走本服务的下载端点：地址稳定，终端不需要知道 Blob 的存在。
+      update.downloads[abi] = base + '/api/update/apk?key=' + encodeURIComponent(file.key);
+    } else if (url) {
+      update.downloads[abi] = url;
+    } else {
+      update.downloads[abi] = '';
+    }
+  }
+}
+
+/** 版本库里一条版本在某架构上的来源，表格里展示用。 */
+function updateAbiCell(item, abi) {
+  const file = isObj(item.files) ? item.files[abi] : null;
+  if (file && file.key) {
+    const size = Number(file.size) > 0
+      ? (Number(file.size) / 1048576).toFixed(1) + ' MB' : '';
+    return '<span class="badge ok">云端已存 ' + esc(size) + '</span>'
+      + (file.sha256
+        ? '<br><span class="meta">sha256 ' + esc(String(file.sha256).slice(0, 12)) + '…</span>'
+        : '');
+  }
+  const url = isObj(item.urls) ? String(item.urls[abi] || '') : '';
+  if (!url) return '<span class="badge off">未提供</span>';
+  return '<span class="badge">外链</span><br><code title="' + esc(url) + '">'
+    + esc(url.length > 40 ? url.slice(0, 40) + '…' : url) + '</code>';
+}
+
+function updateFormAbiRow(abi) {
+  const form = state.updForm;
+  const busy = state.updUploading === abi;
+  const file = form.files[abi];
+  const state0 = file && file.key
+    ? '<span class="badge ok">已上传 ' + esc((Number(file.size) / 1048576).toFixed(1)) + ' MB</span>'
+      + ' <button class="tiny ghost" data-lib="clear-update-file" data-abi="' + esc(abi)
+      + '">移除</button>'
+    : (busy
+      ? '<span class="badge warn">上传中…</span>'
+      : '<button class="tiny" data-lib="pick-update-apk" data-abi="' + esc(abi)
+        + '">选择 APK 上传</button>');
+  return '<div class="upd-abi-row">'
+    + '<span class="upd-abi-name">' + esc(UPDATE_ABI_NAMES[abi]) + '</span>'
+    + '<input class="lib-input" data-upd-url="' + esc(abi) + '" value="'
+    + esc(form.urls[abi] || '') + '" placeholder="或填安装包直链 https://…"'
+    + (file && file.key ? ' disabled' : '') + '>'
+    + '<span class="upd-abi-state">' + state0 + '</span>'
+    + '</div>';
+}
+
+function renderUpdateLibrary() {
+  if (state.libraryState === 'unsupported') return UPDATE_HEAD + libraryUnsupportedHtml();
+  if (!state.library) {
+    return UPDATE_HEAD + libraryLoadFailedHtml()
+      + '<p class="muted">资源库尚未加载。请先点击右上角「连接并加载」，或单独加载资源库。</p>'
+      + '<div class="toolbar"><button class="ghost" data-lib="reload-library">加载资源库</button></div>';
+  }
+  const doc = state.library;
+  const items = updateItems();
+  const form = state.updForm;
+
+  const rows = items.map((item) => {
+    const inUse = bundleItems().filter((bundle) => isObj(bundle.sections)
+      && isObj(bundle.sections.update)
+      && bundle.sections.update.updateId === item.id).length;
+    return '<tr>'
+      + '<td><strong>v' + esc(item.version) + '</strong>'
+      + (item.prerelease ? '<br><span class="badge warn">预发布</span>' : '')
+      + (item.enabled === false ? '<br><span class="badge off">已停用</span>' : '')
+      + '</td>'
+      + '<td>' + esc(item.name || '—') + '</td>'
+      + '<td>' + updateAbiCell(item, 'arm64-v8a') + '</td>'
+      + '<td>' + updateAbiCell(item, 'armeabi-v7a') + '</td>'
+      + '<td>' + (inUse
+        ? '<span class="badge ok">' + inUse + ' 个套餐在用</span>'
+        : '<span class="meta">未被引用</span>') + '</td>'
+      + '<td><span class="meta">' + esc(formatWhen(item.addedAt)) + '</span></td>'
+      + '<td><button class="tiny danger" data-lib="delete-update" data-id="' + esc(item.id)
+      + '">删除</button></td></tr>';
+  }).join('');
+
+  return UPDATE_HEAD
+    + libraryToolbar(doc)
+    + '<div class="df-grid">'
+    + '<div class="df-block"><h3>版本信息</h3>'
+    + '<label class="df-field"><span>版本号（终端据此比大小，必须大于它当前版本）</span>'
+    + '<input data-upd-input="version" value="' + esc(form.version) + '" placeholder="3.0.43"></label>'
+    + '<label class="df-field"><span>名称（可选）</span>'
+    + '<input data-upd-input="name" value="' + esc(form.name) + '" placeholder="默认 v3.0.43"></label>'
+    + '<label class="df-field"><span>更新说明（可选，终端更新弹窗里显示）</span>'
+    + '<textarea rows="3" data-upd-input="desc">' + esc(form.desc) + '</textarea></label>'
+    + '</div>'
+    + '<div class="df-block"><h3>安装包</h3>'
+    + updateFormAbiRow('arm64-v8a')
+    + updateFormAbiRow('armeabi-v7a')
+    + '<p class="meta">每个架构给一种来源即可：上传就是把文件存到云端（推荐，链接不会失效），'
+    + '外链适合把包放在自己的 CDN。上传后点「添加到版本库」，再点上面的「保存资源库」。</p>'
+    + '<div class="toolbar"><button class="primary" data-lib="add-update">添加到版本库</button></div>'
+    + '</div></div>'
+    + '<h3 style="margin-top:22px">版本库（' + items.length + '）</h3>'
+    + (items.length
+      ? '<table class="device-table lib-table"><thead><tr>'
+        + '<th>版本</th><th>名称</th><th>arm64-v8a</th><th>armeabi-v7a</th>'
+        + '<th>套餐引用</th><th>添加时间</th><th></th></tr></thead><tbody>'
+        + rows + '</tbody></table>'
+      : '<p class="muted">还没有在线更新版本。填好版本号与安装包后点「添加到版本库」。</p>');
+}
+
+/**
+ * 上传一个 APK：签名 → 浏览器直传 Blob → 服务端校验。
+ *
+ * 直传的原因很实在：安装包 25 MB 上下，塞进函数请求体还要再套 base64（膨胀 33%），
+ * 边缘函数的请求体上限兜不住；预签名 PUT 让字节直接从浏览器进对象存储。
+ */
+async function uploadUpdateApk(abi) {
+  if (state.updUploading) return;
+  const picker = document.createElement('input');
+  picker.type = 'file';
+  picker.accept = '.apk,application/vnd.android.package-archive';
+  picker.addEventListener('change', async () => {
+    const file = picker.files && picker.files[0];
+    if (!file) return;
+    if (!/\.apk$/i.test(file.name)) {
+      message('只支持 .apk 安装包，收到的是 ' + file.name, 'err');
+      return;
+    }
+    state.updUploading = abi;
+    render();
+    try {
+      clearMessage();
+      message('正在申请上传地址…');
+      const signed = await request('/api/update/apk', {
+        method: 'POST',
+        write: true,
+        body: JSON.stringify({ action: 'sign', abi }),
+      });
+      message('正在上传 ' + file.name + '（' + (file.size / 1048576).toFixed(1) + ' MB）…');
+      const put = await fetch(signed.uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/vnd.android.package-archive' },
+        body: file,
+      });
+      if (!put.ok) throw new Error('直传失败：HTTP ' + put.status + '（上传地址可能已过期，重试即可）');
+      message('上传完成，正在校验安装包…');
+      const done = await request('/api/update/apk', {
+        method: 'POST',
+        write: true,
+        body: JSON.stringify({ action: 'finish', key: signed.key }),
+      });
+      state.updForm.files[abi] = {
+        key: done.key,
+        name: file.name,
+        size: done.size,
+        sha256: done.sha256,
+      };
+      // 同一架构只留一种来源：上传成功后清掉手填链接，免得两份数据打架。
+      state.updForm.urls[abi] = '';
+      clearMessage();
+      toast('已上传 ' + (done.size / 1048576).toFixed(1) + ' MB，记得「添加到版本库」再保存');
+    } catch (error) {
+      message('上传失败：' + error.message + hintOf(error), 'err');
+    } finally {
+      state.updUploading = '';
+      render();
+    }
+  });
+  picker.click();
+}
+
+function addUpdateEntry() {
+  const form = state.updForm;
+  const version = String(form.version || '').trim();
+  if (!/^\d+(\.\d+){0,3}$/.test(version)) {
+    message('版本号要写成 3.0.43 这样的数字点分格式', 'err');
+    return;
+  }
+  if (updateItems().some((item) => item && item.version === version)) {
+    message('版本 ' + version + ' 已经在库里了：换个版本号，或先删掉旧的那条', 'err');
+    return;
+  }
+  const urls = {};
+  const files = {};
+  for (const abi of UPDATE_ABI_KEYS) {
+    const url = String((form.urls && form.urls[abi]) || '').trim();
+    if (url) {
+      if (!/^https?:\/\//i.test(url)) {
+        message(UPDATE_ABI_NAMES[abi] + ' 的地址必须以 http:// 或 https:// 开头', 'err');
+        return;
+      }
+      urls[abi] = url;
+    }
+    const file = form.files && form.files[abi];
+    if (file && file.key) files[abi] = Object.assign({}, file);
+  }
+  if (!UPDATE_ABI_KEYS.some((abi) => urls[abi] || files[abi])) {
+    message('至少要给一个架构填链接或上传安装包，否则终端选中它也没东西可下', 'err');
+    return;
+  }
+  updateItems().unshift({
+    id: newLibraryId('upd'),
+    name: String(form.name || '').trim() || ('v' + version),
+    version,
+    versionNum: flattenVersionNum(version),
+    desc: String(form.desc || '').trim(),
+    prerelease: false,
+    urls,
+    files,
+    enabled: true,
+    addedAt: nowIso(),
+  });
+  state.updForm = {
+    version: '', name: '', desc: '',
+    urls: { 'arm64-v8a': '', 'armeabi-v7a': '' },
+    files: { 'arm64-v8a': null, 'armeabi-v7a': null },
+  };
+  markLibraryDirty();
+  render();
+  toast('已加入版本库，记得点「保存资源库」');
+}
+
+function deleteUpdateEntry(id) {
+  const item = updateById(id);
+  if (!item) return;
+  const used = bundleItems().filter((bundle) => isObj(bundle.sections)
+    && isObj(bundle.sections.update) && bundle.sections.update.updateId === id).length;
+  if (used) {
+    message('v' + item.version + ' 还有 ' + used + ' 个套餐在用，先到套餐里换掉再删。', 'err');
+    return;
+  }
+  state.library.updates = updateItems().filter((entry) => entry && entry.id !== id);
+  markLibraryDirty();
+  render();
+  toast('已从版本库移除；上传的安装包对象会在下次保存后不再被引用');
 }
 
 function agoText(seconds) {
@@ -1549,6 +1889,7 @@ async function saveLibrary() {
       body: JSON.stringify({
         iptv: state.library.iptv,
         vod: state.library.vod,
+        updates: state.library.updates,
         expectedRevision: state.library.revision,
       }),
     });
@@ -2332,6 +2673,44 @@ function onLibraryAction(button) {
   if (kind === 'add-vod-source-url') { addVodSourceUrlOnly(); return; }
   if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
   if (kind === 'migrate-inline') { migrateInlinePackages(); return; }
+  // ---- 在线更新版本库 ----
+  if (kind === 'add-update') { addUpdateEntry(); return; }
+  if (kind === 'delete-update') { deleteUpdateEntry(button.dataset.id); return; }
+  if (kind === 'pick-update-apk') { uploadUpdateApk(button.dataset.abi); return; }
+  if (kind === 'clear-update-file') { clearUpdateFile(button.dataset.abi); return; }
+}
+
+/** 在线更新新建表单：只写 state 不重绘，否则输入框会失焦。 */
+function onUpdateFormInput(target) {
+  const field = target.dataset.updInput;
+  if (field) {
+    state.updForm[field] = target.value;
+    return true;
+  }
+  const abi = target.dataset.updUrl;
+  if (abi) {
+    state.updForm.urls[abi] = target.value.trim();
+    return true;
+  }
+  return false;
+}
+
+/** 移除刚上传的文件：连同 Blob 里的对象一起删掉，别白占额度。 */
+async function clearUpdateFile(abi) {
+  const file = state.updForm.files && state.updForm.files[abi];
+  if (!file || !file.key) return;
+  state.updForm.files[abi] = null;
+  render();
+  try {
+    await request('/api/update/apk', {
+      method: 'POST',
+      write: true,
+      body: JSON.stringify({ action: 'delete', key: file.key }),
+    });
+    toast('已移除并删除云端文件');
+  } catch (error) {
+    message('已从表单移除，但云端文件没删掉：' + error.message + hintOf(error), 'err');
+  }
 }
 
 /** 资源库输入：只写模型 + 点亮「未保存」，不重绘（重绘会抢走输入焦点）。 */
@@ -2393,6 +2772,7 @@ function renderPanel() {
   // /api/devices。这样即使没点「连接并加载」，终端在线/离线也能日常显示。
   const standaloneTab = state.activeTab === 'iptv-lib'
     || state.activeTab === 'vod-lib' || state.activeTab === 'devices'
+    || state.activeTab === 'update-lib'
     || state.activeTab === 'bundles';
   if (!state.doc && !standaloneTab) {
     $('panel').innerHTML = '<p class="muted">请先点击右上角「连接并加载」。</p>';
@@ -2402,7 +2782,8 @@ function renderPanel() {
     navigation: renderNavigation,
     startup: renderStartup, update: renderUpdate,
     iptv: renderIptvDispatch, 'iptv-lib': renderIptvLibrary,
-    'vod-lib': renderVodLibrary, devices: renderDevices };
+    'vod-lib': renderVodLibrary, 'update-lib': renderUpdateLibrary,
+    devices: renderDevices };
   const renderer = renderers[state.activeTab] || renderBundles;
   $('panel').innerHTML = renderer();
 }
@@ -2817,6 +3198,10 @@ function sectionsFormHtml() {
 
     + '<div class="df-block"><h3>在线更新</h3>'
     + dfCheck('update.managed', '云端接管本节')
+    + dfSelect('update.updateId', '指定更新版本', updateVersionOptions())
+    + '<p class="meta">选定版本后，绑定该套餐的终端会直接认定「有新版本」，'
+    + '并从该版本的安装包地址下载：版本号、说明、按架构的直链会一起写进本节，'
+    + '终端不必再去查云端清单。选「不指定」则维持原来的「按更新源查云端清单」。</p>'
     + dfCheck('update.autoCheck', '自动检查更新')
     + dfText('update.checkIntervalHours', '检查间隔（小时）', 'number')
     + dfSelect('update.prompt', '提示方式', prompts)
@@ -2958,13 +3343,15 @@ async function ensureRemoteData(tab) {
   if (!state.base || !state.token) return;
   const jobs = [];
   if (!state.catalog) jobs.push(loadCatalogOnly());
-  if (tab === 'bundles' || tab === 'iptv-lib' || tab === 'vod-lib') {
+  if (tab === 'bundles' || tab === 'iptv-lib' || tab === 'vod-lib'
+    || tab === 'update-lib') {
     if (state.libraryState !== 'ready' && state.libraryState !== 'loading') {
       jobs.push(loadLibrary(true));
     }
   }
-  if ((tab === 'bundles' || tab === 'devices') && state.bundleState !== 'ready'
-    && state.bundleState !== 'loading') {
+  // 在线更新页要显示「几个套餐在引用这条版本」，套餐库也得就位。
+  if ((tab === 'bundles' || tab === 'devices' || tab === 'update-lib')
+    && state.bundleState !== 'ready' && state.bundleState !== 'loading') {
     jobs.push(loadBundles());
   }
   if ((tab === 'bundles' || tab === 'devices') && !arr(state.devices).length) {
@@ -3186,6 +3573,9 @@ function applyDfControl(target) {
     else if (target.type === 'number') value = Number(target.value) || 0;
     else value = target.value;
     setPath(state.doc.sections, target.dataset.df, value);
+    // 选定在线更新版本后，把版本号与按架构直链一起展开进本节：
+    // 终端只读展开后的字段，选择本身没有下发意义。
+    if (target.dataset.df === 'update.updateId') applyUpdateVersion(value);
     markDirty();
     // 公告文案改动即时反映到预览，不整页重绘（避免输入框失焦）。
     if (target.dataset.df.indexOf('startup.notice.') === 0) syncNoticePreview();
@@ -3374,6 +3764,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (file) uploadUpdateManifest(file);
       return;
     }
+    if (target.dataset.updInput || target.dataset.updUrl) { onUpdateFormInput(target); return; }
     if (target.dataset.libInput) { onLibraryInput(target); return; }
     // 套餐表单（#panel）的勾选框 / 下拉 / 数字框
     if (applyDfControl(target)) return;
@@ -3382,6 +3773,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   $('panel').addEventListener('input', (event) => {
     const target = event.target;
+    if (target.dataset.updInput || target.dataset.updUrl) { onUpdateFormInput(target); return; }
     if (target.dataset.libInput) {
       // 文件选择走 change，避免 input + change 重复读取同一份文件。
       if (target.type !== 'file') onLibraryInput(target);

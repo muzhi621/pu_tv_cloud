@@ -448,3 +448,12 @@ textarea.raw {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
+/* 在线更新：新建版本里每个架构一行（直链输入 + 上传按钮 / 状态） */
+.upd-abi-row {
+  display: grid; grid-template-columns: 132px 1fr 150px; gap: 10px;
+  align-items: center; margin: 10px 0; font-size: 12px;
+}
+.upd-abi-name { color: var(--muted-foreground); font-weight: 500; }
+.upd-abi-row .lib-input { width: 100%; }
+.upd-abi-state { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.upd-abi-state .badge { white-space: nowrap; }
