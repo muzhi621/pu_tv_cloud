@@ -3262,6 +3262,43 @@ test('IPTV 套餐分组：两级结构的校验、展开与容错', async (t) =>
     assert.equal(view.sections.iptv.packages[0].groupCount, 2);
   });
 
+  await t.test('库内分组来源可引用频道套餐（pkgref）且悬空引用被清空', () => {
+    const raw = {
+      version: 1,
+      iptv: {
+        sources: [{
+          id: 's_11112222', name: 'iptv4.m3u',
+          url: 'http://a.example/iptv4.m3u', channelCount: 2,
+        }],
+        packages: [
+          {
+            id: 'pkg_aaaabbbb', name: '湖北移动a', sources: [],
+            channels: [{ name: '央视频道', url: 'http://a.example/cctv.ts' }],
+          },
+          {
+            id: 'pkg_ccccdddd', name: '湖北移动b', sources: ['pkgref:pkg_aaaabbbb'],
+            groups: [
+              {
+                id: 'g_00000011', name: '央视', sourceId: 'pkgref:pkg_aaaabbbb',
+                channels: [{ name: 'CCTV1', url: 'http://a.example/1.ts' }],
+              },
+              {
+                id: 'g_00000012', name: '卫视', sourceId: 'pkgref:pkg_deadbeef',
+                channels: [{ name: '湖南', url: 'http://a.example/hn.ts' }],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const [library] = normalizeLibrary(raw);
+    const pkgB = library.iptv.packages.find((p) => p.id === 'pkg_ccccdddd');
+    const groups = new Map(pkgB.groups.map((g) => [g.id, g]));
+    assert.equal(groups.get('g_00000011').sourceId, 'pkgref:pkg_aaaabbbb');
+    assert.equal(groups.get('g_00000012').sourceId, '');
+    assert.ok(pkgB.sources.includes('pkgref:pkg_aaaabbbb'));
+  });
+
   await t.test('设备内联套餐也支持分组（锁定快照场景）', () => {
     const [sections] = normalizeSections({
       iptv: {

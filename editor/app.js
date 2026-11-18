@@ -943,9 +943,50 @@ function sourceDisplayName(src) {
   return String(src.name || '').trim() || String(src.url || '').trim();
 }
 
+/**
+ * 分组「来源」可以是订阅源，也可以是资源库里的频道套餐（用户按业务起的名字，
+ * 如「湖北移动a」）。套餐引用用 REF_PACKAGE_PREFIX + 套餐 id 编码在 sourceId 里，
+ * 与 s_xxxxxxxx 的源 id 区分；频道选择时套餐直接展开自己的频道，不必再抓 URL。
+ */
+const REF_PACKAGE_PREFIX = 'pkgref:';
+
+/** 把来源引用归一化成 {kind, id, name, channels, url}；空/失效返回 null。 */
+function resolveSourceRef(ref) {
+  const value = String(ref == null ? '' : ref).trim();
+  if (!value) return null;
+  if (value.indexOf(REF_PACKAGE_PREFIX) === 0) {
+    const pkg = planPackageById(value.slice(REF_PACKAGE_PREFIX.length));
+    if (!pkg) return null;
+    const groups = arr(pkg.groups);
+    const channels = groups.length
+      ? groups.reduce((out, group) => out.concat(arr(group.channels)), [])
+      : arr(pkg.channels);
+    return {
+      kind: 'package', id: value, name: String(pkg.name || '').trim() || '未命名套餐',
+      channels, url: '', originId: pkg.id,
+    };
+  }
+  const src = findLibrarySource(value);
+  if (!src) return null;
+  return {
+    kind: 'source', id: src.id, name: sourceDisplayName(src),
+    channels: null, url: String(src.url || ''), originId: src.id,
+  };
+}
+
+/** 来源引用的展示名：套餐名 / 源自定义名 / 旧 URL 兜底。 */
+function sourceRefLabel(ref) {
+  const hit = resolveSourceRef(ref);
+  if (hit) return hit.name;
+  const value = String(ref == null ? '' : ref).trim();
+  return /^https?:\/\//i.test(value) ? value : '';
+}
+
 function sourceLabel(ref) {
   const value = String(ref == null ? '' : ref);
   if (!value) return '';
+  const hit = resolveSourceRef(value);
+  if (hit) return (hit.kind === 'package' ? '套餐：' : '') + hit.name;
   const src = findLibrarySource(ref);
   if (src) return sourceDisplayName(src);
   // 源被删掉后残留的 id：显式标注，不要露出一串 s_xxxxxxxx。
@@ -953,8 +994,9 @@ function sourceLabel(ref) {
 }
 
 function sourceUrlOf(ref) {
-  const src = findLibrarySource(ref);
-  return src ? (src.url || '') : String(ref == null ? '' : ref);
+  const hit = resolveSourceRef(ref);
+  if (hit) return hit.url;
+  return String(ref == null ? '' : ref);
 }
 
 function channelPreviewHtml(channels, limit) {
@@ -1173,9 +1215,10 @@ function renderIptvLibrary() {
 
 const PLAN_HEAD = '<h2>IPTV 套餐</h2>'
   + '<p class="hint">套餐就是终端看到的频道列表：<b>分组 → 频道</b> 两级。'
-  + '每个分组引用一条「IPTV 源」里导入的订阅，再从里面挑出要下发的频道；'
-  + '终端按这里的分组与顺序展示。到「套餐管理 → IPTV」勾选套餐即完成下发。'
-  + '来源下拉显示的是源的自定义名称（导入时的文件名可用「改名」覆盖，所有分组同步）。</p>';
+  + '每个分组在「来源」里选一条频道套餐（按你起的名字，如 湖北移动a）或一条 IPTV 源，'
+  + '再从里面挑出要下发的频道；终端按这里的分组与顺序展示。'
+  + '到「套餐管理 → IPTV」勾选套餐即完成下发。'
+  + '选套餐时直接展开该套餐已有的频道；选订阅源时按地址抓取。源的文件名可用「改名」覆盖。</p>';
 
 /** 可用时返回套餐数组；null 表示服务端不支持资源库。 */
 function planPackages() {
@@ -1219,31 +1262,50 @@ function packageGroupStats(pkg) {
   };
 }
 
-function planSourceOptions(selectedId) {
+function planSourceOptions(selectedRef) {
   const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
+  const packages = planPackages() || [];
   // 老套餐（扁平套餐拆分/早期下发）的 sourceId 存的是 URL 而不是 s_xxx id。
-  // option 的 value 一律是 id，直接拿 URL 比较会导致没有一项 selected，
+  // option 的 value 一律是引用值，直接拿 URL 比较会导致没有一项 selected，
   // 浏览器回落到第一个源（常是 iptv4.m3u），看起来就像"改名没生效"。先归一化。
-  const selected = findLibrarySource(selectedId);
-  const selectedRef = selected ? selected.id : String(selectedId == null ? '' : selectedId);
-  return '<option value="">— 不绑定来源 —</option>' + sources.map((src) =>
-    '<option value="' + esc(src.id) + '"' + (src.id === selectedRef ? ' selected' : '') + ' title="'
-    + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('');
+  const selected = resolveSourceRef(selectedRef);
+  const selectedValue = selected ? selected.id : String(selectedRef == null ? '' : selectedRef);
+  let html = '<option value="">— 不绑定来源 —</option>';
+  if (packages.length) {
+    html += '<optgroup label="频道套餐（按名字挑频道）">'
+      + packages.map((pkg) => {
+        const value = REF_PACKAGE_PREFIX + pkg.id;
+        return '<option value="' + esc(value) + '"' + (value === selectedValue ? ' selected' : '')
+          + ' title="从套餐「' + esc(pkg.name || '') + '」的频道里挑">'
+          + esc(String(pkg.name || '').trim() || '未命名套餐') + '</option>';
+      }).join('') + '</optgroup>';
+  }
+  if (sources.length) {
+    html += '<optgroup label="IPTV 源（按订阅地址抓频道）">'
+      + sources.map((src) =>
+        '<option value="' + esc(src.id) + '"' + (src.id === selectedValue ? ' selected' : '')
+        + ' title="' + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('')
+      + '</optgroup>';
+  }
+  return html;
 }
 
 /** 一个分组一行：序号 / 名称 / 来源 / 频道数 / 操作。 */
 function planGroupRowHtml(pkg, group, index) {
-  const src = findLibrarySource(group.sourceId);
+  const ref = resolveSourceRef(group.sourceId);
   const count = arr(group.channels).length;
   const idAttr = ' data-plan="' + esc(pkg.id) + '" data-id="' + esc(group.id) + '"';
+  const renameButton = (ref && ref.kind === 'source')
+    ? '<button class="tiny" data-lib="rename-source" data-id="' + esc(ref.originId)
+      + '" title="给这条源起个能认出来的名字（所有引用它的分组同步）">改名</button>'
+    : '';
   return '<div class="plan-group">'
     + '<span class="plan-group-index">' + (index + 1) + '</span>'
     + '<input class="lib-input plan-group-name" data-lib-input="group-name"' + idAttr
     + ' value="' + esc(group.name || '') + '" placeholder="分组名，如 央视 / 卫视 / 地方台">'
     + '<select class="lib-input plan-group-source" data-lib-input="group-source"' + idAttr + '>'
     + planSourceOptions(group.sourceId) + '</select>'
-    + '<button class="tiny" data-lib="rename-source" data-id="' + esc(src ? src.id : '')
-    + '" title="给这条源起个能认出来的名字（所有引用它的分组同步）">改名</button>'
+    + renameButton
     + '<span class="meta plan-group-count">' + count + ' 个频道</span>'
     + '<span class="lib-row-ops">'
     + '<button class="tiny primary" data-lib="pick-channels"' + idAttr + '>选择频道</button>'
@@ -1251,7 +1313,7 @@ function planGroupRowHtml(pkg, group, index) {
     + '<button class="tiny" data-lib="group-down"' + idAttr + ' title="下移">↓</button>'
     + '<button class="tiny danger" data-lib="delete-group"' + idAttr + '>删除</button>'
     + '</span></div>'
-    + (src ? '' : '<p class="meta plan-warn">这个分组还没绑定来源：先选来源，再点「选择频道」。</p>');
+    + (ref ? '' : '<p class="meta plan-warn">这个分组还没绑定来源：先选套餐或订阅源，再点「选择频道」。</p>');
 }
 
 function renderIptvPlans() {
@@ -1352,17 +1414,25 @@ async function openChannelPicker(pkgId, groupId) {
   state.planPickerPkg = pkgId;
   state.planPickerGroup = groupId;
   state.planPickerError = '';
-  const src = findLibrarySource(hit.group.sourceId);
-  if (!src) {
+  const ref = resolveSourceRef(hit.group.sourceId);
+  if (!ref) {
     state.planPickerSource = null;
     renderPlanPicker();
     $('planPicker').hidden = false;
     return;
   }
-  state.planPickerSource = src;
+  state.planPickerSource = ref;
   renderPlanPicker();
   $('planPicker').hidden = false;
-  if (!planSourceCached(src.id)) await loadPlanSourceChannels(src.id);
+  // 套餐来源直接展开自己的频道（本地数据），不需要抓订阅地址。
+  if (ref.kind === 'package') {
+    state.planSourceChannels[ref.id] = {
+      busy: false, channels: ref.channels, groups: [], at: Date.now(), error: '',
+    };
+    renderPlanPicker();
+    return;
+  }
+  if (!planSourceCached(ref.id)) await loadPlanSourceChannels(ref.id);
 }
 
 function planSourceCached(sourceId) {
@@ -1371,6 +1441,16 @@ function planSourceCached(sourceId) {
 }
 
 async function loadPlanSourceChannels(sourceId) {
+  const ref = resolveSourceRef(sourceId);
+  if (!ref) return;
+  // 套餐来源的频道来自资源库本身，切来源时由 openChannelPicker/switchPickerSource 注入。
+  if (ref.kind === 'package') {
+    state.planSourceChannels[sourceId] = {
+      busy: false, channels: ref.channels, groups: [], at: Date.now(), error: '',
+    };
+    renderPlanPicker();
+    return;
+  }
   const src = findLibrarySource(sourceId);
   if (!src) return;
   state.planSourceChannels[sourceId] = { busy: true, channels: [], at: 0, error: '' };
@@ -1408,16 +1488,30 @@ function channelKey(channel) {
  * 换源不会丢掉已经选好的频道——它们变成「其他来源」，确定时按原顺序保留，
  * 这就是「跨源挑频道」：一个分组里可以同时有多个源的频道。
  */
-function pickerSourceSelect(currentId) {
+function pickerSourceSelect(currentRef) {
+  // 与 planSourceOptions 共用下拉：套餐 + 订阅源，选中值先归一化。
+  const packages = planPackages() || [];
   const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
-  if (!sources.length) return '';
-  // 与 planSourceOptions 同理：currentId 可能是老数据里的 URL，先归一化到源 id。
-  const current = findLibrarySource(currentId);
-  const currentRef = current ? current.id : String(currentId == null ? '' : currentId);
-  return '<label class="picker-source">来源'
-    + '<select data-picker-source>' + sources.map((src) =>
-      '<option value="' + esc(src.id) + '"' + (src.id === currentRef ? ' selected' : '') + ' title="'
-      + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('') + '</select></label>';
+  if (!packages.length && !sources.length) return '';
+  const current = resolveSourceRef(currentRef);
+  const currentValue = current ? current.id : String(currentRef == null ? '' : currentRef);
+  let options = '<option value="">— 不绑定来源 —</option>';
+  if (packages.length) {
+    options += '<optgroup label="频道套餐">'
+      + packages.map((pkg) => {
+        const value = REF_PACKAGE_PREFIX + pkg.id;
+        return '<option value="' + esc(value) + '"' + (value === currentValue ? ' selected' : '') + '>'
+          + esc(String(pkg.name || '').trim() || '未命名套餐') + '</option>';
+      }).join('') + '</optgroup>';
+  }
+  if (sources.length) {
+    options += '<optgroup label="IPTV 源">'
+      + sources.map((src) =>
+        '<option value="' + esc(src.id) + '"' + (src.id === currentValue ? ' selected' : '')
+        + ' title="' + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('')
+      + '</optgroup>';
+  }
+  return '<label class="picker-source">来源<select data-picker-source>' + options + '</select></label>';
 }
 
 function pickerSectionHtml(name, list, picked, extraClass) {
@@ -1448,19 +1542,20 @@ function renderPlanPicker() {
   const hit = planGroupById(state.planPickerPkg, state.planPickerGroup);
   if (!hit) { host.innerHTML = ''; return; }
   const { group } = hit;
-  const src = state.planPickerSource;
+  const ref = state.planPickerSource;
+  const srcName = ref ? (ref.kind === 'package' ? '套餐：' : '源：') + esc(ref.name) : '';
   const head = '<div class="picker-head"><div><h2>' + esc(group.name || '未命名分组') + '</h2>'
-    + '<p class="meta">' + (src ? '来源：' + esc(src.name || src.url) : '这个分组还没有绑定 IPTV 源')
-    + '；换来源不会丢掉已选频道，可跨源拼一个分组。</p>'
-    + pickerSourceSelect(src ? src.id : '') + '</div>'
+    + '<p class="meta">' + (ref ? '来源：' + srcName : '这个分组还没有绑定来源')
+    + '；换来源不会丢掉已选频道，可跨来源拼一个分组。</p>'
+    + pickerSourceSelect(ref ? ref.id : '') + '</div>'
     + '<button class="ghost" data-picker="close">关闭</button></div>';
 
-  if (!src) {
-    host.innerHTML = head + '<p class="muted">先在分组行里选一条来源，再回来挑频道。</p>';
+  if (!ref) {
+    host.innerHTML = head + '<p class="muted">先在分组行里选套餐或订阅源，再回来挑频道。</p>';
     return;
   }
 
-  const cache = state.planSourceChannels[src.id] || { busy: true, channels: [] };
+  const cache = state.planSourceChannels[ref.id] || { busy: true, channels: [] };
   if (cache.busy) {
     host.innerHTML = head + '<p class="muted">正在云端抓取并解析这个来源的频道…</p>';
     return;
@@ -1572,17 +1667,24 @@ function closePlanPicker() {
 }
 
 /** 在选择器里换来源：直接改绑分组，已选频道保留为「其他来源」。 */
-function switchPickerSource(sourceId) {
+function switchPickerSource(sourceRef) {
   const hit = planGroupById(state.planPickerPkg, state.planPickerGroup);
   if (!hit) return;
-  const src = findLibrarySource(sourceId);
-  if (!src) return;
-  hit.group.sourceId = sourceId;
+  const ref = resolveSourceRef(sourceRef);
+  if (!ref) return;
+  hit.group.sourceId = sourceRef;
   syncPlanPackageSources(hit.pkg);
   markLibraryDirty();
-  state.planPickerSource = src;
+  state.planPickerSource = ref;
+  if (ref.kind === 'package') {
+    state.planSourceChannels[sourceRef] = {
+      busy: false, channels: ref.channels, groups: [], at: Date.now(), error: '',
+    };
+    renderPlanPicker();
+    return;
+  }
   renderPlanPicker();
-  if (!planSourceCached(sourceId)) loadPlanSourceChannels(sourceId);
+  if (!planSourceCached(sourceRef)) loadPlanSourceChannels(sourceRef);
 }
 
 function onPlanPickerAction(button) {
@@ -2964,6 +3066,16 @@ function createPackageFromParse(nameInput) {
   // 服务端 packages[].sources 统一存源 id，这里先换算好，避免本地/云端两种形态来回跳。
   const byUrl = registerLibrarySources();
   pkg.sources = [...new Set(state.libSourcesUsed.map((item) => byUrl.get(item.url)).filter(Boolean))];
+  // 用订阅地址建的套餐：若源名还是导入时自动取的文件名（如 iptv4.m3u），
+  // 就顺势改成用户刚起的套餐名，这样编辑器各处「来源」优先显示业务名。
+  for (const sourceId of pkg.sources) {
+    const src = arr(state.library.iptv.sources).find((item) => item.id === sourceId);
+    if (!src) continue;
+    const autoName = sourceNameFromUrl(String(src.url || ''));
+    if (!String(src.name || '').trim() || String(src.name).trim() === autoName) {
+      src.name = name;
+    }
+  }
   state.library.iptv.packages = packages;
   const summary = '已创建套餐「' + name + '」（' + state.libParsed.length
     + ' 个频道）。记得点「保存资源库」。';

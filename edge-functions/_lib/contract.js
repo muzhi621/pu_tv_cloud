@@ -119,6 +119,9 @@ export const MAX_LIBRARY_BYTES = MAX_DOCUMENT_BYTES;
 /** 库内 id 由编辑器生成，格式固定，便于设备侧引用时做正则校验。 */
 const LIB_SOURCE_ID_RE = /^s_[0-9a-f]{8}$/;
 const LIB_PACKAGE_ID_RE = /^pkg_[0-9a-f]{8}$/;
+/** 分组来源可指向同一资源库里的频道套餐：pkgref:pkg_xxxxxxxx。 */
+const LIB_PKG_REF_PREFIX = 'pkgref:';
+const LIB_PKG_REF_RE = /^pkgref:pkg_[0-9a-f]{8}$/;
 const LIB_VOD_SOURCE_ID_RE = /^vs_[0-9a-f]{8}$/;
 /** TVBox 站点 id = `${sourceId}:${key}`，会作为设备 vod.siteIds 的引用值。 */
 const VOD_SITE_ID_RE = /^[A-Za-z0-9_:-]{1,96}$/;
@@ -693,7 +696,7 @@ export function packageChannels(pkg) {
  *   用户真正要下发的是频道，删源不该顺手把套餐掏空；
  * - 每组组内按 url 去重，并强制把频道的 group 写成分组名。
  */
-function normalizePackageGroups(raw, field, warnings, budget, sourceIds) {
+function normalizePackageGroups(raw, field, warnings, budget, sourceIds, packageIds) {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) throw new ConfigError(`${field} 必须是数组`);
   if (raw.length > MAX_IPTV_GROUPS) {
@@ -712,11 +715,17 @@ function normalizePackageGroups(raw, field, warnings, budget, sourceIds) {
     const name = String(entry.name == null ? '' : entry.name).trim().slice(0, 32)
       || `分组 ${groups.length + 1}`;
     let sourceId = String(entry.sourceId == null ? '' : entry.sourceId).trim();
-    if (sourceId && !LIB_SOURCE_ID_RE.test(sourceId)) {
+    const pkgRef = LIB_PKG_REF_RE.test(sourceId);
+    if (sourceId && !pkgRef && !LIB_SOURCE_ID_RE.test(sourceId)) {
       warnings.push(`${field}[${name}]: 忽略非法来源 id ${sourceId}`);
       sourceId = '';
     }
-    if (sourceId && sourceIds && !sourceIds.has(sourceId)) {
+    // 套餐引用只在库级校验存在性（设备内联套餐的分组不认识库 id，沿用旧规则）。
+    if (pkgRef && packageIds && !packageIds.has(sourceId.slice(LIB_PKG_REF_PREFIX.length))) {
+      warnings.push(`${field}[${name}]: 来源套餐 ${sourceId} 不在资源库里，已置空（频道保留）`);
+      sourceId = '';
+    }
+    if (sourceId && !pkgRef && sourceIds && !sourceIds.has(sourceId)) {
       warnings.push(`${field}[${name}]: 来源 ${sourceId} 不在资源库里，已置空（频道保留）`);
       sourceId = '';
     }
@@ -1371,6 +1380,14 @@ function normalizeLibraryIptv(part, warnings) {
       warnings.push(`library.iptv.packages: 超过 ${MAX_IPTV_PACKAGES} 个上限，已截断`);
     }
     const sourceIds = new Set(out.sources.map((item) => item.id));
+    // 分组来源可指向同库套餐，先收集套餐 id 供存在性校验（编辑器生成的真实 id）。
+    const packageIds = new Set();
+    for (const entry of raw.packages.slice(0, MAX_IPTV_PACKAGES)) {
+      const refItem = libraryItem(entry, 'library.iptv.packages', warnings);
+      if (!refItem) continue;
+      const refId = libraryId(refItem, 'pkg_', LIB_PACKAGE_ID_RE, 'library.iptv.packages');
+      if (refId) packageIds.add(refId);
+    }
     const taken = new Set();
     let total = 0;
     for (const entry of raw.packages.slice(0, MAX_IPTV_PACKAGES)) {
@@ -1388,7 +1405,7 @@ function normalizeLibraryIptv(part, warnings) {
         break;
       }
       const groups = normalizePackageGroups(item.groups,
-        `library.iptv.packages[${id}].groups`, warnings, room, sourceIds);
+        `library.iptv.packages[${id}].groups`, warnings, room, sourceIds, packageIds);
       // 有分组时频道只留在分组里，扁平 channels 清空：同一批频道存两份会
       // 把 900 KB 的库上限吃掉一大半，而且两份数据迟早对不上。
       const channels = groups.length ? [] : normalizeChannelList(
@@ -1399,10 +1416,20 @@ function normalizeLibraryIptv(part, warnings) {
         MAX_LIBRARY_SOURCES) || [];
       const sources = [];
       // 分组引用的源本身就是套餐的来源，不必让用户再勾一遍。
+      // pkgref 指向库内套餐：校验引用存在后原样保留（编辑器靠它显示套餐名）。
       for (const group of groups) {
-        if (group.sourceId && !sources.includes(group.sourceId)) sources.push(group.sourceId);
+        if (!group.sourceId || sources.includes(group.sourceId)) continue;
+        if (LIB_PKG_REF_RE.test(group.sourceId)
+          || sourceIds.has(group.sourceId)) sources.push(group.sourceId);
       }
       for (const ref of refs) {
+        // pkgref 指向库内套餐，校验存在后原样保留。
+        if (LIB_PKG_REF_RE.test(ref)) {
+          if (packageIds.has(ref.slice(LIB_PKG_REF_PREFIX.length)) && !sources.includes(ref)) {
+            sources.push(ref);
+          }
+          continue;
+        }
         // 编辑器历史版本存的是订阅 URL，这里兼容成 sourceId，避免来源信息丢失。
         let sourceId = ref;
         if (!sourceIds.has(sourceId) && URL_RE.test(ref)) {

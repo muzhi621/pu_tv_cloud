@@ -1316,5 +1316,35 @@ class IptvPackageGroupsTests(unittest.TestCase):
         self.assertEqual(out["iptv"]["groups"], ["国际"])
 
 
+    def test_library_group_source_can_reference_package(self):
+        """分组来源可指向同库频道套餐（pkgref:），保存后不被置空；悬空引用被清空。"""
+        out, _warnings = normalize_library({
+            "version": 1,
+            "iptv": {
+                "sources": [{
+                    "id": "s_11112222", "name": "iptv4.m3u",
+                    "url": "http://a.example/iptv4.m3u", "channelCount": 2,
+                }],
+                "packages": [
+                    {"id": "pkg_aaaabbbb", "name": "湖北移动a", "sources": [],
+                     "channels": [{"name": "央视频道", "url": "http://a.example/cctv.ts"}]},
+                    {"id": "pkg_ccccdddd", "name": "湖北移动b", "sources": ["pkgref:pkg_aaaabbbb"], "groups": [
+                        {"id": "g_00000011", "name": "央视",
+                         "sourceId": "pkgref:pkg_aaaabbbb",
+                         "channels": [{"name": "CCTV1", "url": "http://a.example/1.ts"}]},
+                        {"id": "g_00000012", "name": "卫视",
+                         "sourceId": "pkgref:pkg_deadbeef",
+                         "channels": [{"name": "湖南", "url": "http://a.example/hn.ts"}]},
+                    ]},
+                ],
+            },
+        })
+        pkg_b = next(p for p in out["iptv"]["packages"] if p["id"] == "pkg_ccccdddd")
+        groups = {g["id"]: g for g in pkg_b["groups"]}
+        self.assertEqual(groups["g_00000011"]["sourceId"], "pkgref:pkg_aaaabbbb")
+        self.assertEqual(groups["g_00000012"]["sourceId"], "")
+        self.assertIn("pkgref:pkg_aaaabbbb", pkg_b["sources"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -188,6 +188,9 @@ MAX_APK_BYTES = 200 * 1024 * 1024
 # 库内 id 由编辑器生成，格式固定，便于设备侧引用时做正则校验。
 _LIB_SOURCE_ID_RE = re.compile(r"^s_[0-9a-f]{8}$")
 _LIB_PACKAGE_ID_RE = re.compile(r"^pkg_[0-9a-f]{8}$")
+# 分组来源可指向同一资源库里的频道套餐：pkgref:pkg_xxxxxxxx。
+_LIB_PKG_REF_PREFIX = "pkgref:"
+_LIB_PKG_REF_RE = re.compile(r"^pkgref:pkg_[0-9a-f]{8}$")
 # 套餐分组 id，与 contract.js 的 GROUP_ID_RE 对齐。
 _GROUP_ID_RE = re.compile(r"^g_[0-9a-f]{8}$")
 _LIB_VOD_SOURCE_ID_RE = re.compile(r"^vs_[0-9a-f]{8}$")
@@ -739,7 +742,8 @@ def package_channels(pkg: dict) -> list[dict]:
 
 
 def _normalize_package_groups(raw: Any, field: str, warnings: list[str],
-                              budget: int, source_ids: set[str] | None) -> list[dict]:
+                              budget: int, source_ids: set[str] | None,
+                              package_ids: set[str] | None = None) -> list[dict]:
     """校验并规整套餐分组（两级结构的一级）。
 
     - 分组 id 缺失/非法/重复就地补发，避免同一份 JSON 出现两个同 id 分组；
@@ -765,10 +769,16 @@ def _normalize_package_groups(raw: Any, field: str, warnings: list[str],
             group_id = _new_library_id("g_", taken)
         name = str(entry.get("name") or "").strip()[:32] or ("分组 %d" % (len(groups) + 1))
         source_id = str(entry.get("sourceId") or "").strip()
-        if source_id and not _LIB_SOURCE_ID_RE.match(source_id):
+        pkg_ref = bool(_LIB_PKG_REF_RE.match(source_id))
+        if source_id and not pkg_ref and not _LIB_SOURCE_ID_RE.match(source_id):
             warnings.append("%s[%s]: 忽略非法来源 id %s" % (field, name, source_id))
             source_id = ""
-        if source_id and source_ids is not None and source_id not in source_ids:
+        # 套餐引用只在库级校验存在性（设备内联套餐不认识库 id，沿用旧规则）。
+        if pkg_ref and package_ids is not None and source_id[len(_LIB_PKG_REF_PREFIX):] not in package_ids:
+            warnings.append("%s[%s]: 来源套餐 %s 不在资源库里，已置空（频道保留）"
+                            % (field, name, source_id))
+            source_id = ""
+        if source_id and not pkg_ref and source_ids is not None and source_id not in source_ids:
             warnings.append("%s[%s]: 来源 %s 不在资源库里，已置空（频道保留）"
                             % (field, name, source_id))
             source_id = ""
@@ -1274,6 +1284,15 @@ def _normalize_library_iptv(part: Any, warnings: list[str]) -> dict:
                             % MAX_IPTV_PACKAGES)
         source_ids = {item["id"] for item in out["sources"]}
         by_url = {item["url"].lower(): item["id"] for item in out["sources"]}
+        # 分组来源可指向同库套餐，先收集套餐 id 供存在性校验。
+        package_ids: set[str] = set()
+        for entry in raw_packages[:MAX_IPTV_PACKAGES]:
+            ref_item = _library_item(entry, "library.iptv.packages", warnings)
+            if ref_item is None:
+                continue
+            ref_id = _library_id(ref_item, _LIB_PACKAGE_ID_RE, "pkg_", "library.iptv.packages")
+            if ref_id:
+                package_ids.add(ref_id)
         taken = set()
         total_channels = 0
         for entry in raw_packages[:MAX_IPTV_PACKAGES]:
@@ -1293,7 +1312,7 @@ def _normalize_library_iptv(part: Any, warnings: list[str]) -> dict:
                 break
             groups = _normalize_package_groups(item.get("groups"),
                                                "library.iptv.packages[%s].groups" % pkg_id,
-                                               warnings, room, source_ids)
+                                               warnings, room, source_ids, package_ids)
             # 有分组时频道只留在分组里，扁平 channels 清空：同一批频道存两份
             # 会把 900 KB 的库上限吃掉一大半，而且两份数据迟早对不上。
             channel_field = "library.iptv.packages[%s].channels" % pkg_id
@@ -1304,10 +1323,19 @@ def _normalize_library_iptv(part: Any, warnings: list[str]) -> dict:
                                  MAX_LIBRARY_SOURCES) or []
             sources: list[str] = []
             # 分组引用的源本身就是套餐的来源，不必让用户再勾一遍。
+            # pkgref 指向库内套餐：校验引用存在后原样保留（编辑器靠它显示套餐名）。
             for group in groups:
-                if group["sourceId"] and group["sourceId"] not in sources:
-                    sources.append(group["sourceId"])
+                sid = group["sourceId"]
+                if not sid or sid in sources:
+                    continue
+                if _LIB_PKG_REF_RE.match(sid) or sid in source_ids:
+                    sources.append(sid)
             for ref in refs:
+                # pkgref 指向库内套餐，校验存在后原样保留。
+                if _LIB_PKG_REF_RE.match(ref):
+                    if ref[len(_LIB_PKG_REF_PREFIX):] in package_ids and ref not in sources:
+                        sources.append(ref)
+                    continue
                 # 编辑器历史版本存的是订阅 URL，这里兼容成 sourceId，避免来源信息丢失。
                 source_id = ref
                 if source_id not in source_ids and _URL_RE.match(ref):
