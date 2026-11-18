@@ -215,6 +215,8 @@ function syncAccountBar() {
 
 function showLogin(reason) {
   syncAccountBar();
+  // 登录是独立页面：把编辑器本体藏起来，避免半透明遮罩透出内容让人以为没登录也能看。
+  document.body.classList.add('login-page');
   const mask = $('loginMask');
   if (!mask) return;
   mask.hidden = false;
@@ -232,6 +234,7 @@ function showLogin(reason) {
 function hideLogin() {
   const mask = $('loginMask');
   if (mask) mask.hidden = true;
+  document.body.classList.remove('login-page');
 }
 
 /** 账号登录：成功后自动带出同源 API 地址并加载全部数据。 */
@@ -1020,7 +1023,9 @@ function legacyInlinePackages(iptv) {
 }
 
 function packageChannelCount(pkg) {
-  const list = arr(pkg && pkg.channels).length;
+  // 两级套餐的频道在 group.channels，扁平套餐才在 pkg.channels；
+  // 只数后者会把分组套餐显示成 0 个频道。统一走展开后的列表。
+  const list = packageChannelList(pkg).length;
   if (list) return list;
   return Number(pkg && pkg.channelCount) || 0;
 }
@@ -1133,7 +1138,7 @@ function renderIptvLibrary() {
     : '';
 
   const pkgRows = packages.map((pkg) => {
-    const count = arr(pkg.channels).length;
+    const count = packageChannelCount(pkg);
     const open = state.libPreviewId === pkg.id;
     const srcs = arr(pkg.sources).map(sourceLabel).filter(Boolean);
     return '<div class="lib-row">'
@@ -1192,7 +1197,7 @@ function renderIptvLibrary() {
         + '<select class="pkg-name" data-lib-input="append-target">'
         + packages.map((pkg) => '<option value="' + esc(pkg.id) + '"'
           + (state.libAppendTo === pkg.id ? ' selected' : '') + '>' + esc(pkg.name || pkg.id)
-          + '（' + arr(pkg.channels).length + ' 个频道）</option>').join('')
+          + '（' + packageChannelCount(pkg) + ' 个频道）</option>').join('')
         + '</select>'
         + '<button class="ghost" data-lib="append-package">追加到已有套餐（合并去重）</button>'
         + '</div>'
@@ -4088,10 +4093,13 @@ function deviceIptvBlock() {
     }
   } else {
     html += libPackages.length
-      ? '<div class="df-multi">' + libPackages.map((pkg) =>
-        '<label><input type="checkbox" data-df-multi="iptv.packageIds" data-value="' + esc(pkg.id) + '"'
-        + (arr(iptv.packageIds).includes(pkg.id) ? ' checked' : '') + '> '
-        + esc(pkg.name) + '（' + arr(pkg.channels).length + ' 个频道）</label>').join('')
+      ? '<div class="df-multi">' + libPackages.map((pkg) => {
+        const stats = packageGroupStats(pkg);
+        return '<label><input type="checkbox" data-df-multi="iptv.packageIds" data-value="' + esc(pkg.id) + '"'
+          + (arr(iptv.packageIds).includes(pkg.id) ? ' checked' : '') + '> '
+          + esc(pkg.name) + '（' + (stats.groups ? stats.groups + ' 个分组 · ' : '')
+          + stats.channels + ' 个频道）</label>';
+      }).join('')
         + '</div>'
       : '<p class="meta">资源库里还没有套餐，请先到「IPTV 源」页导入并创建套餐。</p>';
     html += '<label class="df-check"><input type="checkbox" data-df="iptv.lockLibrary"'

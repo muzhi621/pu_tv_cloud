@@ -472,6 +472,18 @@ textarea.raw {
   backdrop-filter: blur(2px);
 }
 .login-mask[hidden] { display: none; }
+
+/* 登录是独立整页：未登录时用不透明背景盖住编辑器，不能透出顶栏和内容。
+   只针对 #loginMask，planPicker / planPreview / pwdMask 仍用半透明弹窗。 */
+body.login-page .topbar,
+body.login-page main,
+body.login-page #toast { display: none; }
+#loginMask {
+  background: var(--background);
+  backdrop-filter: none;
+}
+#loginMask .login-card { box-shadow: none; border-color: var(--border); }
+
 .login-card {
   width: min(380px, 100%);
   display: flex; flex-direction: column; gap: 12px;
