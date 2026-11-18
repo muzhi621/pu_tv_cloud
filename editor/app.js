@@ -1221,8 +1221,13 @@ function packageGroupStats(pkg) {
 
 function planSourceOptions(selectedId) {
   const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
+  // 老套餐（扁平套餐拆分/早期下发）的 sourceId 存的是 URL 而不是 s_xxx id。
+  // option 的 value 一律是 id，直接拿 URL 比较会导致没有一项 selected，
+  // 浏览器回落到第一个源（常是 iptv4.m3u），看起来就像"改名没生效"。先归一化。
+  const selected = findLibrarySource(selectedId);
+  const selectedRef = selected ? selected.id : String(selectedId == null ? '' : selectedId);
   return '<option value="">— 不绑定来源 —</option>' + sources.map((src) =>
-    '<option value="' + esc(src.id) + '"' + (src.id === selectedId ? ' selected' : '') + ' title="'
+    '<option value="' + esc(src.id) + '"' + (src.id === selectedRef ? ' selected' : '') + ' title="'
     + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('');
 }
 
@@ -1406,9 +1411,12 @@ function channelKey(channel) {
 function pickerSourceSelect(currentId) {
   const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
   if (!sources.length) return '';
+  // 与 planSourceOptions 同理：currentId 可能是老数据里的 URL，先归一化到源 id。
+  const current = findLibrarySource(currentId);
+  const currentRef = current ? current.id : String(currentId == null ? '' : currentId);
   return '<label class="picker-source">来源'
     + '<select data-picker-source>' + sources.map((src) =>
-      '<option value="' + esc(src.id) + '"' + (src.id === currentId ? ' selected' : '') + ' title="'
+      '<option value="' + esc(src.id) + '"' + (src.id === currentRef ? ' selected' : '') + ' title="'
       + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('') + '</select></label>';
 }
 
@@ -3659,7 +3667,11 @@ function splitPlanPackage(pkgId) {
     if (!buckets.has(name)) { buckets.set(name, []); order.push(name); }
     buckets.get(name).push(channel);
   }
-  const sourceId = arr(pkg.sources).find((id) => findLibrarySource(id)) || '';
+  // 老套餐的 pkg.sources 存的是订阅 URL（契约层如此），必须换算成资源库里
+  // 真正的 s_xxxxxxxx id 再写入分组：否则 sourceId 是 URL，下拉匹配不上 option
+  // （显示回落成第一个源），且服务端按 LIB_SOURCE_ID_RE 校验时会把它置空。
+  const firstSource = arr(pkg.sources).map((ref) => findLibrarySource(ref)).find(Boolean);
+  const sourceId = firstSource ? firstSource.id : '';
   pkg.groups = order.map((name) => ({
     id: newLibraryId('grp'),
     name: name.slice(0, 32),
