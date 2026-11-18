@@ -510,7 +510,7 @@ textarea.raw {
   margin-top: 10px;
 }
 .plan-group {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
   padding: 8px 10px;
   background: var(--card);
   border: 1px solid var(--border);

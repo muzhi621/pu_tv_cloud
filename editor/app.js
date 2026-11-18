@@ -937,11 +937,17 @@ function findLibrarySource(ref) {
     .find((item) => item.id === value || String(item.url || '') === value) || null;
 }
 
+/** 订阅源展示名：自定义名优先，导入时按 URL 文件名自动生成的名字只作兜底。 */
+function sourceDisplayName(src) {
+  if (!src) return '';
+  return String(src.name || '').trim() || String(src.url || '').trim();
+}
+
 function sourceLabel(ref) {
   const value = String(ref == null ? '' : ref);
   if (!value) return '';
   const src = findLibrarySource(ref);
-  if (src) return src.name || src.url || '';
+  if (src) return sourceDisplayName(src);
   // 源被删掉后残留的 id：显式标注，不要露出一串 s_xxxxxxxx。
   return /^s_[0-9a-f]{8}$/i.test(value) ? '未知来源(' + value + ')' : value;
 }
@@ -1168,7 +1174,8 @@ function renderIptvLibrary() {
 const PLAN_HEAD = '<h2>IPTV 套餐</h2>'
   + '<p class="hint">套餐就是终端看到的频道列表：<b>分组 → 频道</b> 两级。'
   + '每个分组引用一条「IPTV 源」里导入的订阅，再从里面挑出要下发的频道；'
-  + '终端按这里的分组与顺序展示。到「套餐管理 → IPTV」勾选套餐即完成下发。</p>';
+  + '终端按这里的分组与顺序展示。到「套餐管理 → IPTV」勾选套餐即完成下发。'
+  + '来源下拉显示的是源的自定义名称（导入时的文件名可用「改名」覆盖，所有分组同步）。</p>';
 
 /** 可用时返回套餐数组；null 表示服务端不支持资源库。 */
 function planPackages() {
@@ -1215,8 +1222,8 @@ function packageGroupStats(pkg) {
 function planSourceOptions(selectedId) {
   const sources = arr(state.library && state.library.iptv && state.library.iptv.sources);
   return '<option value="">— 不绑定来源 —</option>' + sources.map((src) =>
-    '<option value="' + esc(src.id) + '"' + (src.id === selectedId ? ' selected' : '') + '>'
-    + esc(src.name || src.url) + '</option>').join('');
+    '<option value="' + esc(src.id) + '"' + (src.id === selectedId ? ' selected' : '') + ' title="'
+    + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('');
 }
 
 /** 一个分组一行：序号 / 名称 / 来源 / 频道数 / 操作。 */
@@ -1230,6 +1237,8 @@ function planGroupRowHtml(pkg, group, index) {
     + ' value="' + esc(group.name || '') + '" placeholder="分组名，如 央视 / 卫视 / 地方台">'
     + '<select class="lib-input plan-group-source" data-lib-input="group-source"' + idAttr + '>'
     + planSourceOptions(group.sourceId) + '</select>'
+    + '<button class="tiny" data-lib="rename-source" data-id="' + esc(src ? src.id : '')
+    + '" title="给这条源起个能认出来的名字（所有引用它的分组同步）">改名</button>'
     + '<span class="meta plan-group-count">' + count + ' 个频道</span>'
     + '<span class="lib-row-ops">'
     + '<button class="tiny primary" data-lib="pick-channels"' + idAttr + '>选择频道</button>'
@@ -1399,8 +1408,8 @@ function pickerSourceSelect(currentId) {
   if (!sources.length) return '';
   return '<label class="picker-source">来源'
     + '<select data-picker-source>' + sources.map((src) =>
-      '<option value="' + esc(src.id) + '"' + (src.id === currentId ? ' selected' : '') + '>'
-      + esc(src.name || src.url) + '</option>').join('') + '</select></label>';
+      '<option value="' + esc(src.id) + '"' + (src.id === currentId ? ' selected' : '') + ' title="'
+      + esc(src.url || '') + '">' + esc(sourceDisplayName(src)) + '</option>').join('') + '</select></label>';
 }
 
 function pickerSectionHtml(name, list, picked, extraClass) {
@@ -3587,6 +3596,21 @@ function syncPlanPackageSources(pkg) {
   pkg.sources = ids;
 }
 
+/** 给订阅源起个能认出来的名字；与「IPTV 源」页的名称字段是同一份数据。 */
+function renameLibrarySource(id) {
+  const src = arr(state.library && state.library.iptv && state.library.iptv.sources)
+    .find((item) => item.id === id);
+  if (!src) { message('这条来源已被删除，无法改名。', 'err'); return; }
+  const next = window.prompt('给这条 IPTV 源起个名字（所有引用它的分组会同步显示）：',
+    String(src.name || '').slice(0, 64));
+  if (next === null) return;
+  const name = next.trim().slice(0, 64) || sourceNameFromUrl(String(src.url || ''));
+  src.name = name;
+  markLibraryDirty();
+  render();
+  message('来源已改名为「' + name + '」，记得点「保存资源库」。', 'ok');
+}
+
 function deletePlanGroup(pkgId, groupId) {
   const pkg = planPackageById(pkgId);
   if (!pkg) return;
@@ -3672,6 +3696,7 @@ function onLibraryAction(button) {
     renderPanel();
     return;
   }
+  if (kind === 'rename-source') { renameLibrarySource(button.dataset.id); return; }
   if (kind === 'add-group') { addPlanGroup(button.dataset.plan); return; }
   if (kind === 'delete-group') { deletePlanGroup(button.dataset.plan, button.dataset.id); return; }
   if (kind === 'group-up') { movePlanGroup(button.dataset.plan, button.dataset.id, -1); return; }
