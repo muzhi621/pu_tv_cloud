@@ -1069,6 +1069,45 @@ class ExpandLibraryPriorityTests(unittest.TestCase):
         out["iptv"]["channels"].append({"name": "z", "url": "http://z/1"})
         self.assertEqual(len(library["iptv"]["packages"][0]["channels"]), 1)
 
+    def _epg_library(self):
+        return {"iptv": {
+            "epgUrl": "https://gitee.com/taksssss/tv/raw/main/epg/51zmt.xml.gz",
+            "packages": [{"id": "pkg_00000001", "channels": [
+                {"name": "L1", "url": "http://lib/1", "group": "央视"}]}],
+        }}
+
+    def test_library_epg_backfilled(self):
+        """回归：资源库 EPG 要回填到终端视图（此前 expand 只展开 channels/groups）。"""
+        sections, _ = normalize_sections({"iptv": {"managed": True, "packageIds": ["pkg_00000001"]}})
+        self.assertEqual(sections["iptv"]["epgUrl"], "")
+        out = expand_iptv_channels(sections, self._epg_library())
+        self.assertEqual(out["iptv"]["epgUrl"],
+                         "https://gitee.com/taksssss/tv/raw/main/epg/51zmt.xml.gz")
+        self.assertEqual(len(out["iptv"]["channels"]), 1)
+        self.assertEqual(sections["iptv"]["epgUrl"], "", "深拷贝，不能污染入参")
+
+    def test_library_epg_backfilled_without_packages(self):
+        """只填 EPG、没引用套餐时也要回填（必须在无频道早退之前）。"""
+        sections, _ = normalize_sections({"iptv": {"managed": True}})
+        out = expand_iptv_channels(sections, self._epg_library())
+        self.assertEqual(out["iptv"]["channels"], [])
+        self.assertEqual(out["iptv"]["epgUrl"],
+                         "https://gitee.com/taksssss/tv/raw/main/epg/51zmt.xml.gz")
+
+    def test_explicit_epg_is_not_overwritten(self):
+        """优先级：sections 单独配置 > library 全局。"""
+        own = "https://own.example.com/device.xml.gz"
+        sections, _ = normalize_sections({"iptv": {"managed": True, "epgUrl": own}})
+        out = expand_iptv_channels(sections, self._epg_library())
+        self.assertEqual(out["iptv"]["epgUrl"], own)
+
+    def test_unmanaged_locked_and_no_library_not_backfilled(self):
+        unmanaged, _ = normalize_sections({"iptv": {"managed": False}})
+        self.assertEqual(expand_iptv_channels(unmanaged, self._epg_library())["iptv"]["epgUrl"], "")
+        locked, _ = normalize_sections({"iptv": {"managed": True, "lockLibrary": True}})
+        self.assertEqual(expand_iptv_channels(locked, self._epg_library())["iptv"]["epgUrl"], "")
+        self.assertFalse(expand_iptv_channels({"iptv": {"managed": True}})["iptv"].get("epgUrl"))
+
 
 class SpiderFieldTests(unittest.TestCase):
     """TVBox spider 字段与相对资源解析（与 contract.js 同语义）。"""

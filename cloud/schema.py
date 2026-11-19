@@ -1129,6 +1129,9 @@ def expand_iptv_channels(sections: dict, library: dict | None = None) -> dict:
        再挂自己的几个频道。
 
     不传 library 或库不可用时行为与旧版本完全一致，旧文档不会被新字段卡住。
+
+    另外把 library.iptv.epgUrl 回填到 sections.iptv.epgUrl（编辑器在「资源库」页
+    维护全局 EPG，展开链路此前只展开 channels/groups，终端拿到的始终是空串）。
     """
     result = copy.deepcopy(sections)
     iptv = result.get("iptv")
@@ -1136,6 +1139,17 @@ def expand_iptv_channels(sections: dict, library: dict | None = None) -> dict:
         return result
 
     locked = iptv.get("lockLibrary") is True
+    # 优先级：sections 单独配置 > library 全局。只在 managed 且未锁定时回填
+    # （终端只消费 managed 节；锁定设备内容冻结、不跟库变）。必须放在下面的
+    # 无套餐早退之前：只填了 EPG、没引用套餐的设备也要拿到。
+    lib_epg = ""
+    if isinstance(library, dict):
+        lib_iptv = library.get("iptv")
+        if isinstance(lib_iptv, dict) and isinstance(lib_iptv.get("epgUrl"), str):
+            lib_epg = lib_iptv["epgUrl"]
+    if iptv.get("managed") is True and not locked and not iptv.get("epgUrl") and lib_epg:
+        iptv["epgUrl"] = lib_epg
+
     inline_packages = iptv.get("packages")
     if not isinstance(inline_packages, list):
         inline_packages = []

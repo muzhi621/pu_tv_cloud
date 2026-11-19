@@ -913,11 +913,23 @@ function normalizeIptv(part, warnings) {
  * 最后并入设备内联 channels（第 3 种情况除外，旧行为保持字节级兼容）。
  *
  * library 参数可选：不传时行为与旧版本完全一致。
+ *
+ * 另外把 library.iptv.epgUrl 回填到 sections.iptv.epgUrl（编辑器在「资源库」页
+ * 维护全局 EPG，展开链路此前只展开 channels/groups，终端拿到的始终是空串）。
  */
 export function expandIptvChannels(sections, library = null) {
-  const iptv = sections && sections.iptv;
-  if (!iptv) return sections;
+  if (!sections || !sections.iptv) return sections;
+  const out = clone(sections);
+  const iptv = out.iptv;
   const locked = iptv.lockLibrary === true;
+  // 优先级：sections 单独配置 > library 全局。只在 managed 且未锁定时回填
+  // （终端只消费 managed 节；锁定设备内容冻结、不跟库变）。必须放在下面的
+  // 无套餐早退之前：只填了 EPG、没引用套餐的设备也要拿到。
+  const libEpg = (library && library.iptv && typeof library.iptv.epgUrl === 'string')
+    ? library.iptv.epgUrl : '';
+  if (iptv.managed === true && !locked && !iptv.epgUrl && libEpg) {
+    iptv.epgUrl = libEpg;
+  }
   const inlinePackages = Array.isArray(iptv.packages) ? iptv.packages : [];
   const libPackages = (library && library.iptv && Array.isArray(library.iptv.packages))
     ? library.iptv.packages : [];
@@ -927,7 +939,7 @@ export function expandIptvChannels(sections, library = null) {
   const ids = useLibrary
     ? refIds
     : (Array.isArray(iptv.selectedPackageIds) ? iptv.selectedPackageIds : []);
-  if (!ids.length) return sections;
+  if (!ids.length) return out;
   const byId = new Map((useLibrary ? libPackages : inlinePackages).map((pkg) => [pkg.id, pkg]));
   const seen = new Set();
   const channels = [];
@@ -954,9 +966,8 @@ export function expandIptvChannels(sections, library = null) {
       if (channels.length >= MAX_IPTV_CHANNELS) break;
     }
   }
-  const out = clone(sections);
-  out.iptv.channels = channels;
-  out.iptv.groups = [...new Set(channels.map((c) => c.group).filter(Boolean))]
+  iptv.channels = channels;
+  iptv.groups = [...new Set(channels.map((c) => c.group).filter(Boolean))]
     .slice(0, MAX_LIST_ITEMS);
   return out;
 }

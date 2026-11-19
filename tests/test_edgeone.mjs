@@ -2085,6 +2085,84 @@ test('资源库 API 与设备引用：写入、409、懒触发生效与锁定隔
   });
 });
 
+/* ================= 资源库 EPG 地址回填到终端视图 ================= */
+
+test('资源库 EPG 地址回填到 sections.iptv.epgUrl', async (t) => {
+  const LIB_EPG = 'https://gitee.com/taksssss/tv/raw/main/epg/51zmt.xml.gz';
+  const OWN_EPG = 'https://own.example.com/device.xml.gz';
+  const library = {
+    iptv: {
+      epgUrl: LIB_EPG,
+      packages: [{
+        id: 'pkg_00000001',
+        channels: [{ name: 'CCTV1', url: 'http://lib.example.com/1.ts', group: '央视' }],
+      }],
+    },
+  };
+
+  await t.test('library EPG 回填：expandIptvChannels 与 viewDocument 都生效', () => {
+    const [sections] = normalizeSections({ iptv: { managed: true, packageIds: ['pkg_00000001'] } });
+    assert.equal(sections.iptv.epgUrl, '');
+    const expanded = expandIptvChannels(sections, library);
+    assert.equal(expanded.iptv.epgUrl, LIB_EPG);
+    assert.equal(expanded.iptv.channels.length, 1);
+    assert.equal(sections.iptv.epgUrl, '', '深拷贝：不能污染入参');
+
+    const view = viewDocument(
+      { sections: { iptv: { managed: true, packageIds: ['pkg_00000001'] } } }, false, library);
+    assert.equal(view.sections.iptv.epgUrl, LIB_EPG);
+  });
+
+  await t.test('没引用套餐也回填（必须在无频道早退之前）', () => {
+    const [sections] = normalizeSections({ iptv: { managed: true } });
+    const expanded = expandIptvChannels(sections, library);
+    assert.deepEqual(expanded.iptv.channels, []);
+    assert.equal(expanded.iptv.epgUrl, LIB_EPG);
+  });
+
+  await t.test('sections 单独配置的 epgUrl 优先，不被 library 覆盖', () => {
+    const [sections] = normalizeSections({ iptv: { managed: true, epgUrl: OWN_EPG } });
+    assert.equal(expandIptvChannels(sections, library).iptv.epgUrl, OWN_EPG);
+    const view = viewDocument({ sections }, false, library);
+    assert.equal(view.sections.iptv.epgUrl, OWN_EPG);
+  });
+
+  await t.test('unmanaged / lockLibrary / 无 library 都不回填', () => {
+    const [unmanaged] = normalizeSections({ iptv: { managed: false } });
+    assert.equal(expandIptvChannels(unmanaged, library).iptv.epgUrl, '');
+    const [locked] = normalizeSections({ iptv: { managed: true, lockLibrary: true } });
+    assert.equal(expandIptvChannels(locked, library).iptv.epgUrl, '');
+    assert.ok(!expandIptvChannels({ iptv: { managed: true } }).iptv.epgUrl, '不传 library 不回填');
+  });
+
+  await t.test('端到端 GET：资源库 EPG 下发，设备单独配置仍优先', async () => {
+    const savedKv = globalThis.PURETV_KV;
+    const fresh = new MemoryKV();
+    globalThis.PURETV_KV = fresh;
+    t.after(() => { globalThis.PURETV_KV = savedKv; });
+    const env = {};
+    const put = await libraryPut(ctx('PUT', '/api/library', {
+      env,
+      headers: { 'Content-Type': 'application/json', 'If-Match': '0' },
+      body: { iptv: { epgUrl: LIB_EPG, sources: [], packages: [] }, vod: {} },
+    }));
+    assert.equal(put.status, 200);
+    for (const [device, sections] of [
+      ['epg-lib', { iptv: { managed: true } }],
+      ['epg-own', { iptv: { managed: true, epgUrl: OWN_EPG } }],
+    ]) {
+      const res = await configPut(ctx('PUT', `/api/config?deviceId=${device}`, {
+        env, headers: { 'Content-Type': 'application/json', 'If-Match': '1' }, body: { sections },
+      }));
+      assert.equal(res.status, 200);
+    }
+    const lib = await json(await configGet(ctx('GET', '/api/config?deviceId=epg-lib', { env })));
+    assert.equal(lib.sections.iptv.epgUrl, LIB_EPG);
+    const own = await json(await configGet(ctx('GET', '/api/config?deviceId=epg-own', { env })));
+    assert.equal(own.sections.iptv.epgUrl, OWN_EPG);
+  });
+});
+
 /* ================= TVBox 源：库字段与按源展开 ================= */
 
 test('TVBox 源与站点：库字段、按源展开、白名单与锁定隔离', async (t) => {
