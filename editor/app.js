@@ -38,7 +38,9 @@ const state = {
   planPreviewPkg: '',     // 预览弹窗正在看的套餐
   planSourceChannels: {}, // sourceId → {busy, channels, at, error}：源频道缓存
   tvboxUrl: '',           // TVBox 配置地址输入
+  tvboxName: '',          // TVBox 源自定义名称（添加时可选，留空按配置名/文件名自动取）
   tvboxSummary: '',       // TVBox 最近一次导入摘要
+  vodOpenSource: '',      // 源列表里正在展开「查看站点」的源 id（空 = 全部收起）
   // ---- 在线更新版本库（与 IPTV 源 / TVBox 源并列的第三类资源） ----
   // 新建表单的临时输入。放在 state 里而不是直接读 DOM：上传 APK 是异步的
   // （签名 → 直传 → 校验），中途只要重绘一次，未保存的输入就全丢了。
@@ -1831,8 +1833,9 @@ function renderPlanPreview() {
 /* ---------------- TVBox 源页（库层） ---------------- */
 
 const VOD_HEAD = '<h2>TVBox 源 · 站点库</h2>'
-  + '<p class="hint">资源库与终端无关：先添加 TVBox 配置源，站点会按源分组入库，'
-  + '再到「终端管理」里给终端勾选整源或单个站点。</p>';
+  + '<p class="hint">资源库与终端无关：先添加 TVBox 配置源（可自己起名，区分不同订阅），'
+  + '站点随源一起入库。点源列表里的「<b>查看站点</b>」展开该源下的站点、设默认站点；'
+  + '再到「套餐管理 → TVBox 站点下发」给套餐 / 终端勾选整源或单个站点。</p>';
 
 function renderVodLibrary() {
   if (state.libraryState === 'unsupported') return VOD_HEAD + libraryUnsupportedHtml();
@@ -1846,15 +1849,16 @@ function renderVodLibrary() {
   const sites = arr(doc.vod.sites);
   // 库级默认站点：所有终端共用，套餐/终端没单独指定时用它。
   const defaultSiteId = String((doc.vod && doc.vod.defaultSiteId) || '');
-  const countOf = (sourceId) => sites.filter((site) => site.sourceId === sourceId).length;
-
   const spiderCountOf = (sourceId) =>
     sites.filter((site) => site.sourceId === sourceId
       && String(site.api || '').startsWith('csp_')).length;
   const sourceRows = sources.map((src) => {
     const needJar = spiderCountOf(src.id);
+    const own = sites.filter((site) => site.sourceId === src.id);
+    const open = state.vodOpenSource === src.id;
     return '<tr>'
-      + '<td><strong>' + esc(src.name || src.id) + '</strong>'
+      + '<td><input class="lib-input" data-lib-input="vod-source-name" data-id="' + esc(src.id)
+      + '" value="' + esc(src.name || '') + '" title="改个名字，用来区分不同的订阅源">'
       + (needJar && !src.jar
         ? '<br><span class="badge off">缺 jar</span>'
         : '') + '</td>'
@@ -1869,36 +1873,17 @@ function renderVodLibrary() {
       + '<td><input class="lib-input" data-lib-input="vod-source-jar" data-id="' + esc(src.id)
       + '" value="' + esc(src.jar || '') + '" placeholder="spider.jar 地址'
       + (needJar ? '（必填）' : '（可留空）') + '"></td>'
-      + '<td>' + countOf(src.id) + (needJar ? '<br><span class="meta">' + needJar
-        + ' 个 csp_</span>' : '') + '</td>'
+      + '<td>' + own.length + (needJar ? '<br><span class="meta">' + needJar
+        + ' 个 csp_</span>' : '')
+      + '<br><button class="tiny' + (open ? ' primary' : '') + '" data-lib="toggle-vod-sites"'
+      + ' data-id="' + esc(src.id) + '">' + (open ? '收起站点' : '查看站点') + '</button></td>'
       + '<td><span class="meta">' + esc(formatWhen(src.addedAt)) + '</span></td>'
       + '<td><button class="tiny danger" data-lib="delete-vod-source" data-id="' + esc(src.id)
-      + '">删除</button></td></tr>';
-  }).join('');
-
-  const groups = sources.map((src) => {
-    const own = sites.filter((site) => site.sourceId === src.id);
-    if (!own.length) return '';
-    const rows = own.map((site) => {
-      const isDefault = defaultSiteId === site.id;
-      return '<div class="lib-site-row"><code>' + esc(site.key) + '</code>'
-        + '<span class="lib-site-name">' + esc(site.name || site.key) + '</span>'
-        + '<code class="lib-site-api" title="' + esc(site.api || '') + '">' + esc(site.api || '')
-        + '</code>'
-        + '<input class="lib-input" data-lib-input="site-ext" data-id="' + esc(site.id)
-        + '" value="' + esc(site.ext || '') + '" placeholder="ext（多数留空）">'
-        + '<input class="lib-input" data-lib-input="site-note" data-id="' + esc(site.id)
-        + '" value="' + esc(site.note || '') + '" placeholder="备注">'
-        + '<button class="tiny' + (isDefault ? ' primary' : '') + '" data-lib="set-default-site"'
-        + ' data-id="' + esc(site.id) + '" title="'
-        + (isDefault ? '再点一次取消默认站点' : '打开影音时默认选中这个站点') + '">'
-        + (isDefault ? '默认站点' : '设为默认') + '</button></div>';
-    }).join('');
-    return '<div class="lib-source-block">'
-      + '<div class="lib-source-head"><strong>' + esc(src.name || src.id) + '</strong>'
-      + '<span class="meta">' + own.length + ' 个站点</span>'
-      + '<code class="lib-site-api">' + esc(src.url || '') + '</code></div>'
-      + '<div class="lib-scroll">' + rows + '</div></div>';
+      + '">删除</button></td></tr>'
+      + (open
+        ? '<tr class="lib-expand-row"><td colspan="7">'
+          + vodSiteBlock(src, own, defaultSiteId) + '</td></tr>'
+        : '');
   }).join('');
 
   const defaultSite = sites.find((site) => site.id === defaultSiteId);
@@ -1908,7 +1893,11 @@ function renderVodLibrary() {
 
     + '<h3>添加源</h3>'
     + '<div class="toolbar">'
-    + '<input class="pkg-name" data-lib-input="tvbox-url" placeholder="https://example.com/tvbox.json"'
+    + '<input class="pkg-name tvbox-name-input" data-lib-input="tvbox-name"'
+    + ' placeholder="源名称（可选，用来区分订阅；留空自动取）"'
+    + ' value="' + esc(state.tvboxName) + '">'
+    + '<input class="pkg-name tvbox-url-input" data-lib-input="tvbox-url"'
+    + ' placeholder="https://example.com/tvbox.json"'
     + ' value="' + esc(state.tvboxUrl) + '">'
     + '<button class="primary" data-lib="add-vod-source">云端抓取并解析</button>'
     + '<button class="ghost" data-lib="add-vod-source-url">不解析，只下发配置 URL</button>'
@@ -1916,6 +1905,7 @@ function renderVodLibrary() {
     + '<p class="hint">从配置里取 <code>sites</code>，映射成库站点；'
     + '<code>api</code> 不是 http(s):// 或 csp_ 开头、<code>key</code> 缺失或重复的站点会被跳过并统计。'
     + '同时兼容顶层数组，以及 <code>urls</code> 里指向多份子配置的写法（最多取 5 个子配置）。'
+    + '<br><b>源名称</b>留空时依次取配置里的名称、配置文件名；导入多个订阅时可以自己起名区分。'
     + '<br>配置顶层的 <code>spider</code> 会自动记成该源的 <b>spider jar</b>；'
     + '站点的 <code>ext</code> 也会一并保存。'
     + '<b>api 以 csp_ 开头的站点必须有 jar 才能播</b>，缺了会在列表里标红。'
@@ -1928,21 +1918,52 @@ function renderVodLibrary() {
     + (state.tvboxSummary ? '<p class="hint">' + esc(state.tvboxSummary) + '</p>' : '')
 
     + '<h3>源列表（' + sources.length + '）</h3>'
-    + (sources.length
-      ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>配置 URL</th>'
-        + '<th>下发模式</th><th>spider jar</th><th>站点数</th><th>添加时间</th><th></th></tr></thead>'
-        + '<tbody>' + sourceRows + '</tbody></table>'
-      : '<p class="muted">还没有 TVBox 源，先在上面添加。</p>')
-
-    + '<h3>站点（' + sites.length + '）</h3>'
-    + '<p class="hint">「默认站点」是打开影音时自动选中的那个，对所有终端生效'
+    + '<p class="hint">名称可直接在表格里改；「查看站点」展开该源下的站点，'
+    + '在里面改 ext / 备注、设置默认站点。'
+    + '「默认站点」是打开影音时自动选中的那个，全库只有一个，对所有终端生效'
     + '（套餐 / 单终端里单独指定的优先）。'
     + (defaultSiteId
       ? '当前默认：<b>' + esc(defaultSite ? (defaultSite.name || defaultSite.key) : defaultSiteId)
         + '</b>；再点一次该行按钮即可取消。'
       : '当前没有设置，终端会按源顺序用第一个站点。')
     + '改完记得点「保存资源库」，终端下次同步即生效。</p>'
-    + (groups || '<p class="muted">还没有站点。</p>');
+    + (sources.length
+      ? '<table class="device-table lib-table"><thead><tr><th>名称</th><th>配置 URL</th>'
+        + '<th>下发模式</th><th>spider jar</th><th>站点数</th><th>添加时间</th><th></th></tr></thead>'
+        + '<tbody>' + sourceRows + '</tbody></table>'
+      : '<p class="muted">还没有 TVBox 源，先在上面添加。</p>');
+}
+
+/**
+ * 源列表里「查看站点」展开出来的站点块：ext / 备注 / 默认站点都在这里改。
+ *
+ * 站点不再单独成节——同一个 TVBox 配置导入两次（不同订阅）时，站点表按源
+ * 分块才看得清「这批站点属于哪个源」，也避免整库几百条站点摊在同一屏。
+ */
+function vodSiteBlock(src, own, defaultSiteId) {
+  const head = '<div class="lib-source-head"><strong>' + esc(src.name || src.id) + '</strong>'
+    + '<span class="meta">' + own.length + ' 个站点</span>'
+    + '<code class="lib-site-api">' + esc(src.url || '') + '</code></div>';
+  if (!own.length) {
+    return head + '<p class="muted">这个源还没有云端站点'
+      + (src.mode === 'url' ? '（终端直连模式，由终端自己解析配置）' : '') + '。</p>';
+  }
+  const rows = own.map((site) => {
+    const isDefault = defaultSiteId === site.id;
+    return '<div class="lib-site-row"><code>' + esc(site.key) + '</code>'
+      + '<span class="lib-site-name">' + esc(site.name || site.key) + '</span>'
+      + '<code class="lib-site-api" title="' + esc(site.api || '') + '">' + esc(site.api || '')
+      + '</code>'
+      + '<input class="lib-input" data-lib-input="site-ext" data-id="' + esc(site.id)
+      + '" value="' + esc(site.ext || '') + '" placeholder="ext（多数留空）">'
+      + '<input class="lib-input" data-lib-input="site-note" data-id="' + esc(site.id)
+      + '" value="' + esc(site.note || '') + '" placeholder="备注">'
+      + '<button class="tiny' + (isDefault ? ' primary' : '') + '" data-lib="set-default-site"'
+      + ' data-id="' + esc(site.id) + '" title="'
+      + (isDefault ? '再点一次取消默认站点' : '打开影音时默认选中这个站点') + '">'
+      + (isDefault ? '默认站点' : '设为默认') + '</button></div>';
+  }).join('');
+  return head + '<div class="lib-scroll">' + rows + '</div>';
 }
 
 /* ---------------- 在线更新版本库 ---------------- */
@@ -2944,11 +2965,11 @@ function sourceNameFromUrl(url) {
  * 终端拿到 mode=url 会自己拉配置解析。这里统一把中文域名转 punycode、
  * 中文路径 percent-encode，避免终端 Uri.parse 与云端 URL_RE 校验踩坑。
  */
-function buildVodUrlOnlySource(rawUrl, sourceId) {
+function buildVodUrlOnlySource(rawUrl, sourceId, preferredName) {
   const url = normalizeHttpUrl(rawUrl);
   return {
     id: sourceId,
-    name: sourceNameFromUrl(url).slice(0, 64),
+    name: (String(preferredName || '').trim() || sourceNameFromUrl(url)).slice(0, 64),
     url,
     jar: '',
     spiderMd5: '',
@@ -3202,6 +3223,8 @@ function deleteVodSource(id) {
   if (!window.confirm('删除源「' + (src.name || src.url) + '」？它下面的站点会一并删除。')) return;
   state.library.vod.sources = sources.filter((item) => item.id !== id);
   state.library.vod.sites = arr(state.library.vod.sites).filter((site) => site.sourceId !== id);
+  // 展开状态跟着源一起清，否则下次打开页面还留着一个不存在的 id。
+  if (state.vodOpenSource === id) state.vodOpenSource = '';
   // 默认站点跟着源一起删掉了，否则库里留一个指向不存在站点的引用。
   if (state.library.vod.defaultSiteId
       && !arr(state.library.vod.sites).some((site) => site.id === state.library.vod.defaultSiteId)) {
@@ -3460,8 +3483,10 @@ function addVodSourceUrlOnly(reason) {
     return false;
   }
   let source;
+  const typedName = readLibInput('tvbox-name').trim().slice(0, 64);
+  state.tvboxName = typedName;
   try {
-    source = buildVodUrlOnlySource(raw, newLibraryId('vod'));
+    source = buildVodUrlOnlySource(raw, newLibraryId('vod'), typedName);
   } catch (error) {
     message('配置地址不合法：' + error.message, 'err');
     return false;
@@ -3473,6 +3498,7 @@ function addVodSourceUrlOnly(reason) {
     + '记得在设备里勾选这个源并点「保存资源库」；'
     + '需客户端支持 url 模式且设备能访问该地址，终端也拉不到时该源不会有站点。'
     + (reason ? ' 云端解析失败原因：' + reason : '');
+  state.tvboxName = '';
   markLibraryDirty();
   render();
   message(state.tvboxSummary, 'ok');
@@ -3573,7 +3599,8 @@ async function addVodSource() {
     if (room <= 0) { message('资源库站点已达 ' + MAX_VOD_SITES + ' 条上限，请先删除不用的源。', 'err'); return; }
     let dropped = 0;
     if (sites.length > room) { dropped = sites.length - room; sites = sites.slice(0, room); }
-    const name = (names[0] || sourceNameFromUrl(url)).slice(0, 64);
+    const name = (readLibInput('tvbox-name').trim() || names[0]
+      || sourceNameFromUrl(url)).slice(0, 64);
     const needJar = sites.filter((site) => /^csp_/i.test(String(site.api || ''))).length;
     const ownJarCount = sites.filter((site) => String(site.jar || '')).length;
     state.library.vod.sources.push({
@@ -3594,6 +3621,8 @@ async function addVodSource() {
       + (dropped ? '，超出资源库 ' + MAX_VOD_SITES + ' 条上限丢弃 ' + dropped + ' 条' : '')
       + (subFailed ? '，子配置抓取失败 ' + subFailed + ' 个' : '')
       + '。记得点「保存资源库」。';
+    // 名称用过就清掉：下一个源重新起名，不会误带上一批的订阅名。
+    state.tvboxName = '';
     markLibraryDirty();
     render();
     message(state.tvboxSummary, 'ok');
@@ -3835,6 +3864,12 @@ function onLibraryAction(button) {
   if (kind === 'preview-plan') { openPlanPreview(button.dataset.id || button.dataset.plan); return; }
   if (kind === 'add-vod-source') { addVodSource(); return; }
   if (kind === 'add-vod-source-url') { addVodSourceUrlOnly(); return; }
+  if (kind === 'toggle-vod-sites') {
+    const id = button.dataset.id;
+    state.vodOpenSource = state.vodOpenSource === id ? '' : id;
+    render();
+    return;
+  }
   if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
   if (kind === 'set-default-site') { setVodDefaultSite(button.dataset.id); return; }
   if (kind === 'migrate-inline') { migrateInlinePackages(); return; }
@@ -3886,6 +3921,7 @@ function onLibraryInput(target) {
   if (kind === 'import-text') { state.libPasteText = target.value; return; }
   if (kind === 'import-file') { readLibraryFile(target); return; }
   if (kind === 'tvbox-url') { state.tvboxUrl = target.value; return; }
+  if (kind === 'tvbox-name') { state.tvboxName = target.value; return; }
   if (kind === 'new-package-name') return;
   if (!state.library) return;
   if (kind === 'append-target') { state.libAppendTo = target.value; return; }
@@ -3943,6 +3979,12 @@ function onLibraryInput(target) {
   if (kind === 'site-ext') {
     const site = arr(state.library.vod.sites).find((item) => item.id === id);
     if (site) { site.ext = target.value.slice(0, 1000); markLibraryDirty(); }
+    return;
+  }
+  if (kind === 'vod-source-name') {
+    const src = arr(state.library.vod.sources).find((item) => item.id === id);
+    // 允许清空（保存时服务端会把空名补成配置地址），不要边打字边自动改名。
+    if (src) { src.name = target.value.slice(0, 64); markLibraryDirty(); }
     return;
   }
   if (kind === 'vod-source-jar') {
@@ -4165,6 +4207,16 @@ function deviceVodBlock() {
   // 旧默认站点被删/被取消勾选时，下拉里补一条显式的「已失效」选项。
   // 否则 <select> 会静默跳到第一项，用户以为默认站点还是原来那个。
   const defaultKnown = !defaultSite || seenCandidate.has(defaultSite);
+  // 站点跟随「已勾选的源」变化：只列勾选源下的站点，免得在几百条里翻。
+  // 已单独勾选但源没勾的站点要单独列出来——否则它会「看不见但仍然生效」。
+  const sitesOfPicked = allSites.filter((site) => pickedSources.includes(site.sourceId));
+  const orphanPicked = allSites.filter((site) => !pickedSources.includes(site.sourceId)
+    && pickedSites.includes(site.id));
+  const visibleSites = sitesOfPicked.concat(orphanPicked).slice(0, 300);
+  const sourceNameOf = (sourceId) => {
+    const src = sources.find((item) => item.id === sourceId);
+    return src ? (src.name || src.url || sourceId) : sourceId;
+  };
   html += '<p class="meta">整源下发：勾选后该源下所有站点都会下发。</p>'
     + '<div class="df-multi">' + sources.map((src) =>
       '<label><input type="checkbox" data-df-multi="vod.sourceIds" data-value="' + esc(src.id) + '"'
@@ -4172,14 +4224,22 @@ function deviceVodBlock() {
       + esc(src.name || src.url) + '（'
       + allSites.filter((site) => site.sourceId === src.id).length + ' 个站点）</label>').join('')
     + '</div>'
-    + '<p class="meta">再单独勾选具体站点（可选，最多列出 300 条）：</p>'
+    + '<p class="meta">' + (pickedSources.length
+      ? '再单独勾选具体站点（<b>只列上面勾选的源</b>，最多 300 条；多源时站点后面跟着源名）：'
+      : '勾选上面的源后，这里才会列出该源的站点；只勾源就是整源下发。') + '</p>'
     + '<div class="lib-scroll lib-site-checks">'
-    + (allSites.slice(0, 300).map((site) =>
+    + (visibleSites.length ? visibleSites.map((site) =>
       '<label><input type="checkbox" data-df-multi="vod.siteIds" data-value="' + esc(site.id) + '"'
       + (pickedSites.includes(site.id) ? ' checked' : '') + '> '
       + '<code>' + esc(site.key) + '</code> ' + esc(site.name || '')
+      + (pickedSources.length > 1
+        ? ' <span class="meta">' + esc(sourceNameOf(site.sourceId)) + '</span>' : '')
+      + (pickedSources.includes(site.sourceId)
+        ? '' : ' <span class="badge off">来源未勾选</span>')
       + (site.note ? ' <span class="meta">' + esc(site.note) + '</span>' : '')
-      + '</label>').join('') || '<p class="muted">还没有站点。</p>')
+      + '</label>').join('')
+      : '<p class="muted">' + (pickedSources.length ? '这些源下还没有站点。' : '还没有勾选任何源。')
+        + '</p>')
     + '</div>'
     + '<label class="df-field"><span>默认站点（打开影音时自动选中）</span>'
     + '<select data-df="vod.defaultSiteId">'
@@ -4195,7 +4255,8 @@ function deviceVodBlock() {
     + '</select></label>'
     + '<p class="meta">只决定「打开影音先显示哪个站点」，不影响哪些站点可见；'
     + (candidateSites.length
-      ? '可选项来自上面勾选的源与站点；选「跟随资源库默认」就到「TVBox 源」页改。'
+      ? '可选项来自上面勾选的源与站点——<b>换一个源，这里就只列那个源的站点</b>；'
+        + '选「跟随资源库默认」就到「TVBox 源」页的「查看站点」里改。'
       : '请先勾选源或站点，否则只能不指定。')
     + '</p>'
     + '<label class="df-check"><input type="checkbox" data-df="vod.lockLibrary"'
@@ -4818,6 +4879,9 @@ function applyDfControl(target) {
     else current.delete(target.dataset.value);
     setPath(state.doc.sections, path, [...current]);
     markDirty();
+    // 站点清单跟着「勾选的源」走：勾上/取消一个源必须立刻重绘，
+    // 否则下面列的还是上一次的站点，用户会以为勾了没反应。
+    if (path === 'vod.sourceIds') render();
     return true;
   }
   return false;

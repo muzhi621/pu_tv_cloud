@@ -291,6 +291,9 @@ textarea.raw {
   min-height: 34px; transition: border-color .15s, box-shadow .15s;
 }
 .pkg-name { min-width: 260px; }
+/* TVBox 添加源：名称 + 地址并排，两个都 260px 会把按钮挤到第二行。 */
+.tvbox-name-input { min-width: 200px; }
+.tvbox-url-input { min-width: 300px; }
 .pkg-name:focus, .df-field input:focus, .df-field select:focus, .df-field textarea:focus {
   outline: none; border-color: var(--ring); box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 14%, transparent);
 }
@@ -404,6 +407,13 @@ textarea.raw {
 .lib-site-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .lib-site-checks label { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 12px; cursor: pointer; }
 .lib-site-checks code { font-size: 11px; }
+
+/* 源表格里「查看站点」就地展开的那一行：站点不再单开一节，跟着源走。 */
+.lib-expand-row > td {
+  padding: 10px 12px 12px; background: var(--muted); border-top: 1px solid var(--border);
+}
+.lib-expand-row .lib-source-head { border-bottom: 0; margin-bottom: 6px; padding-bottom: 0; }
+.lib-expand-row .lib-scroll { background: var(--card); }
 
 /* ================= 退出弹窗二维码上传 ================= */
 .qr-upload { display: flex; align-items: center; gap: 10px; margin: 6px 0 10px; flex-wrap: wrap; }
