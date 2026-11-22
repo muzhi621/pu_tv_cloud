@@ -3872,6 +3872,7 @@ function onLibraryAction(button) {
   }
   if (kind === 'delete-vod-source') { deleteVodSource(button.dataset.id); return; }
   if (kind === 'set-default-site') { setVodDefaultSite(button.dataset.id); return; }
+  if (kind === 'clear-vod-orphan-sites') { clearVodOrphanSites(); return; }
   if (kind === 'migrate-inline') { migrateInlinePackages(); return; }
   // ---- 在线更新版本库 ----
   if (kind === 'add-update') { addUpdateEntry(); return; }
@@ -4190,33 +4191,28 @@ function deviceVodBlock() {
   // 这台终端最终会拿到的站点：整源勾选的源下所有站点 + 单独勾选的站点。
   // 「默认站点」只能从这里选——选一个根本不下发的站点没有意义，服务端
   // expandVodSites 展开时也会把它清空（否则终端会去开一个不存在的站点）。
-  const candidateSites = [];
-  const seenCandidate = new Set();
-  for (const site of allSites) {
-    if (!pickedSources.includes(site.sourceId) && !pickedSites.includes(site.id)) continue;
-    if (seenCandidate.has(site.id)) continue;
-    seenCandidate.add(site.id);
-    candidateSites.push(site);
-  }
   const defaultSite = String(vod.defaultSiteId || '');
   // 资源库级默认站点：这一项留空时终端就用它（服务端展开时兜底），
   // 所以下拉里要写清楚「跟随时会用谁」，而不是笼统写「第一个站点」。
   const libDefaultSite = String(
     (state.library && state.library.vod && state.library.vod.defaultSiteId) || '');
   const libDefaultHit = allSites.find((site) => site.id === libDefaultSite);
-  // 旧默认站点被删/被取消勾选时，下拉里补一条显式的「已失效」选项。
-  // 否则 <select> 会静默跳到第一项，用户以为默认站点还是原来那个。
-  const defaultKnown = !defaultSite || seenCandidate.has(defaultSite);
-  // 站点跟随「已勾选的源」变化：只列勾选源下的站点，免得在几百条里翻。
-  // 已单独勾选但源没勾的站点要单独列出来——否则它会「看不见但仍然生效」。
+  // 站点清单与「默认站点」都只跟着**已勾选的源**走：勾一个源就只看到该源的站点，
+  // 换一个源整块换掉。以前这里铺的是全库/全部已勾选站点，选完源还得在几百条里找。
   const sitesOfPicked = allSites.filter((site) => pickedSources.includes(site.sourceId));
+  // 单独勾选、但所属源没勾的站点仍然会下发，不能凭空消失——收进折叠区，
+  // 默认站点也不把它们铺进下拉（否则又变回「全部内容」）。
   const orphanPicked = allSites.filter((site) => !pickedSources.includes(site.sourceId)
     && pickedSites.includes(site.id));
-  const visibleSites = sitesOfPicked.concat(orphanPicked).slice(0, 300);
   const sourceNameOf = (sourceId) => {
     const src = sources.find((item) => item.id === sourceId);
     return src ? (src.name || src.url || sourceId) : sourceId;
   };
+  // 默认站点落在「勾选源」里才算正常；落在折叠区（单独勾选）或已被删掉时，
+  // 补一条显式选项，别让 <select> 静默跳到第一项。
+  const defaultInPool = !defaultSite || sitesOfPicked.some((site) => site.id === defaultSite);
+  const defaultOrphan = defaultInPool ? null
+    : orphanPicked.find((site) => site.id === defaultSite);
   html += '<p class="meta">整源下发：勾选后该源下所有站点都会下发。</p>'
     + '<div class="df-multi">' + sources.map((src) =>
       '<label><input type="checkbox" data-df-multi="vod.sourceIds" data-value="' + esc(src.id) + '"'
@@ -4228,41 +4224,97 @@ function deviceVodBlock() {
       ? '再单独勾选具体站点（<b>只列上面勾选的源</b>，最多 300 条；多源时站点后面跟着源名）：'
       : '勾选上面的源后，这里才会列出该源的站点；只勾源就是整源下发。') + '</p>'
     + '<div class="lib-scroll lib-site-checks">'
-    + (visibleSites.length ? visibleSites.map((site) =>
+    + (sitesOfPicked.length ? sitesOfPicked.slice(0, 300).map((site) =>
       '<label><input type="checkbox" data-df-multi="vod.siteIds" data-value="' + esc(site.id) + '"'
       + (pickedSites.includes(site.id) ? ' checked' : '') + '> '
       + '<code>' + esc(site.key) + '</code> ' + esc(site.name || '')
       + (pickedSources.length > 1
         ? ' <span class="meta">' + esc(sourceNameOf(site.sourceId)) + '</span>' : '')
-      + (pickedSources.includes(site.sourceId)
-        ? '' : ' <span class="badge off">来源未勾选</span>')
       + (site.note ? ' <span class="meta">' + esc(site.note) + '</span>' : '')
       + '</label>').join('')
       : '<p class="muted">' + (pickedSources.length ? '这些源下还没有站点。' : '还没有勾选任何源。')
         + '</p>')
     + '</div>'
+    // 单独勾选、但源没勾的站点：仍然下发，收在折叠区里，主清单保持「只跟源走」。
+    + (orphanPicked.length
+      ? '<details class="vod-orphan"><summary>另有 ' + orphanPicked.length
+        + ' 个站点是单独勾选的（所属源未勾选，仍然会下发）</summary>'
+        + '<div class="lib-scroll lib-site-checks">'
+        + orphanPicked.slice(0, 300).map((site) =>
+          '<label><input type="checkbox" data-df-multi="vod.siteIds" data-value="' + esc(site.id) + '"'
+          + (pickedSites.includes(site.id) ? ' checked' : '') + '> '
+          + '<code>' + esc(site.key) + '</code> ' + esc(site.name || '')
+          + ' <span class="meta">' + esc(sourceNameOf(site.sourceId)) + '</span>'
+          + '</label>').join('')
+        + '</div>'
+        + '<div class="toolbar"><button class="tiny danger" data-lib="clear-vod-orphan-sites">'
+        + '清空这些站点勾选</button></div>'
+        + '</details>'
+      : '')
     + '<label class="df-field"><span>默认站点（打开影音时自动选中）</span>'
     + '<select data-df="vod.defaultSiteId">'
     + '<option value="">' + (libDefaultHit
       ? '跟随资源库默认（' + esc(libDefaultHit.name || libDefaultHit.key) + '）'
       : '不指定（用第一个站点）') + '</option>'
-    + (defaultKnown ? '' : '<option value="' + esc(defaultSite) + '" selected>'
-      + esc(defaultSite) + '（已失效，需重新选择）</option>')
-    + candidateSites.slice(0, 300).map((site) =>
-      '<option value="' + esc(site.id) + '"'
-      + (defaultSite === site.id ? ' selected' : '') + '>'
-      + esc(site.name || site.key) + '</option>').join('')
+    + (defaultInPool ? '' : (defaultOrphan
+      ? '<option value="' + esc(defaultSite) + '" selected>'
+        + esc(defaultOrphan.name || defaultOrphan.key) + '（单独勾选，来源未勾选）</option>'
+      : '<option value="' + esc(defaultSite) + '" selected>'
+        + esc(defaultSite) + '（已失效，需重新选择）</option>'))
+    + pickedSources.map((sid) => {
+      const list = sitesOfPicked.filter((site) => site.sourceId === sid).slice(0, 300);
+      if (!list.length) return '';
+      const options = list.map((site) =>
+        '<option value="' + esc(site.id) + '"'
+        + (defaultSite === site.id ? ' selected' : '') + '>'
+        + esc(site.name || site.key) + '</option>').join('');
+      // 多源时按源分组，一眼能看出这个站点属于哪个源；单源就不加缩进。
+      return pickedSources.length > 1
+        ? '<optgroup label="' + esc(sourceNameOf(sid)) + '">' + options + '</optgroup>'
+        : options;
+    }).join('')
     + '</select></label>'
     + '<p class="meta">只决定「打开影音先显示哪个站点」，不影响哪些站点可见；'
-    + (candidateSites.length
-      ? '可选项来自上面勾选的源与站点——<b>换一个源，这里就只列那个源的站点</b>；'
+    + (sitesOfPicked.length
+      ? '可选项<b>只来自上面勾选的源</b>——换一个源，这里就只列那个源的站点；'
         + '选「跟随资源库默认」就到「TVBox 源」页的「查看站点」里改。'
-      : '请先勾选源或站点，否则只能不指定。')
+      : '请先勾选源，否则只能不指定。')
     + '</p>'
     + '<label class="df-check"><input type="checkbox" data-df="vod.lockLibrary"'
     + (vod.lockLibrary ? ' checked' : '') + '> 锁定资源库</label>'
     + '<p class="meta">锁定后该终端不再跟随资源库变化，保持当前站点表。</p>';
   return html;
+}
+
+/**
+ * 清掉「所属源未勾选」的单独站点勾选（折叠区里的那些）。
+ *
+ * 站点清单现在只跟勾选的源走，这些残留勾选收在折叠区：一个个取消太累，
+ * 清掉之后这台终端/套餐下发的站点就等于「勾选的源」本身。
+ * 只动站点勾选，源勾选与默认站点该清的顺带清掉，不碰资源库。
+ */
+function clearVodOrphanSites() {
+  const vod = state.doc && state.doc.sections && state.doc.sections.vod;
+  if (!isObj(vod)) return;
+  const all = arr(libraryVodSites());
+  const pickedSources = arr(vod.sourceIds);
+  const byId = new Map(all.map((site) => [site.id, site]));
+  const before = arr(vod.siteIds);
+  const kept = before.filter((id) => {
+    const site = byId.get(id);
+    // 库里已经找不到的旧 id 不算「来源未勾选」，留着交给服务端忽略。
+    return !site || pickedSources.includes(site.sourceId);
+  });
+  const dropped = before.length - kept.length;
+  if (!dropped) { message('没有需要清理的站点勾选。', 'ok'); return; }
+  vod.siteIds = kept;
+  if (vod.defaultSiteId) {
+    const site = byId.get(String(vod.defaultSiteId));
+    if (site && !pickedSources.includes(site.sourceId)) vod.defaultSiteId = '';
+  }
+  markDirty();
+  render();
+  message('已清掉 ' + dropped + ' 个「来源未勾选」的站点勾选。', 'ok');
 }
 
 /**

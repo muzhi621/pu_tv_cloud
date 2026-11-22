@@ -415,6 +415,15 @@ textarea.raw {
 .lib-expand-row .lib-source-head { border-bottom: 0; margin-bottom: 6px; padding-bottom: 0; }
 .lib-expand-row .lib-scroll { background: var(--card); }
 
+/* 套餐/终端里「来源未勾选的单独勾选站点」折叠区：主清单只跟勾选的源走。 */
+.vod-orphan {
+  margin-top: 8px; padding: 6px 10px;
+  border: 1px dashed var(--border); border-radius: var(--radius-md);
+}
+.vod-orphan > summary { cursor: pointer; font-size: 12px; color: var(--muted-foreground); }
+.vod-orphan[open] > summary { margin-bottom: 6px; }
+.vod-orphan .lib-scroll { max-height: 200px; margin-top: 6px; }
+
 /* ================= 退出弹窗二维码上传 ================= */
 .qr-upload { display: flex; align-items: center; gap: 10px; margin: 6px 0 10px; flex-wrap: wrap; }
 .qr-upload input[type="file"] { font-size: 12px; max-width: 240px; }
